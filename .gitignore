@@ -1,0 +1,52 @@
+# ---- Qt / C++ build artifacts ----
+build/
+build-*/
+out/
+cmake-build-*/
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.exp
+*.pdb
+*.idb
+*.ilk
+moc_*.cpp
+moc_*.h
+qrc_*.cpp
+ui_*.h
+*.qm
+*.user
+*.user.*
+Makefile
+Makefile.*
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+cmake_install.cmake
+CTestTestfile.cmake
+compile_commands.json
+
+# ---- IDE / Editor ----
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ---- Python (pre-commit envs, venv) ----
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# ---- Logs / temp ----
+*.log
+*.tmp
+*.bak

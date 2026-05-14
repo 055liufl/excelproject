@@ -1,0 +1,27 @@
+{
+    "profileName": "customer_basic",
+    "sheet": "Customers",
+    "headerRow": 1,
+    "mode": "singleTable",
+    "table": "customer",
+    "conflict": {
+        "columns": ["customer_no"]
+    },
+    "columns": {
+        "customer_no": {
+            "source": "CustomerNo",
+            "validators": ["notNull", "len<=32"]
+        },
+        "name": {
+            "source": "Name",
+            "validators": ["notNull", "len<=128"]
+        },
+        "phone": {
+            "source": "Phone",
+            "validators": ["regex:^[-0-9+ ]*$"]
+        }
+    },
+    "export": {
+        "orderBy": ["customer_no"]
+    }
+}

@@ -1,0 +1,57 @@
+{
+    "profileName": "mixed_abc",
+    "sheet": "Mixed",
+    "headerRow": 1,
+    "mode": "mixed",
+    "discriminator": {
+        "source": "Type"
+    },
+    "classes": [
+        {
+            "id": "A",
+            "match": {"equals": "A"},
+            "routes": [
+                {
+                    "table": "m1",
+                    "conflict": {"columns": ["m_no"]},
+                    "columns": {
+                        "m_no": {"source": "MNo", "validators": ["notNull"]},
+                        "m_data": {"source": "Data"}
+                    }
+                }
+            ]
+        },
+        {
+            "id": "B",
+            "match": {"equals": "B"},
+            "routes": [
+                {
+                    "table": "n1",
+                    "conflict": {"columns": ["n_no"]},
+                    "columns": {
+                        "n_no": {"source": "NNo", "validators": ["notNull"]},
+                        "n_data": {"source": "Data"}
+                    }
+                }
+            ]
+        },
+        {
+            "id": "C",
+            "match": {"equals": "C"},
+            "routes": [
+                {
+                    "table": "o1",
+                    "conflict": {"columns": ["o_no"]},
+                    "columns": {
+                        "o_no": {"source": "ONo", "validators": ["notNull"]},
+                        "o_data": {"source": "Data"}
+                    }
+                }
+            ]
+        }
+    ],
+    "export": {
+        "classColumn": "Type",
+        "orderBy": ["m_no"]
+    }
+}

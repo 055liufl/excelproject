@@ -1,0 +1,34 @@
+{
+    "profileName": "order_m_set",
+    "sheet": "Orders",
+    "headerRow": 1,
+    "mode": "multiTable",
+    "routes": [
+        {
+            "table": "orders",
+            "conflict": {"columns": ["order_no"]},
+            "columns": {
+                "order_no": {"source": "OrderNo", "validators": ["notNull"]},
+                "customer": {"source": "Customer"},
+                "amount": {"source": "Amount", "validators": ["decimal"]}
+            }
+        },
+        {
+            "table": "order_items",
+            "parent": "orders",
+            "fkInject": {
+                "from": "orders.order_no",
+                "to": "order_items.order_no"
+            },
+            "conflict": {"columns": ["order_no", "line_no"]},
+            "columns": {
+                "line_no": {"source": "LineNo", "validators": ["int>=1"]},
+                "sku": {"source": "Sku", "validators": ["notNull"]},
+                "qty": {"source": "Qty", "validators": ["int>=1"]}
+            }
+        }
+    ],
+    "export": {
+        "orderBy": ["orders.order_no", "order_items.line_no"]
+    }
+}

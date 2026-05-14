@@ -129,16 +129,23 @@ ExportResult ExportService::run(const ProfileSpec& profile, const SchemaCatalog&
             allHeaders.prepend(classCol);
         }
 
-        // Sort allRows by orderBy (in-memory sort)
+        // Sort allRows by all orderBy keys (in-memory sort, spec §6.8)
         if (!profile.exportSpec.orderBy.isEmpty()) {
-            QString sortKey = profile.exportSpec.orderBy.first();
-            // Strip "table." prefix if present
-            if (sortKey.contains('.'))
-                sortKey = sortKey.section('.', -1);
-            std::stable_sort(
-                allRows.begin(), allRows.end(), [&sortKey](const MixedRow& a, const MixedRow& b) {
-                    return a.data.value(sortKey).toString() < b.data.value(sortKey).toString();
-                });
+            QStringList sortKeys;
+            for (const QString& ob : profile.exportSpec.orderBy) {
+                // Strip "table." prefix if present
+                sortKeys.append(ob.contains('.') ? ob.section('.', -1) : ob);
+            }
+            std::stable_sort(allRows.begin(), allRows.end(),
+                             [&sortKeys](const MixedRow& a, const MixedRow& b) {
+                                 for (const QString& k : sortKeys) {
+                                     QString va = a.data.value(k).toString();
+                                     QString vb = b.data.value(k).toString();
+                                     if (va != vb)
+                                         return va < vb;
+                                 }
+                                 return false;
+                             });
         }
 
         writer.writeHeader(allHeaders);

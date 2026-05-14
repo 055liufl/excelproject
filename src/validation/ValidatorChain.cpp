@@ -1,11 +1,31 @@
 #include "ValidatorChain.h"
 
+#include "dbridge/Errors.h"
+
 #include "Validators.h"
 
 namespace dbridge::detail {
 
+static bool isTypeNormalizingToken(const QString& token) {
+    return token == QStringLiteral("int") || token.startsWith(QStringLiteral("int>=")) ||
+           token == QStringLiteral("decimal") || token.startsWith(QStringLiteral("date:"));
+}
+
 bool ValidatorChain::compile(const QStringList& tokens, QString* err) {
     fns_.clear();
+    // Detect conflicting type-normalizing tokens (spec §5.7)
+    int typeTokenCount = 0;
+    for (const auto& token : tokens) {
+        if (isTypeNormalizingToken(token))
+            typeTokenCount++;
+    }
+    if (typeTokenCount > 1) {
+        if (err)
+            *err = QString::fromLatin1(err::E_PROFILE_PARSE) +
+                   QStringLiteral(": multiple conflicting type tokens in validator chain");
+        return false;
+    }
+
     for (const auto& token : tokens) {
         ValidatorFn fn = compileToken(token, err);
         if (!fn)

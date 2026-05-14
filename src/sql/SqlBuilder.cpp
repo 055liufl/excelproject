@@ -62,17 +62,16 @@ QString SqlBuilder::buildAutoJoinSelect(const QVector<RouteSpec>& routes,
         }
 
         if (&route != &routes[0]) {
-            // Build JOIN condition from fkInject
+            // Build JOIN condition from fkInject (spec §6.2)
             if (route.fkInject.has_value()) {
                 const FkInjectSpec& fk = route.fkInject.value();
                 joinClauses.append(QStringLiteral("LEFT JOIN ") + route.table +
                                    QStringLiteral(" ON ") + fk.toTable + QStringLiteral(".") +
                                    fk.toColumn + QStringLiteral(" = ") + fk.fromTable +
                                    QStringLiteral(".") + fk.fromColumn);
-            } else if (!route.parent.isEmpty()) {
-                // Try to find matching FK by parent
-                joinClauses.append(QStringLiteral("LEFT JOIN ") + route.table);
             }
+            // Routes without fkInject but with a parent should always have fkInject defined;
+            // ProfileValidator enforces this, so no fallback is needed here.
         }
     }
 

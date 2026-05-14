@@ -45,6 +45,11 @@ bool ProfileLoader::validateToken(const QString& token, QString* err) {
 
 bool ProfileLoader::readColumn(const QString& dbCol, const QJsonObject& o, ColumnSpec* out,
                                QString* err) {
+    if (!isSimpleIdentifier(dbCol)) {
+        if (err)
+            *err = QStringLiteral("column name is not a valid identifier: ") + dbCol;
+        return false;
+    }
     out->dbColumn = dbCol;
     out->source = o.value(QStringLiteral("source")).toString(dbCol);
 
@@ -148,7 +153,13 @@ bool ProfileLoader::readSingleTable(const QJsonObject& o, ProfileSpec* out, QStr
     QJsonObject conflictObj = o.value(QStringLiteral("conflict")).toObject();
     QJsonArray conflictCols = conflictObj.value(QStringLiteral("columns")).toArray();
     for (const auto& c : conflictCols) {
-        route.conflict.columns.append(c.toString());
+        QString col = c.toString();
+        if (!isSimpleIdentifier(col)) {
+            if (err)
+                *err = QStringLiteral("conflict column is not a valid identifier: ") + col;
+            return false;
+        }
+        route.conflict.columns.append(col);
     }
 
     // columns

@@ -95,6 +95,14 @@ bool ProfileValidator::validateRoute(const RouteSpec& route, const SchemaCatalog
     // Validate fkInject if present
     if (route.fkInject.has_value()) {
         const FkInjectSpec& fk = route.fkInject.value();
+        // fromTable must match route.parent (spec §5.4)
+        if (!route.parent.isEmpty() && fk.fromTable != route.parent) {
+            errors->addTable(sheet, QString::fromLatin1(err::E_PROFILE_PARSE),
+                             QStringLiteral("fkInject.from table '") + fk.fromTable +
+                                 QStringLiteral("' must match route parent '") + route.parent +
+                                 '\'');
+            ok = false;
+        }
         if (!catalog.hasTable(fk.fromTable)) {
             errors->addTable(sheet, QString::fromLatin1(err::E_PROFILE_TABLE_NOT_FOUND),
                              QStringLiteral("fkInject.from table '") + fk.fromTable +

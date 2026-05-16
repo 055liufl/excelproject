@@ -1146,7 +1146,7 @@ graph LR
 | **CMake** | 3.16+ | 项目使用现代 CMake target 写法 |
 | **Qt** | **5.12.12 LTS** | 必须包含 `Core` + `Sql` + `Gui` 三个模块；运行测试还需 `Test` |
 | **SQLite** | **3.24.0+** | 因为依赖 `INSERT ... ON CONFLICT(...) DO UPDATE`，库会在 `open()` 时检查版本，低版本直接报 `E_OPEN_DB` |
-| **QXlsx** | 已 vendored 在 `3rdparty/QXlsx/` | **不需要单独安装**，构建系统会自动编译它 |
+| **QXlsx** | 已 vendored 在 `3rdparty/QXlsx/`（QtExcel/QXlsx，BSD-2） | **不需要单独安装**，构建系统会自动编译。注意它依赖 Qt 的 `QtGui/private/qzipreader_p.h`——这要求 Qt 安装包含 GUI 私有头文件（Qt 官方 Online Installer 默认带；某些 Linux 发行版的 `qtbase-private-dev` 包要额外装） |
 
 **怎么检查环境是否满足？**
 

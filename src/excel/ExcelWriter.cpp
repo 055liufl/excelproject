@@ -17,11 +17,21 @@ ExcelWriter::~ExcelWriter() = default;
 bool ExcelWriter::open(const QString& xlsxPath, const QString& sheetName, QString* err) {
     path_ = xlsxPath;
     rowCursor_ = 1;
-    impl_->doc = std::make_unique<QXlsx::Document>(xlsxPath);
+    impl_->doc = std::make_unique<QXlsx::Document>();  // empty doc; saveAs writes path_
     impl_->sheet = sheetName;
+    // Fresh QXlsx::Document already contains "Sheet1"; rename it if user wants
+    // a different sheet name, otherwise addSheet+selectSheet.
+    QStringList names = impl_->doc->sheetNames();
+    if (!names.contains(sheetName)) {
+        if (!impl_->doc->addSheet(sheetName)) {
+            if (err)
+                *err = QStringLiteral("Failed to add sheet: ") + sheetName;
+            return false;
+        }
+    }
     if (!impl_->doc->selectSheet(sheetName)) {
         if (err)
-            *err = QStringLiteral("Failed to select/create sheet: ") + sheetName;
+            *err = QStringLiteral("Failed to select sheet: ") + sheetName;
         return false;
     }
     return true;

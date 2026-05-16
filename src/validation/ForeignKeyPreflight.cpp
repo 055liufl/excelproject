@@ -12,12 +12,15 @@ namespace dbridge::detail {
 bool ForeignKeyPreflight::check(const QVector<RowContext>& contexts,
                                 const QVector<RouteSpec>& allRoutes, QSqlDatabase& db,
                                 const QString& sheet, ErrorCollector* errors) {
-    // Build a map of routeKey -> set of conflict key values present in this batch
+    // Build a map of table -> conflict key values present in this batch.
+    // Caller (ImportService) filters contexts per class in mixed mode, so all
+    // payloads here belong to a single class; using payload.table matches the
+    // lookup side below (fk.fromTable is a bare table name).
     QHash<QString, QVector<QVariant>> batchParentKeys;
     for (const auto& ctx : contexts) {
         for (const auto& payload : ctx.payloads) {
             if (!payload.conflictVals.isEmpty() && !payload.conflictVals[0].isNull()) {
-                batchParentKeys[payload.routeKey].append(payload.conflictVals[0]);
+                batchParentKeys[payload.table].append(payload.conflictVals[0]);
             }
         }
     }
@@ -56,8 +59,7 @@ bool ForeignKeyPreflight::checkPayload(const RoutePayload& payload, const RouteS
         return true;
 
     // Check if parent row exists in this batch
-    QString parentRouteKey = fk.fromTable;
-    const auto& batchKeys = batchParentKeys.value(parentRouteKey);
+    const auto& batchKeys = batchParentKeys.value(fk.fromTable);
     for (const auto& bk : batchKeys) {
         if (bk == fkVal)
             return true;  // found in batch

@@ -64,6 +64,10 @@ void DataBridgePrivate::closeDb() {
         db_.close();
         dbOpen_ = false;
     }
+    // Drop our QSqlDatabase reference BEFORE removeDatabase, otherwise Qt
+    // logs "connection is still in use" because db_ itself still holds a
+    // QExplicitlySharedDataPointer to the connection.
+    db_ = QSqlDatabase();
     if (QSqlDatabase::contains(connName_)) {
         QSqlDatabase::removeDatabase(connName_);
     }

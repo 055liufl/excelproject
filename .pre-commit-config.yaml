@@ -35,14 +35,20 @@ repos:
       - id: clang-format
         types_or: [c, c++]
         args: [--style=file, -i]
+        # Skip third-party code: vendored libraries (QXlsx) follow their own style.
+        exclude: ^3rdparty/
 
   # ---- CMake formatting ----
   - repo: https://github.com/cheshirekow/cmake-format-precommit
     rev: v0.6.13
     hooks:
       - id: cmake-format
+        # Skip third-party CMake files (we author 3rdparty/QXlsx/CMakeLists.txt
+        # ourselves, but it's a glue layer — keep our local edits intact).
+        exclude: ^3rdparty/QXlsx/CMakeLists\.txt$
       - id: cmake-lint
         args: [--disabled-codes, C0103, C0301]
+        exclude: ^3rdparty/QXlsx/CMakeLists\.txt$
 
   # ---- YAML lint ----
   - repo: https://github.com/adrienverge/yamllint

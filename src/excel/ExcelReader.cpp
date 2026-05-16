@@ -1,6 +1,7 @@
 #include "ExcelReader.h"
 
 #include <memory>
+#include <xlsxcellrange.h>
 #include <xlsxdocument.h>
 
 namespace dbridge::detail {
@@ -16,7 +17,7 @@ ExcelReader::~ExcelReader() = default;
 
 bool ExcelReader::open(const QString& xlsxPath, QString* err) {
     impl_->doc = std::make_unique<QXlsx::Document>(xlsxPath);
-    if (!impl_->doc->load(xlsxPath)) {
+    if (!impl_->doc->load()) {
         if (err)
             *err = QStringLiteral("Failed to open xlsx: ") + xlsxPath;
         return false;
@@ -39,11 +40,13 @@ bool ExcelReader::readHeader(int headerRow, QString* err) {
     headers_.clear();
     sourceToCol_.clear();
 
-    // Find max columns by scanning the header row
-    // In stub we go up to a reasonable max; real QXlsx would give dimension
-    int maxCol = impl_->doc->dimension_colMax();
-    if (maxCol == 0)
-        maxCol = 256;  // fallback
+    // Real QXlsx exposes the active worksheet dimension as CellRange.
+    // When the workbook has no data, dimension is invalid; fall back to a
+    // reasonable scan width so callers still get a useful error.
+    QXlsx::CellRange dim = impl_->doc->dimension();
+    int maxCol = dim.lastColumn();
+    if (maxCol <= 0)
+        maxCol = 256;  // fallback for empty/broken dimension metadata
 
     for (int col = 1; col <= maxCol; ++col) {
         QVariant v = impl_->doc->read(headerRow, col);
@@ -62,7 +65,7 @@ bool ExcelReader::readHeader(int headerRow, QString* err) {
         return false;
     }
 
-    lastRow_ = impl_->doc->dimension_rowMax();
+    lastRow_ = dim.lastRow();
     if (lastRow_ < headerRow_)
         lastRow_ = headerRow_;
 

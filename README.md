@@ -2140,6 +2140,102 @@ A：MVP 不做。Profile 是声明文件，由开发/运维管控；如需加密
 **Q5：表 schema 变更怎么办？**
 A：调 `generateAutoProfileJson` 重新生成草稿，diff 旧的、合并到新的。
 
+**Q6：从 Excel 读取的数据，会按表字段类型自动转换吗？**
+A：**不会自动按 DB schema 转换。** 读取层只回传 QXlsx 给出的原始 `QVariant`，类型化由列上的 validator 决定。
+
+- 读取层（`src/excel/ExcelReader.cpp:75`）：`cellBySource(row, source)` 直接返回 `impl_->doc->read(row, col)`，拿到什么是什么 —— 数字单元格大多是 `double`、文本是 `QString`、被识别为日期样式的是 `QDate/QDateTime`（参见 commit `c6dc2d5`），空单元格是 `QVariant()`。
+- 映射层（`src/mapping/Mapper.cpp:43`）：把原值喂给 `ValidatorChain`，得到 `normalizedVal` 再绑到 SQL。只有"类型化"validator 会真正改写值类型：
+  - `int` / `int>=N` → `QVariant(qlonglong)`（`Validators.cpp:74,101`）
+  - `decimal` → `QVariant(double)`（`Validators.cpp:121`）
+  - `date:fmt` → `QVariant(QDate)`，若已是 `QDate/QDateTime` 则直通（`Validators.cpp:133,146`）
+- 其余 token（`notNull` / `len<=` / `len>=` / `regex:` / `enum:`）只做校验，**不改类型**。
+
+**结论**：最终绑定到 SQL 的值类型 = QXlsx 原始 `QVariant` 类型，**叠加** profile 里该列声明的类型化 validator 所做的强制转换。
+
+**Q7：不指定字段类型直接导入 SQLite，有什么风险？**
+A：能跑通，但有几类隐患需要清楚。
+
+**为什么不会立刻出错**
+
+SQLite 是"类型亲和（type affinity）"，列没有强类型；任何 `QVariant` 都能通过 `QSqlQuery::addBindValue` 写进去（`src/service/ImportService.cpp:278`）。即使建表把列写成 `INTEGER`，SQLite 也允许往里塞 TEXT/REAL；除非用 `STRICT` 表（SQLite ≥ 3.37）。
+
+**实际会踩的坑**
+
+1. **整数列变 REAL/带小数**：Excel "123" 被 QXlsx 当 `double`，绑到无 validator 的列里就是 `123.0`。INTEGER affinity 通常会把无小数部分的 REAL 收敛成 INTEGER，但 TEXT 列会直接存成 `"123"` 或 `"123.0"`。
+2. **长数字精度丢失**：身份证号、订单号、银行卡号等 ≥ 2^53 的整数，被当 `double` 读进来就已经丢精度了。**必须**在 Excel 端按"文本"格式录入，且 profile 里**不要**加 `int`，挂 `regex:` / `len>=` 走字符串路径。
+3. **前导零丢失**：Excel 单元格若是数字格式，"00123" 在 QXlsx 那一层就只剩 `123`，读出来已经无法恢复。同样要源头按文本格式存。
+4. **日期格式不统一**：未在识别白名单中的日期样式仍可能返回原始 serial 数字；即便识别为 `QDate`，SQLite 没有 DATE 类型，Qt 驱动写入时会序列化成 ISO 字符串。下游若按 "yyyy/M/d" 比对会匹配不上。建议日期列必挂 `date:yyyy-MM-dd` 之类做归一化。
+5. **唯一键 / 外键比对失效**：同一逻辑值在两张表里一边是 `123`（INTEGER）、一边是 `"123"`（TEXT），SQLite 不会自动等价（`123 = '123'` 为 false）。这是 UPSERT、FK 预检最容易出现的隐藏 bug。
+6. **TEXT 列拿到非字符串**：能存，但后续 `LIKE`、长度比对、CSV 导出顺序可能与预期不一致。
+
+**实务建议**
+
+- 关键列（主键、外键、`conflict.columns`、日期、长编号）一律在 profile 里挂对应 validator，让类型显式化。
+- 建表 DDL 明确写 `INTEGER/REAL/TEXT/NUMERIC`，强约束场景考虑 `STRICT` 表。
+- 长数字字段在 Excel 源头就按"文本"格式录入，不要指望读完再补救。
+
+**Q8：如何在 Profile 配置中显式声明字段类型？**
+A：本项目里"字段类型"不是单独字段，而是通过列上的 `validators` token 数组隐式声明的 —— 把对应的**类型化 validator** 加到列里，绑定到 SQLite 时就会变成那种 QVariant 类型。完整 token 清单见 §14.8。
+
+**类型化 token 速查**
+
+| Token | 实际效果（`Validators.cpp`） | 写进 SQLite 的 QVariant 类型 |
+|---|---|---|
+| `int` | `toLongLong` → `QVariant(qlonglong)` | INTEGER |
+| `int>=N` / `int<=N` | 同上并加上下限校验 | INTEGER |
+| `decimal` | `toDouble` → `QVariant(double)` | REAL |
+| `date:yyyy-MM-dd` | `QDate::fromString(fmt)` → `QVariant(QDate)` | TEXT（Qt SQLite 驱动按 ISO 序列化） |
+| 其它（`notNull` / `len<=N` / `regex:` / `enum:` / ...） | 仅校验，保留原 `QVariant` | 由 QXlsx 给出的原型决定 |
+
+> 没有 `string` / `text` token —— 不挂任何类型化 token 就是"按 QXlsx 原型走"（数字单元格 → double，文本单元格 → QString）。若想强制按字符串入库，目前只能在 Excel 源头把单元格设为文本格式，profile 这边用 `regex:.*` / `len<=N` 做约束。
+>
+> 此外，同一列里类型化 token（`int` / `int>=` / `decimal` / `date:`）**最多只能挂一个**，否则 `loadProfile` 直接报 `E_PROFILE_PARSE`（参见 §14.8）。
+
+**示例：把 `tests/data/profiles/order_m_set.json` 里的每种类型显式化**
+
+```json
+{
+    "profileName": "orders_typed",
+    "sheet": "Orders",
+    "headerRow": 1,
+    "mode": "multiTable",
+    "routes": [
+        {
+            "table": "orders",
+            "conflict": { "columns": ["order_no"] },
+            "columns": {
+                "order_no":   { "source": "OrderNo",   "validators": ["notNull", "len<=32", "regex:^[A-Z0-9-]+$"] },
+                "customer":   { "source": "Customer",  "validators": ["notNull", "len<=128"] },
+                "amount":     { "source": "Amount",    "validators": ["decimal"] },
+                "order_date": { "source": "OrderDate", "validators": ["notNull", "date:yyyy-MM-dd"] },
+                "status":     { "source": "Status",    "validators": ["enum:NEW|PAID|SHIPPED|DONE"] }
+            }
+        },
+        {
+            "table": "order_items",
+            "parent": "orders",
+            "fkInject": { "from": "orders.order_no", "to": "order_items.order_no" },
+            "conflict": { "columns": ["order_no", "line_no"] },
+            "columns": {
+                "line_no": { "source": "LineNo", "validators": ["int>=1"] },
+                "sku":     { "source": "Sku",    "validators": ["notNull", "len<=64"] },
+                "qty":     { "source": "Qty",    "validators": ["int>=1"] },
+                "price":   { "source": "Price",  "validators": ["decimal"] }
+            }
+        }
+    ],
+    "export": { "orderBy": ["orders.order_no", "order_items.line_no"] }
+}
+```
+
+**几个实务要点**
+
+- 顺序无关功能，但建议 `notNull` 放最前（短路），类型 token 紧随其后，限值 / 正则放后。Validator 链一旦失败会用原始值占位（`Mapper.cpp:52`），所以先后顺序影响错误消息但不影响最终绑定。
+- **长编号**（身份证、银行卡、长订单号）**不要**加 `int`，否则会被转 `qlonglong` 后超精度风险；让它走 `QString` 路径，配 `len<=N` + `regex:`。Excel 源头务必按"文本"格式录入。
+- **日期**列建议必挂 `date:fmt`：即便 QXlsx 已识别为 `QDate` 也会原样直通；若返回的是字符串 / serial 会被强制归一化，下游对账才不会因格式差异错配。
+- **conflict.columns / FK 列**尤其要显式声明类型，避免一边 INTEGER 一边 TEXT 导致 UPSERT / 外键比对失效（参见 Q7 第 5 条）。
+- 目前 profile 里**没有** `type: "integer"` 这样的字段；若想往"声明式类型"路线扩展，需要在 `ProfileSpec::ColumnSpec` 上加 `dbType` 字段，并在 `Validators::compileToken` 或 `Mapper` 里据此派生默认 validator。属于功能扩展，不是当前已支持的能力。
+
 ---
 
 ## License & 贡献

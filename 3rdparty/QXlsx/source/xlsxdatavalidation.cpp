@@ -2,49 +2,54 @@
 
 #include "xlsxdatavalidation.h"
 
-#include <QXmlStreamReader>
-#include <QXmlStreamWriter>
-
 #include "xlsxcellrange.h"
 #include "xlsxdatavalidation_p.h"
 #include "xlsxworksheet.h"
 
+#include <QXmlStreamReader>
+#include <QXmlStreamWriter>
+
 QT_BEGIN_NAMESPACE_XLSX
 
 DataValidationPrivate::DataValidationPrivate()
-    : validationType(DataValidation::None),
-      validationOperator(DataValidation::Between),
-      errorStyle(DataValidation::Stop),
-      allowBlank(false),
-      isPromptMessageVisible(true),
-      isErrorMessageVisible(true) {
+    : validationType(DataValidation::None)
+    , validationOperator(DataValidation::Between)
+    , errorStyle(DataValidation::Stop)
+    , allowBlank(false)
+    , isPromptMessageVisible(true)
+    , isErrorMessageVisible(true)
+{
 }
 
 DataValidationPrivate::DataValidationPrivate(DataValidation::ValidationType type,
                                              DataValidation::ValidationOperator op,
-                                             const QString &formula1, const QString &formula2,
+                                             const QString &formula1,
+                                             const QString &formula2,
                                              bool allowBlank)
-    : validationType(type),
-      validationOperator(op),
-      errorStyle(DataValidation::Stop),
-      allowBlank(allowBlank),
-      isPromptMessageVisible(true),
-      isErrorMessageVisible(true),
-      formula1(formula1),
-      formula2(formula2) {
+    : validationType(type)
+    , validationOperator(op)
+    , errorStyle(DataValidation::Stop)
+    , allowBlank(allowBlank)
+    , isPromptMessageVisible(true)
+    , isErrorMessageVisible(true)
+    , formula1(formula1)
+    , formula2(formula2)
+{
 }
 
 DataValidationPrivate::DataValidationPrivate(const DataValidationPrivate &other)
-    : QSharedData(other),
-      validationType(DataValidation::None),
-      validationOperator(DataValidation::Between),
-      errorStyle(DataValidation::Stop),
-      allowBlank(false),
-      isPromptMessageVisible(true),
-      isErrorMessageVisible(true) {
+    : QSharedData(other)
+    , validationType(DataValidation::None)
+    , validationOperator(DataValidation::Between)
+    , errorStyle(DataValidation::Stop)
+    , allowBlank(false)
+    , isPromptMessageVisible(true)
+    , isErrorMessageVisible(true)
+{
 }
 
-DataValidationPrivate::~DataValidationPrivate() {
+DataValidationPrivate::~DataValidationPrivate()
+{
 }
 
 /*!
@@ -102,28 +107,37 @@ DataValidationPrivate::~DataValidationPrivate() {
  * Construct a data validation object with the given \a type, \a op, \a formula1
  * \a formula2, and \a allowBlank.
  */
-DataValidation::DataValidation(ValidationType type, ValidationOperator op, const QString &formula1,
-                               const QString &formula2, bool allowBlank)
-    : d(new DataValidationPrivate(type, op, formula1, formula2, allowBlank)) {
+DataValidation::DataValidation(ValidationType type,
+                               ValidationOperator op,
+                               const QString &formula1,
+                               const QString &formula2,
+                               bool allowBlank)
+    : d(new DataValidationPrivate(type, op, formula1, formula2, allowBlank))
+{
 }
 
 /*!
     Construct a data validation object
 */
-DataValidation::DataValidation() : d(new DataValidationPrivate()) {
+DataValidation::DataValidation()
+    : d(new DataValidationPrivate())
+{
 }
 
 /*!
     Constructs a copy of \a other.
 */
-DataValidation::DataValidation(const DataValidation &other) : d(other.d) {
+DataValidation::DataValidation(const DataValidation &other)
+    : d(other.d)
+{
 }
 
 /*!
     Assigns \a other to this validation and returns a reference to this validation.
  */
-DataValidation &DataValidation::operator=(const DataValidation &other) {
-    if (this != &other)  // Self-assignment check [cert-oop54-cpp]
+DataValidation &DataValidation::operator=(const DataValidation &other)
+{
+    if (this != &other) // Self-assignment check [cert-oop54-cpp]
     {
         this->d = other.d;
     }
@@ -133,125 +147,143 @@ DataValidation &DataValidation::operator=(const DataValidation &other) {
 /*!
  * Destroy the object.
  */
-DataValidation::~DataValidation() {
+DataValidation::~DataValidation()
+{
 }
 
 /*!
     Returns the validation type.
  */
-DataValidation::ValidationType DataValidation::validationType() const {
+DataValidation::ValidationType DataValidation::validationType() const
+{
     return d->validationType;
 }
 
 /*!
     Returns the validation operator.
  */
-DataValidation::ValidationOperator DataValidation::validationOperator() const {
+DataValidation::ValidationOperator DataValidation::validationOperator() const
+{
     return d->validationOperator;
 }
 
 /*!
     Returns the validation error style.
  */
-DataValidation::ErrorStyle DataValidation::errorStyle() const {
+DataValidation::ErrorStyle DataValidation::errorStyle() const
+{
     return d->errorStyle;
 }
 
 /*!
     Returns the formula1.
  */
-QString DataValidation::formula1() const {
+QString DataValidation::formula1() const
+{
     return d->formula1;
 }
 
 /*!
     Returns the formula2.
  */
-QString DataValidation::formula2() const {
+QString DataValidation::formula2() const
+{
     return d->formula2;
 }
 
 /*!
     Returns whether blank is allowed.
  */
-bool DataValidation::allowBlank() const {
+bool DataValidation::allowBlank() const
+{
     return d->allowBlank;
 }
 
 /*!
     Returns the error message.
  */
-QString DataValidation::errorMessage() const {
+QString DataValidation::errorMessage() const
+{
     return d->errorMessage;
 }
 
 /*!
     Returns the error message title.
  */
-QString DataValidation::errorMessageTitle() const {
+QString DataValidation::errorMessageTitle() const
+{
     return d->errorMessageTitle;
 }
 
 /*!
     Returns the prompt message.
  */
-QString DataValidation::promptMessage() const {
+QString DataValidation::promptMessage() const
+{
     return d->promptMessage;
 }
 
 /*!
     Returns the prompt message title.
  */
-QString DataValidation::promptMessageTitle() const {
+QString DataValidation::promptMessageTitle() const
+{
     return d->promptMessageTitle;
 }
 
 /*!
     Returns the whether prompt message is shown.
  */
-bool DataValidation::isPromptMessageVisible() const {
+bool DataValidation::isPromptMessageVisible() const
+{
     return d->isPromptMessageVisible;
 }
 
 /*!
     Returns the whether error message is shown.
  */
-bool DataValidation::isErrorMessageVisible() const {
+bool DataValidation::isErrorMessageVisible() const
+{
     return d->isErrorMessageVisible;
 }
 
 /*!
     Returns the ranges on which the validation will be applied.
  */
-QList<CellRange> DataValidation::ranges() const {
+QList<CellRange> DataValidation::ranges() const
+{
     return d->ranges;
 }
 
 /*!
     Sets the validation type to \a type.
  */
-void DataValidation::setValidationType(DataValidation::ValidationType type) {
+void DataValidation::setValidationType(DataValidation::ValidationType type)
+{
     d->validationType = type;
 }
 
 /*!
     Sets the validation operator to \a op.
  */
-void DataValidation::setValidationOperator(DataValidation::ValidationOperator op) {
+void DataValidation::setValidationOperator(DataValidation::ValidationOperator op)
+{
     d->validationOperator = op;
 }
 
 /*!
     Sets the error style to \a es.
  */
-void DataValidation::setErrorStyle(DataValidation::ErrorStyle es) {
+void DataValidation::setErrorStyle(DataValidation::ErrorStyle es)
+{
     d->errorStyle = es;
 }
 
 /*!
     Sets the formula1 to \a formula.
  */
-void DataValidation::setFormula1(const QString &formula) {
+void DataValidation::setFormula1(const QString &formula)
+{
     if (formula.startsWith(QLatin1Char('=')))
         d->formula1 = formula.mid(1);
     else
@@ -261,7 +293,8 @@ void DataValidation::setFormula1(const QString &formula) {
 /*!
     Sets the formulas to \a formula.
  */
-void DataValidation::setFormula2(const QString &formula) {
+void DataValidation::setFormula2(const QString &formula)
+{
     if (formula.startsWith(QLatin1Char('=')))
         d->formula2 = formula.mid(1);
     else
@@ -271,44 +304,50 @@ void DataValidation::setFormula2(const QString &formula) {
 /*!
     Sets the error message to \a error with title \a title.
  */
-void DataValidation::setErrorMessage(const QString &error, const QString &title) {
-    d->errorMessage = error;
+void DataValidation::setErrorMessage(const QString &error, const QString &title)
+{
+    d->errorMessage      = error;
     d->errorMessageTitle = title;
 }
 
 /*!
     Sets the prompt message to \a prompt with title \a title.
  */
-void DataValidation::setPromptMessage(const QString &prompt, const QString &title) {
-    d->promptMessage = prompt;
+void DataValidation::setPromptMessage(const QString &prompt, const QString &title)
+{
+    d->promptMessage      = prompt;
     d->promptMessageTitle = title;
 }
 
 /*!
     Enable/disable blank allow based on \a enable.
  */
-void DataValidation::setAllowBlank(bool enable) {
+void DataValidation::setAllowBlank(bool enable)
+{
     d->allowBlank = enable;
 }
 
 /*!
     Enable/disable prompt message visible based on \a visible.
  */
-void DataValidation::setPromptMessageVisible(bool visible) {
+void DataValidation::setPromptMessageVisible(bool visible)
+{
     d->isPromptMessageVisible = visible;
 }
 
 /*!
     Enable/disable error message visible based on \a visible.
  */
-void DataValidation::setErrorMessageVisible(bool visible) {
+void DataValidation::setErrorMessageVisible(bool visible)
+{
     d->isErrorMessageVisible = visible;
 }
 
 /*!
     Add the \a cell on which the DataValidation will apply to.
  */
-void DataValidation::addCell(const CellReference &cell) {
+void DataValidation::addCell(const CellReference &cell)
+{
     d->ranges.append(CellRange(cell, cell));
 }
 
@@ -316,7 +355,8 @@ void DataValidation::addCell(const CellReference &cell) {
     \overload
     Add the cell(\a row, \a col) on which the DataValidation will apply to.
  */
-void DataValidation::addCell(int row, int col) {
+void DataValidation::addCell(int row, int col)
+{
     d->ranges.append(CellRange(row, col, row, col));
 }
 
@@ -325,21 +365,24 @@ void DataValidation::addCell(int row, int col) {
     Add the range(\a firstRow, \a firstCol, \a lastRow, \a lastCol) on
     which the DataValidation will apply to.
  */
-void DataValidation::addRange(int firstRow, int firstCol, int lastRow, int lastCol) {
+void DataValidation::addRange(int firstRow, int firstCol, int lastRow, int lastCol)
+{
     d->ranges.append(CellRange(firstRow, firstCol, lastRow, lastCol));
 }
 
 /*!
     Add the \a range on which the DataValidation will apply to.
  */
-void DataValidation::addRange(const CellRange &range) {
+void DataValidation::addRange(const CellRange &range)
+{
     d->ranges.append(range);
 }
 
 /*!
  * \internal
  */
-bool DataValidation::saveToXml(QXmlStreamWriter &writer) const {
+bool DataValidation::saveToXml(QXmlStreamWriter &writer) const
+{
     static const QMap<DataValidation::ValidationType, QString> typeMap = {
         {DataValidation::None, QStringLiteral("none")},
         {DataValidation::Whole, QStringLiteral("whole")},
@@ -400,7 +443,7 @@ bool DataValidation::saveToXml(QXmlStreamWriter &writer) const {
     if (!formula2().isEmpty())
         writer.writeTextElement(QStringLiteral("formula2"), formula2());
 
-    writer.writeEndElement();  // dataValidation
+    writer.writeEndElement(); // dataValidation
 
     return true;
 }
@@ -408,7 +451,8 @@ bool DataValidation::saveToXml(QXmlStreamWriter &writer) const {
 /*!
  * \internal
  */
-DataValidation DataValidation::loadFromXml(QXmlStreamReader &reader) {
+DataValidation DataValidation::loadFromXml(QXmlStreamReader &reader)
+{
     Q_ASSERT(reader.name() == QLatin1String("dataValidation"));
 
     static const QMap<QString, DataValidation::ValidationType> typeMap = {
@@ -439,24 +483,24 @@ DataValidation DataValidation::loadFromXml(QXmlStreamReader &reader) {
     DataValidation validation;
     QXmlStreamAttributes attrs = reader.attributes();
 
-    QString sqref = attrs.value(QLatin1String("sqref")).toString();
+    QString sqref         = attrs.value(QLatin1String("sqref")).toString();
     const auto sqrefParts = sqref.split(QLatin1Char(' '));
     for (const QString &range : sqrefParts)
         validation.addRange(range);
 
     if (attrs.hasAttribute(QLatin1String("type"))) {
         QString t = attrs.value(QLatin1String("type")).toString();
-        auto it = typeMap.constFind(t);
+        auto it   = typeMap.constFind(t);
         validation.setValidationType(it != typeMap.constEnd() ? it.value() : DataValidation::None);
     }
     if (attrs.hasAttribute(QLatin1String("errorStyle"))) {
         QString es = attrs.value(QLatin1String("errorStyle")).toString();
-        auto it = esMap.constFind(es);
+        auto it    = esMap.constFind(es);
         validation.setErrorStyle(it != esMap.constEnd() ? it.value() : DataValidation::Stop);
     }
     if (attrs.hasAttribute(QLatin1String("operator"))) {
         QString op = attrs.value(QLatin1String("operator")).toString();
-        auto it = opMap.constFind(op);
+        auto it    = opMap.constFind(op);
         validation.setValidationOperator(it != opMap.constEnd() ? it.value()
                                                                 : DataValidation::Between);
     }
@@ -477,12 +521,12 @@ DataValidation DataValidation::loadFromXml(QXmlStreamReader &reader) {
     }
 
     QString et = attrs.value(QLatin1String("errorTitle")).toString();
-    QString e = attrs.value(QLatin1String("error")).toString();
+    QString e  = attrs.value(QLatin1String("error")).toString();
     if (!e.isEmpty() || !et.isEmpty())
         validation.setErrorMessage(e, et);
 
     QString pt = attrs.value(QLatin1String("promptTitle")).toString();
-    QString p = attrs.value(QLatin1String("prompt")).toString();
+    QString p  = attrs.value(QLatin1String("prompt")).toString();
     if (!p.isEmpty() || !pt.isEmpty())
         validation.setPromptMessage(p, pt);
 

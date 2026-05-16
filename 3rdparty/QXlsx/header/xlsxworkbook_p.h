@@ -3,22 +3,30 @@
 #ifndef XLSXWORKBOOK_P_H
 #define XLSXWORKBOOK_P_H
 
-#include <QStringList>
-
 #include "xlsxabstractooxmlfile_p.h"
 #include "xlsxrelationships_p.h"
 #include "xlsxsimpleooxmlfile_p.h"
 #include "xlsxtheme_p.h"
 #include "xlsxworkbook.h"
 
+#include <QStringList>
+
 QT_BEGIN_NAMESPACE_XLSX
 
 struct XlsxDefineNameData {
-    XlsxDefineNameData() : sheetId(-1) {
+    XlsxDefineNameData()
+        : sheetId(-1)
+    {
     }
-    XlsxDefineNameData(const QString &name, const QString &formula, const QString &comment,
+    XlsxDefineNameData(const QString &name,
+                       const QString &formula,
+                       const QString &comment,
                        int sheetId = -1)
-        : name(name), formula(formula), comment(comment), sheetId(sheetId) {
+        : name(name)
+        , formula(formula)
+        , comment(comment)
+        , sheetId(sheetId)
+    {
     }
     QString name;
     QString formula;
@@ -27,9 +35,10 @@ struct XlsxDefineNameData {
     int sheetId;
 };
 
-class WorkbookPrivate : public AbstractOOXmlFilePrivate {
+class WorkbookPrivate : public AbstractOOXmlFilePrivate
+{
     Q_DECLARE_PUBLIC(Workbook)
-   public:
+public:
     WorkbookPrivate(Workbook *q, Workbook::CreateFlag flag);
 
     std::shared_ptr<SharedStrings> sharedStrings;
@@ -67,4 +76,4 @@ class WorkbookPrivate : public AbstractOOXmlFilePrivate {
 
 QT_END_NAMESPACE_XLSX
 
-#endif  // XLSXWORKBOOK_P_H
+#endif // XLSXWORKBOOK_P_H

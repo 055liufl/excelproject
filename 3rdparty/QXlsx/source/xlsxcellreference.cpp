@@ -2,17 +2,18 @@
 
 #include "xlsxcellreference.h"
 
+#include "xlsxworksheet_p.h"
+
 #include <QMap>
 #include <QRegularExpression>
 #include <QStringList>
-
-#include "xlsxworksheet_p.h"
 
 QT_BEGIN_NAMESPACE_XLSX
 
 namespace {
 
-int intPow(int x, int p) {
+int intPow(int x, int p)
+{
     if (p == 0)
         return 1;
     if (p == 1)
@@ -25,7 +26,8 @@ int intPow(int x, int p) {
         return x * tmp * tmp;
 }
 
-QString col_to_name(int col_num) {
+QString col_to_name(int col_num)
+{
     QString col_str;
     int remainder;
     while (col_num) {
@@ -38,8 +40,9 @@ QString col_to_name(int col_num) {
     return col_str;
 }
 
-int col_from_name(const QString &col_str) {
-    int col = 0;
+int col_from_name(const QString &col_str)
+{
+    int col  = 0;
     int expn = 0;
     for (int i = col_str.size() - 1; i > -1; --i) {
         col += (col_str[i].unicode() - 'A' + 1) * intPow(26, expn);
@@ -48,7 +51,7 @@ int col_from_name(const QString &col_str) {
 
     return col;
 }
-}  // namespace
+} // namespace
 
 /*!
     \class CellReference
@@ -67,7 +70,8 @@ CellReference::CellReference() = default;
     \overload
     Constructs the Reference form the given \a cell string.
 */
-CellReference::CellReference(const QString &cell) {
+CellReference::CellReference(const QString &cell)
+{
     init(cell);
 }
 
@@ -75,18 +79,20 @@ CellReference::CellReference(const QString &cell) {
     \overload
     Constructs the Reference form the given \a cell string.
 */
-CellReference::CellReference(const char *cell) {
+CellReference::CellReference(const char *cell)
+{
     init(QString::fromLatin1(cell));
 }
 
-void CellReference::init(const QString &cell_str) {
+void CellReference::init(const QString &cell_str)
+{
     static const QRegularExpression re(QStringLiteral("^\\$?([A-Z]{1,3})\\$?(\\d+)$"));
     QRegularExpressionMatch match = re.match(cell_str);
     if (match.hasMatch()) {
         const QString col_str = match.captured(1);
         const QString row_str = match.captured(2);
-        _row = row_str.toInt();
-        _column = col_from_name(col_str);
+        _row                  = row_str.toInt();
+        _column               = col_from_name(col_str);
     }
 }
 
@@ -95,20 +101,24 @@ void CellReference::init(const QString &cell_str) {
     other Reference.
 */
 CellReference::CellReference(const CellReference &other)
-    : _row(other._row), _column(other._column) {
+    : _row(other._row)
+    , _column(other._column)
+{
 }
 
 /*!
     Destroys the Reference.
 */
-CellReference::~CellReference() {
+CellReference::~CellReference()
+{
 }
 
 /*!
      Convert the Reference to string notation, such as "A1" or "$A$1".
      If current object is invalid, an empty string will be returned.
 */
-QString CellReference::toString(bool row_abs, bool col_abs) const {
+QString CellReference::toString(bool row_abs, bool col_abs) const
+{
     if (!isValid())
         return {};
 
@@ -125,7 +135,8 @@ QString CellReference::toString(bool row_abs, bool col_abs) const {
 /*!
  * Returns true if the Reference is valid.
  */
-bool CellReference::isValid() const {
+bool CellReference::isValid() const
+{
     return _row > 0 && _column > 0;
 }
 

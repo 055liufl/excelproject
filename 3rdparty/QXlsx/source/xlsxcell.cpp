@@ -2,32 +2,36 @@
 
 #include "xlsxcell.h"
 
-#include <QDate>
-#include <QDateTime>
-#include <QDebug>
-#include <QTime>
-
 #include "xlsxcell_p.h"
 #include "xlsxformat.h"
 #include "xlsxformat_p.h"
 #include "xlsxutility_p.h"
 #include "xlsxworkbook.h"
 #include "xlsxworksheet.h"
+
 #include <cmath>
+
+#include <QDate>
+#include <QDateTime>
+#include <QDebug>
+#include <QTime>
 
 QT_BEGIN_NAMESPACE_XLSX
 
-CellPrivate::CellPrivate(Cell *p) : q_ptr(p) {
+CellPrivate::CellPrivate(Cell *p)
+    : q_ptr(p)
+{
 }
 
 CellPrivate::CellPrivate(const CellPrivate *const cp)
-    : parent(cp->parent),
-      cellType(cp->cellType),
-      value(cp->value),
-      formula(cp->formula),
-      format(cp->format),
-      richString(cp->richString),
-      styleNumber(cp->styleNumber) {
+    : parent(cp->parent)
+    , cellType(cp->cellType)
+    , value(cp->value)
+    , formula(cp->formula)
+    , format(cp->format)
+    , richString(cp->richString)
+    , styleNumber(cp->styleNumber)
+{
 }
 
 /*!
@@ -52,34 +56,42 @@ CellPrivate::CellPrivate(const CellPrivate *const cp)
  * Created by Worksheet only.
  */
 // qint32 styleIndex = (-1)
-Cell::Cell(const QVariant &data, CellType type, const Format &format, Worksheet *parent,
+Cell::Cell(const QVariant &data,
+           CellType type,
+           const Format &format,
+           Worksheet *parent,
            qint32 styleIndex)
-    : d_ptr(new CellPrivate(this)) {
-    d_ptr->value = data;
-    d_ptr->cellType = type;
-    d_ptr->format = format;
-    d_ptr->parent = parent;
+    : d_ptr(new CellPrivate(this))
+{
+    d_ptr->value       = data;
+    d_ptr->cellType    = type;
+    d_ptr->format      = format;
+    d_ptr->parent      = parent;
     d_ptr->styleNumber = styleIndex;
 }
 
 /*!
  * \internal
  */
-Cell::Cell(const Cell *const cell) : d_ptr(new CellPrivate(cell->d_ptr)) {
+Cell::Cell(const Cell *const cell)
+    : d_ptr(new CellPrivate(cell->d_ptr))
+{
     d_ptr->q_ptr = this;
 }
 
 /*!
  * Destroys the Cell and cleans up.
  */
-Cell::~Cell() {
+Cell::~Cell()
+{
     delete d_ptr;
 }
 
 /*!
  * Return the dataType of this Cell
  */
-Cell::CellType Cell::cellType() const {
+Cell::CellType Cell::cellType() const
+{
     Q_D(const Cell);
 
     return d->cellType;
@@ -88,7 +100,8 @@ Cell::CellType Cell::cellType() const {
 /*!
  * Return the data content of this Cell
  */
-QVariant Cell::value() const {
+QVariant Cell::value() const
+{
     Q_D(const Cell);
 
     return d->value;
@@ -97,10 +110,11 @@ QVariant Cell::value() const {
 /*!
  * Return the data content of this Cell for reading
  */
-QVariant Cell::readValue() const {
+QVariant Cell::readValue() const
+{
     Q_D(const Cell);
 
-    QVariant ret;  // return value
+    QVariant ret; // return value
     ret = d->value;
 
     Format fmt = this->format();
@@ -113,7 +127,7 @@ QVariant Cell::readValue() const {
 
 // https://github.com/QtExcel/QXlsx/issues/171
 // https://www.qt.io/blog/whats-new-in-qmetatype-qvariant
-#if QT_VERSION >= 0x060000  // Qt 6.0 or over
+#if QT_VERSION >= 0x060000 // Qt 6.0 or over
         if (vDT.metaType().id() == QMetaType::QDateTime) {
             ret = vDT;
         } else if (vDT.metaType().id() == QMetaType::QDate) {
@@ -193,8 +207,8 @@ QVariant Cell::readValue() const {
 
     if (hasFormula()) {
         QString formulaString = this->formula().formulaText();
-        ret = formulaString;
-        return ret;  // return formula string
+        ret                   = formulaString;
+        return ret; // return formula string
     }
 
     return ret;
@@ -203,7 +217,8 @@ QVariant Cell::readValue() const {
 /*!
  * Return the style used by this Cell. If no style used, 0 will be returned.
  */
-Format Cell::format() const {
+Format Cell::format() const
+{
     Q_D(const Cell);
 
     return d->format;
@@ -212,7 +227,8 @@ Format Cell::format() const {
 /*!
  * Returns true if the cell has one formula.
  */
-bool Cell::hasFormula() const {
+bool Cell::hasFormula() const
+{
     Q_D(const Cell);
 
     return d->formula.isValid();
@@ -221,7 +237,8 @@ bool Cell::hasFormula() const {
 /*!
  * Return the formula contents if the dataType is Formula
  */
-CellFormula Cell::formula() const {
+CellFormula Cell::formula() const
+{
     Q_D(const Cell);
 
     return d->formula;
@@ -230,14 +247,15 @@ CellFormula Cell::formula() const {
 /*!
  * Returns whether the value is probably a dateTime or not
  */
-bool Cell::isDateTime() const {
+bool Cell::isDateTime() const
+{
     Q_D(const Cell);
 
     Cell::CellType cellType = d->cellType;
-    double dValue = d->value.toDouble();  // number
+    double dValue           = d->value.toDouble(); // number
     //	QString strValue = d->value.toString().toUtf8();
-    bool isValidFormat = d->format.isValid();
-    bool isDateTimeFormat = d->format.isDateTimeFormat();  // datetime format
+    bool isValidFormat    = d->format.isValid();
+    bool isDateTimeFormat = d->format.isDateTimeFormat(); // datetime format
 
     // dev67
     if (cellType == NumberType || cellType == DateType || cellType == CustomType) {
@@ -263,7 +281,8 @@ QDateTime Cell::dateTime() const
         return datetimeFromNumber(d->value.toDouble(), d->parent->workbook()->isDate1904());
 }
 */
-QVariant Cell::dateTime() const {
+QVariant Cell::dateTime() const
+{
     Q_D(const Cell);
 
     if (!isDateTime()) {
@@ -273,16 +292,17 @@ QVariant Cell::dateTime() const {
     // dev57
 
     QVariant ret;
-    double dValue = d->value.toDouble();
+    double dValue   = d->value.toDouble();
     bool isDate1904 = d->parent->workbook()->isDate1904();
-    ret = datetimeFromNumber(dValue, isDate1904);
+    ret             = datetimeFromNumber(dValue, isDate1904);
     return ret;
 }
 
 /*!
  * Returns whether the cell is probably a rich string or not
  */
-bool Cell::isRichString() const {
+bool Cell::isRichString() const
+{
     Q_D(const Cell);
 
     if (d->cellType != SharedStringType && d->cellType != InlineStringType &&
@@ -293,14 +313,16 @@ bool Cell::isRichString() const {
     return d->richString.isRichString();
 }
 
-qint32 Cell::styleNumber() const {
+qint32 Cell::styleNumber() const
+{
     Q_D(const Cell);
 
     qint32 ret = d->styleNumber;
     return ret;
 }
 
-bool Cell::isDateType(CellType cellType, const Format &format) {
+bool Cell::isDateType(CellType cellType, const Format &format)
+{
     if (cellType == NumberType || cellType == DateType || cellType == CustomType) {
         return format.isValid() && format.isDateTimeFormat();
     }

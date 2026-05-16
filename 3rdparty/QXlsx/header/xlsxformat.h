@@ -3,14 +3,14 @@
 #ifndef QXLSX_FORMAT_H
 #define QXLSX_FORMAT_H
 
+#include "xlsxglobal.h"
+
 #include <QByteArray>
 #include <QColor>
 #include <QExplicitlySharedDataPointer>
 #include <QFont>
 #include <QList>
 #include <QVariant>
-
-#include "xlsxglobal.h"
 
 class FormatTest;
 
@@ -24,8 +24,9 @@ class SharedStrings;
 
 class FormatPrivate;
 
-class QXLSX_EXPORT Format {
-   public:
+class QXLSX_EXPORT Format
+{
+public:
     enum FontScript { FontScriptNormal, FontScriptSuper, FontScriptSub };
 
     enum FontUnderline {
@@ -192,8 +193,10 @@ class QXLSX_EXPORT Format {
     bool operator!=(const Format &format) const;
 
     QVariant property(int propertyId, const QVariant &defaultValue = QVariant()) const;
-    void setProperty(int propertyId, const QVariant &value, const QVariant &clearValue = QVariant(),
-                     bool detach = true);
+    void setProperty(int propertyId,
+                     const QVariant &value,
+                     const QVariant &clearValue = QVariant(),
+                     bool detach                = true);
     void clearProperty(int propertyId);
     bool hasProperty(int propertyId) const;
 
@@ -233,7 +236,7 @@ class QXLSX_EXPORT Format {
     void setXfIndex(int index);
     void setDxfIndex(int index);
 
-   private:
+private:
     friend class Styles;
     friend class ::FormatTest;
     friend QDebug operator<<(QDebug, const Format &f);
@@ -249,4 +252,4 @@ QDebug operator<<(QDebug dbg, const Format &f);
 
 QT_END_NAMESPACE_XLSX
 
-#endif  // QXLSX_FORMAT_H
+#endif // QXLSX_FORMAT_H

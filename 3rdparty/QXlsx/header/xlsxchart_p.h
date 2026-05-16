@@ -3,6 +3,11 @@
 #ifndef QXLSX_CHART_P_H
 #define QXLSX_CHART_P_H
 
+#include "xlsxabstractooxmlfile_p.h"
+#include "xlsxchart.h"
+
+#include <memory>
+
 #include <QList>
 #include <QMap>
 #include <QObject>
@@ -11,35 +16,33 @@
 #include <QXmlStreamReader>
 #include <QXmlStreamWriter>
 
-#include "xlsxabstractooxmlfile_p.h"
-#include "xlsxchart.h"
-#include <memory>
-
 QT_BEGIN_NAMESPACE_XLSX
 
-class XlsxSeries {
-   public:
+class XlsxSeries
+{
+public:
     // At present, we care about number cell ranges only!
-    QString numberDataSource_numRef;  // yval, val
-    QString axDataSource_numRef;      // xval, cat
+    QString numberDataSource_numRef; // yval, val
+    QString axDataSource_numRef;     // xval, cat
     QString headerH_numRef;
     QString headerV_numRef;
     bool swapHeader = false;
 };
 
-class XlsxAxis {
-   public:
+class XlsxAxis
+{
+public:
     enum Type { T_None = (-1), T_Cat, T_Val, T_Date, T_Ser };
     enum AxisPos { None = (-1), Left, Right, Top, Bottom };
 
-   public:
-    XlsxAxis() {
-    }
+public:
+    XlsxAxis() {}
 
-    XlsxAxis(Type t, XlsxAxis::AxisPos p, int id, int crossId, QString axisTitle = QString()) {
-        type = t;
+    XlsxAxis(Type t, XlsxAxis::AxisPos p, int id, int crossId, QString axisTitle = QString())
+    {
+        type    = t;
         axisPos = p;
-        axisId = id;
+        axisId  = id;
         crossAx = crossId;
 
         if (!axisTitle.isEmpty()) {
@@ -47,7 +50,7 @@ class XlsxAxis {
         }
     }
 
-   public:
+public:
     Type type;
     XlsxAxis::AxisPos axisPos;
     int axisId;
@@ -55,21 +58,22 @@ class XlsxAxis {
     QMap<XlsxAxis::AxisPos, QString> axisNames;
 };
 
-class ChartPrivate : public AbstractOOXmlFilePrivate {
+class ChartPrivate : public AbstractOOXmlFilePrivate
+{
     Q_DECLARE_PUBLIC(Chart)
 
-   public:
+public:
     ChartPrivate(Chart *q, Chart::CreateFlag flag);
     ~ChartPrivate();
 
-   public:
+public:
     bool loadXmlChart(QXmlStreamReader &reader);
     bool loadXmlPlotArea(QXmlStreamReader &reader);
 
-   protected:
+protected:
     bool loadXmlPlotAreaElement(QXmlStreamReader &reader);
 
-   public:
+public:
     bool loadXmlXxxChart(QXmlStreamReader &reader);
     bool loadXmlSer(QXmlStreamReader &reader);
     QString loadXmlNumRef(QXmlStreamReader &reader);
@@ -77,13 +81,13 @@ class ChartPrivate : public AbstractOOXmlFilePrivate {
     bool loadXmlChartTitle(QXmlStreamReader &reader);
     bool loadXmlChartLegend(QXmlStreamReader &reader);
 
-   protected:
+protected:
     bool loadXmlChartTitleTx(QXmlStreamReader &reader);
     bool loadXmlChartTitleTxRich(QXmlStreamReader &reader);
     bool loadXmlChartTitleTxRichP(QXmlStreamReader &reader);
     bool loadXmlChartTitleTxRichP_R(QXmlStreamReader &reader);
 
-   protected:
+protected:
     bool loadXmlAxisCatAx(QXmlStreamReader &reader);
     bool loadXmlAxisDateAx(QXmlStreamReader &reader);
     bool loadXmlAxisSerAx(QXmlStreamReader &reader);
@@ -100,7 +104,7 @@ class ChartPrivate : public AbstractOOXmlFilePrivate {
 
     QString readSubTree(QXmlStreamReader &reader);
 
-   public:
+public:
     void saveXmlChart(QXmlStreamWriter &writer) const;
     void saveXmlChartTitle(QXmlStreamWriter &writer) const;
     void saveXmlPieChart(QXmlStreamWriter &writer) const;
@@ -113,7 +117,7 @@ class ChartPrivate : public AbstractOOXmlFilePrivate {
     void saveXmlAxis(QXmlStreamWriter &writer) const;
     void saveXmlChartLegend(QXmlStreamWriter &writer) const;
 
-   protected:
+protected:
     void saveXmlAxisCatAx(QXmlStreamWriter &writer, XlsxAxis *axis) const;
     void saveXmlAxisDateAx(QXmlStreamWriter &writer, XlsxAxis *axis) const;
     void saveXmlAxisSerAx(QXmlStreamWriter &writer, XlsxAxis *axis) const;
@@ -124,7 +128,7 @@ class ChartPrivate : public AbstractOOXmlFilePrivate {
     QString GetAxisPosString(XlsxAxis::AxisPos axisPos) const;
     QString GetAxisName(XlsxAxis *ptrXlsxAxis) const;
 
-   public:
+public:
     Chart::ChartType chartType;
     QList<std::shared_ptr<XlsxSeries>> seriesList;
     QList<std::shared_ptr<XlsxAxis>> axisList;
@@ -136,9 +140,9 @@ class ChartPrivate : public AbstractOOXmlFilePrivate {
     bool majorGridlinesEnabled;
     bool minorGridlinesEnabled;
 
-    QString layout;  // only for storing a read file
+    QString layout; // only for storing a read file
 };
 
 QT_END_NAMESPACE_XLSX
 
-#endif  // QXLSX_CHART_P_H
+#endif // QXLSX_CHART_P_H

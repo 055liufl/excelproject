@@ -3,28 +3,29 @@
 #ifndef XLSXCELL_P_H
 #define XLSXCELL_P_H
 
-#include <QList>
-#include <QObject>
-
 #include "xlsxcell.h"
 #include "xlsxcellformula.h"
 #include "xlsxcellrange.h"
 #include "xlsxglobal.h"
 #include "xlsxrichstring.h"
 
+#include <QList>
+#include <QObject>
+
 QT_BEGIN_NAMESPACE_XLSX
 
-class CellPrivate {
+class CellPrivate
+{
     Q_DECLARE_PUBLIC(Cell)
-   public:
+public:
     CellPrivate(Cell *p);
     CellPrivate(const CellPrivate *const cp);
 
-   public:
+public:
     Worksheet *parent;
     Cell *q_ptr;
 
-   public:
+public:
     Cell::CellType cellType;
     QVariant value;
 
@@ -38,4 +39,4 @@ class CellPrivate {
 
 QT_END_NAMESPACE_XLSX
 
-#endif  // XLSXCELL_P_H
+#endif // XLSXCELL_P_H

@@ -36,11 +36,11 @@
 // We mean it.
 //
 
+#include "xlsxglobal.h"
+
 #include <QIODevice>
 #include <QList>
 #include <QString>
-
-#include "xlsxglobal.h"
 
 QT_BEGIN_NAMESPACE_XLSX
 
@@ -51,8 +51,9 @@ struct XlsxRelationship {
     QString targetMode;
 };
 
-class Relationships {
-   public:
+class Relationships
+{
+public:
     Relationships();
 
     QList<XlsxRelationship> documentRelationships(const QString &relativeType) const;
@@ -63,7 +64,8 @@ class Relationships {
     void addDocumentRelationship(const QString &relativeType, const QString &target);
     void addPackageRelationship(const QString &relativeType, const QString &target);
     void addMsPackageRelationship(const QString &relativeType, const QString &target);
-    void addWorksheetRelationship(const QString &relativeType, const QString &target,
+    void addWorksheetRelationship(const QString &relativeType,
+                                  const QString &target,
                                   const QString &targetMode = QString());
 
     void saveToXmlFile(QIODevice *device) const;
@@ -76,9 +78,10 @@ class Relationships {
     int count() const;
     bool isEmpty() const;
 
-   private:
+private:
     QList<XlsxRelationship> relationships(const QString &type) const;
-    void addRelationship(const QString &type, const QString &target,
+    void addRelationship(const QString &type,
+                         const QString &target,
                          const QString &targetMode = QString());
 
     QList<XlsxRelationship> m_relationships;
@@ -86,4 +89,4 @@ class Relationships {
 
 QT_END_NAMESPACE_XLSX
 
-#endif  // XLSXRELATIONSHIPS_H
+#endif // XLSXRELATIONSHIPS_H

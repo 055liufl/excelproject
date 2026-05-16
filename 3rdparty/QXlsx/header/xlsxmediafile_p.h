@@ -3,19 +3,20 @@
 #ifndef QXLSX_XLSXMEDIAFILE_H
 #define QXLSX_XLSXMEDIAFILE_H
 
+#include "xlsxglobal.h"
+
 #include <QByteArray>
 #include <QString>
 
-#include "xlsxglobal.h"
-
 QT_BEGIN_NAMESPACE_XLSX
 
-class MediaFile {
-   public:
+class MediaFile
+{
+public:
     MediaFile(const QString &fileName);
     MediaFile(const QByteArray &bytes, const QString &suffix, const QString &mimeType = QString());
 
-   public:
+public:
     void set(const QByteArray &bytes, const QString &suffix, const QString &mimeType = QString());
     QString suffix() const;
     QString mimeType() const;
@@ -29,7 +30,7 @@ class MediaFile {
     void setFileName(const QString &name);
     QString fileName() const;
 
-   protected:
+protected:
     QString m_fileName;
     QByteArray m_contents;
     QString m_suffix;
@@ -42,4 +43,4 @@ class MediaFile {
 
 QT_END_NAMESPACE_XLSX
 
-#endif  // QXLSX_XLSXMEDIAFILE_H
+#endif // QXLSX_XLSXMEDIAFILE_H

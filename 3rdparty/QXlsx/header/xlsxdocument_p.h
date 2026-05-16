@@ -3,19 +3,21 @@
 #ifndef XLSXDOCUMENT_P_H
 #define XLSXDOCUMENT_P_H
 
-#include <QMap>
-
 #include "xlsxcontenttypes_p.h"
 #include "xlsxdocument.h"
 #include "xlsxglobal.h"
 #include "xlsxworkbook.h"
+
+#include <QMap>
+
 #include <memory>
 
 QT_BEGIN_NAMESPACE_XLSX
 
-class DocumentPrivate {
+class DocumentPrivate
+{
     Q_DECLARE_PUBLIC(Document)
-   public:
+public:
     DocumentPrivate(Document *p);
     void init();
 
@@ -28,19 +30,18 @@ class DocumentPrivate {
     static bool copyStyle(const QString &from, const QString &to);
 
     Document *q_ptr;
-    const QString defaultPackageName;  // default name when package name not specified
-    QString packageName;               // name of the .xlsx file
+    const QString defaultPackageName; // default name when package name not specified
+    QString packageName;              // name of the .xlsx file
 
-    QMap<QString, QString> documentProperties;  // core, app and custom properties
+    QMap<QString, QString> documentProperties; // core, app and custom properties
     std::shared_ptr<Workbook> workbook;
     std::shared_ptr<ContentTypes> contentTypes;
     bool isLoad;
 
-    // Store the entire xlsx (zip) bytes so that even when opened with QIODevice, the zip can be
-    // reopened in SAX
+    // Store the entire xlsx (zip) bytes so that even when opened with QIODevice, the zip can be reopened in SAX
     std::shared_ptr<QByteArray> package_bytes;
 };
 
 QT_END_NAMESPACE_XLSX
 
-#endif  // XLSXDOCUMENT_P_H
+#endif // XLSXDOCUMENT_P_H

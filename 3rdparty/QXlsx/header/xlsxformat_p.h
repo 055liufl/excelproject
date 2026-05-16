@@ -2,23 +2,24 @@
 #ifndef XLSXFORMAT_P_H
 #define XLSXFORMAT_P_H
 
+#include "xlsxformat.h"
+
 #include <QMap>
 #include <QSet>
 #include <QSharedData>
 
-#include "xlsxformat.h"
-
 QT_BEGIN_NAMESPACE_XLSX
 
-class FormatPrivate : public QSharedData {
-   public:
+class FormatPrivate : public QSharedData
+{
+public:
     enum FormatType {
-        FT_Invalid = 0,
-        FT_NumFmt = 0x01,
-        FT_Font = 0x02,
-        FT_Alignment = 0x04,
-        FT_Border = 0x08,
-        FT_Fill = 0x10,
+        FT_Invalid    = 0,
+        FT_NumFmt     = 0x01,
+        FT_Font       = 0x02,
+        FT_Alignment  = 0x04,
+        FT_Border     = 0x08,
+        FT_Fill       = 0x10,
         FT_Protection = 0x20
     };
 
@@ -91,7 +92,7 @@ class FormatPrivate : public QSharedData {
     FormatPrivate(const FormatPrivate &other);
     ~FormatPrivate();
 
-    bool dirty;  // The key re-generation is need.
+    bool dirty; // The key re-generation is need.
     QByteArray formatKey;
 
     bool font_dirty;

@@ -36,29 +36,34 @@
 // We mean it.
 //
 
+#include "xlsxabstractooxmlfile.h"
+#include "xlsxglobal.h"
+#include "xlsxrichstring.h"
+
 #include <QHash>
 #include <QIODevice>
 #include <QStringList>
 #include <QXmlStreamReader>
 #include <QXmlStreamWriter>
 
-#include "xlsxabstractooxmlfile.h"
-#include "xlsxglobal.h"
-#include "xlsxrichstring.h"
-
 QT_BEGIN_NAMESPACE_XLSX
 
-class XlsxSharedStringInfo {
-   public:
-    XlsxSharedStringInfo(int index = 0, int count = 1) : index(index), count(count) {
+class XlsxSharedStringInfo
+{
+public:
+    XlsxSharedStringInfo(int index = 0, int count = 1)
+        : index(index)
+        , count(count)
+    {
     }
 
     int index;
     int count;
 };
 
-class SharedStrings : public AbstractOOXmlFile {
-   public:
+class SharedStrings : public AbstractOOXmlFile
+{
+public:
     SharedStrings(CreateFlag flag);
     int count() const;
     bool isEmpty() const;
@@ -77,18 +82,18 @@ class SharedStrings : public AbstractOOXmlFile {
     void saveToXmlFile(QIODevice *device) const override;
     bool loadFromXmlFile(QIODevice *device) override;
 
-   private:
-    void readString(QXmlStreamReader &reader);                             // <si>
-    void readRichStringPart(QXmlStreamReader &reader, RichString &rich);   // <r>
-    void readPlainStringPart(QXmlStreamReader &reader, RichString &rich);  // <v>
+private:
+    void readString(QXmlStreamReader &reader);                            // <si>
+    void readRichStringPart(QXmlStreamReader &reader, RichString &rich);  // <r>
+    void readPlainStringPart(QXmlStreamReader &reader, RichString &rich); // <v>
     Format readRichStringPart_rPr(QXmlStreamReader &reader);
     void writeRichStringPart_rPr(QXmlStreamWriter &writer, const Format &format) const;
 
-    QHash<RichString, XlsxSharedStringInfo> m_stringTable;  // for fast lookup
+    QHash<RichString, XlsxSharedStringInfo> m_stringTable; // for fast lookup
     QList<RichString> m_stringList;
     int m_stringCount;
 };
 
 QT_END_NAMESPACE_XLSX
 
-#endif  // XLSXSHAREDSTRINGS_H
+#endif // XLSXSHAREDSTRINGS_H

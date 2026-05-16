@@ -2,20 +2,26 @@
 
 #include "xlsxcellformula.h"
 
+#include "xlsxcellformula_p.h"
+#include "xlsxutility_p.h"
+
 #include <QDebug>
 #include <QObject>
 #include <QString>
 #include <QXmlStreamReader>
 #include <QXmlStreamWriter>
 
-#include "xlsxcellformula_p.h"
-#include "xlsxutility_p.h"
-
 QT_BEGIN_NAMESPACE_XLSX
 
-CellFormulaPrivate::CellFormulaPrivate(const QString &formula_, const CellRange &ref_,
+CellFormulaPrivate::CellFormulaPrivate(const QString &formula_,
+                                       const CellRange &ref_,
                                        CellFormula::FormulaType type_)
-    : formula(formula_), type(type_), reference(ref_), ca(false), si(0) {
+    : formula(formula_)
+    , type(type_)
+    , reference(ref_)
+    , ca(false)
+    , si(0)
+{
     // Remove the formula '=' sign if exists
     if (formula.startsWith(QLatin1String("=")))
         formula.remove(0, 1);
@@ -24,15 +30,17 @@ CellFormulaPrivate::CellFormulaPrivate(const QString &formula_, const CellRange 
 }
 
 CellFormulaPrivate::CellFormulaPrivate(const CellFormulaPrivate &other)
-    : QSharedData(other),
-      formula(other.formula),
-      type(other.type),
-      reference(other.reference),
-      ca(other.ca),
-      si(other.si) {
+    : QSharedData(other)
+    , formula(other.formula)
+    , type(other.type)
+    , reference(other.reference)
+    , ca(other.ca)
+    , si(other.si)
+{
 }
 
-CellFormulaPrivate::~CellFormulaPrivate() {
+CellFormulaPrivate::~CellFormulaPrivate()
+{
 }
 
 /*!
@@ -53,7 +61,8 @@ CellFormulaPrivate::~CellFormulaPrivate() {
 /*!
  *  Creates a new formula.
  */
-CellFormula::CellFormula() {
+CellFormula::CellFormula()
+{
     // The d pointer is initialized with a null pointer
 }
 
@@ -61,35 +70,41 @@ CellFormula::CellFormula() {
  *  Creates a new formula with the given \a formula and \a type.
  */
 CellFormula::CellFormula(const char *formula, FormulaType type)
-    : d(new CellFormulaPrivate(QString::fromLatin1(formula), CellRange(), type)) {
+    : d(new CellFormulaPrivate(QString::fromLatin1(formula), CellRange(), type))
+{
 }
 
 /*!
  *  Creates a new formula with the given \a formula and \a type.
  */
 CellFormula::CellFormula(const QString &formula, FormulaType type)
-    : d(new CellFormulaPrivate(formula, CellRange(), type)) {
+    : d(new CellFormulaPrivate(formula, CellRange(), type))
+{
 }
 
 /*!
  *  Creates a new formula with the given \a formula, \a ref and \a type.
  */
 CellFormula::CellFormula(const QString &formula, const CellRange &ref, FormulaType type)
-    : d(new CellFormulaPrivate(formula, ref, type)) {
+    : d(new CellFormulaPrivate(formula, ref, type))
+{
 }
 
 /*!
    Creates a new formula with the same attributes as the \a other formula.
  */
-CellFormula::CellFormula(const CellFormula &other) : d(other.d) {
+CellFormula::CellFormula(const CellFormula &other)
+    : d(other.d)
+{
 }
 
 /*!
    Assigns the \a other formula to this formula, and returns a
    reference to this formula.
  */
-CellFormula &CellFormula::operator=(const CellFormula &other) {
-    if (this != &other)  // Self-assignment check [cert-oop54-cpp]
+CellFormula &CellFormula::operator=(const CellFormula &other)
+{
+    if (this != &other) // Self-assignment check [cert-oop54-cpp]
     {
         this->d = other.d;
     }
@@ -99,20 +114,23 @@ CellFormula &CellFormula::operator=(const CellFormula &other) {
 /*!
  * Destroys this formula.
  */
-CellFormula::~CellFormula() {
+CellFormula::~CellFormula()
+{
 }
 
 /*!
  * Returns the type of the formula.
  */
-CellFormula::FormulaType CellFormula::formulaType() const {
+CellFormula::FormulaType CellFormula::formulaType() const
+{
     return d ? d->type : NormalType;
 }
 
 /*!
  * Returns the contents of the formula.
  */
-QString CellFormula::formulaText() const {
+QString CellFormula::formulaText() const
+{
     return d ? d->formula : QString();
 }
 
@@ -120,21 +138,24 @@ QString CellFormula::formulaText() const {
  * Returns the reference cells of the formula. For normal formula,
  * this will return an invalid CellRange object.
  */
-CellRange CellFormula::reference() const {
+CellRange CellFormula::reference() const
+{
     return d ? d->reference : CellRange();
 }
 
 /*!
  * Returns whether the formula is valid.
  */
-bool CellFormula::isValid() const {
+bool CellFormula::isValid() const
+{
     return d;
 }
 
 /*!
  * Returns the shared index for shared formula.
  */
-int CellFormula::sharedIndex() const {
+int CellFormula::sharedIndex() const
+{
     return d && d->type == SharedType ? d->si : (-1);
 }
 
@@ -226,7 +247,9 @@ int CellFormula::sharedIndex() const {
  * \internal
  * \remark pair with loadFromXml()
  */
-bool CellFormula::saveToXml(QXmlStreamWriter &writer) const {
+bool CellFormula::saveToXml(QXmlStreamWriter &writer) const
+{
+
     // t (Formula Type)
     //
     // Type of formula.
@@ -241,21 +264,21 @@ bool CellFormula::saveToXml(QXmlStreamWriter &writer) const {
 
     QString t;
     switch (d->type) {
-        case CellFormula::ArrayType:
-            t = QStringLiteral("array");
-            break;
-        case CellFormula::SharedType:
-            t = QStringLiteral("shared");
-            break;
-        case CellFormula::NormalType:
-            t = QStringLiteral("normal");
-            break;
-        case CellFormula::DataTableType:
-            t = QStringLiteral("dataTable");
-            break;
-        default:  // undefined type
-            return false;
-            break;
+    case CellFormula::ArrayType:
+        t = QStringLiteral("array");
+        break;
+    case CellFormula::SharedType:
+        t = QStringLiteral("shared");
+        break;
+    case CellFormula::NormalType:
+        t = QStringLiteral("normal");
+        break;
+    case CellFormula::DataTableType:
+        t = QStringLiteral("dataTable");
+        break;
+    default: // undefined type
+        return false;
+        break;
     }
 
     // f (Formula)
@@ -265,7 +288,7 @@ bool CellFormula::saveToXml(QXmlStreamWriter &writer) const {
     writer.writeStartElement(QStringLiteral("f"));
 
     if (!t.isEmpty()) {
-        writer.writeAttribute(QStringLiteral("t"), t);  // write type(t)
+        writer.writeAttribute(QStringLiteral("t"), t); // write type(t)
     }
 
     // ref (Range of Cells)
@@ -321,10 +344,10 @@ bool CellFormula::saveToXml(QXmlStreamWriter &writer) const {
 
     if (!d->formula.isEmpty()) {
         QString strFormula = d->formula;
-        writer.writeCharacters(strFormula);  // write formula
+        writer.writeCharacters(strFormula); // write formula
     }
 
-    writer.writeEndElement();  // f
+    writer.writeEndElement(); // f
 
     return true;
 }
@@ -333,13 +356,14 @@ bool CellFormula::saveToXml(QXmlStreamWriter &writer) const {
  * \internal
  * \remark pair with saveToXml()
  */
-bool CellFormula::loadFromXml(QXmlStreamReader &reader) {
+bool CellFormula::loadFromXml(QXmlStreamReader &reader)
+{
     Q_ASSERT(reader.name() == QLatin1String("f"));
     if (!d)
         d = new CellFormulaPrivate(QString(), CellRange(), NormalType);
 
     QXmlStreamAttributes attributes = reader.attributes();
-    QString typeString = attributes.value(QLatin1String("t")).toString();
+    QString typeString              = attributes.value(QLatin1String("t")).toString();
 
     // branch: shared-formula
     //
@@ -360,7 +384,7 @@ bool CellFormula::loadFromXml(QXmlStreamReader &reader) {
 
         // dev40 {{
         // https://github.com/QtExcel/QXlsx/issues/38
-        d->type = NormalType;  // Change: normal Type is not mentioned in the xml file!!!!!
+        d->type = NormalType; // Change: normal Type is not mentioned in the xml file!!!!!
         // }}
     }
 
@@ -373,7 +397,7 @@ bool CellFormula::loadFromXml(QXmlStreamReader &reader) {
         d->type == CellFormula::DataTableType) {
         if (attributes.hasAttribute(QLatin1String("ref"))) {
             QString refString = attributes.value(QLatin1String("ref")).toString();
-            d->reference = CellRange(refString);
+            d->reference      = CellRange(refString);
         }
     }
 
@@ -385,14 +409,14 @@ bool CellFormula::loadFromXml(QXmlStreamReader &reader) {
     // indicates the group to which this particular cell's formula belongs.
     if (d->type == CellFormula::SharedType) {
         QString ca = attributes.value(QLatin1String("si")).toString();
-        d->ca = parseXsdBoolean(ca, false);
+        d->ca      = parseXsdBoolean(ca, false);
 
         if (attributes.hasAttribute(QLatin1String("si"))) {
             d->si = attributes.value(QLatin1String("si")).toInt();
         }
     }
 
-    d->formula = reader.readElementText();  // read formula
+    d->formula = reader.readElementText(); // read formula
 
     return true;
 }
@@ -400,14 +424,16 @@ bool CellFormula::loadFromXml(QXmlStreamReader &reader) {
 /*!
  * \internal
  */
-bool CellFormula::operator==(const CellFormula &formula) const {
+bool CellFormula::operator==(const CellFormula &formula) const
+{
     return d->formula == formula.d->formula && d->type == formula.d->type && d->si == formula.d->si;
 }
 
 /*!
  * \internal
  */
-bool CellFormula::operator!=(const CellFormula &formula) const {
+bool CellFormula::operator!=(const CellFormula &formula) const
+{
     return d->formula != formula.d->formula || d->type != formula.d->type || d->si != formula.d->si;
 }
 

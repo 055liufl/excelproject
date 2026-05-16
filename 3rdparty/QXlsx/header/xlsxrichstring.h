@@ -25,12 +25,12 @@
 #ifndef XLSXRICHSTRING_H
 #define XLSXRICHSTRING_H
 
+#include "xlsxformat.h"
+#include "xlsxglobal.h"
+
 #include <QSharedDataPointer>
 #include <QStringList>
 #include <QVariant>
-
-#include "xlsxformat.h"
-#include "xlsxglobal.h"
 
 QT_BEGIN_NAMESPACE_XLSX
 class RichStringPrivate;
@@ -39,8 +39,9 @@ using QHashType = decltype(qHash(0));
 // qHash is a friend, but we can't use default arguments for friends (§8.3.6.4)
 QHashType qHash(const RichString &rs, QHashType seed = 0) Q_DECL_NOTHROW;
 
-class QXLSX_EXPORT RichString {
-   public:
+class QXLSX_EXPORT RichString
+{
+public:
     RichString();
     explicit RichString(const QString &text);
     RichString(const RichString &other);
@@ -62,7 +63,7 @@ class QXLSX_EXPORT RichString {
 
     RichString &operator=(const RichString &other);
 
-   private:
+private:
     friend QHashType qHash(const RichString &rs, QHashType seed) Q_DECL_NOTHROW;
     friend bool operator==(const RichString &rs1, const RichString &rs2);
     friend bool operator!=(const RichString &rs1, const RichString &rs2);
@@ -88,4 +89,4 @@ QT_END_NAMESPACE_XLSX
 
 Q_DECLARE_METATYPE(QXlsx::RichString)
 
-#endif  // XLSXRICHSTRING_H
+#endif // XLSXRICHSTRING_H

@@ -3,15 +3,16 @@
 #ifndef XLSXTHEME_H
 #define XLSXTHEME_H
 
+#include "xlsxabstractooxmlfile.h"
+
 #include <QIODevice>
 #include <QString>
 
-#include "xlsxabstractooxmlfile.h"
-
 QT_BEGIN_NAMESPACE_XLSX
 
-class Theme : public AbstractOOXmlFile {
-   public:
+class Theme : public AbstractOOXmlFile
+{
+public:
     Theme(CreateFlag flag);
 
     void saveToXmlFile(QIODevice *device) const override;
@@ -24,4 +25,4 @@ class Theme : public AbstractOOXmlFile {
 
 QT_END_NAMESPACE_XLSX
 
-#endif  // XLSXTHEME_H
+#endif // XLSXTHEME_H

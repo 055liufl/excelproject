@@ -3,19 +3,19 @@
 #ifndef XLSXWORKSHEET_P_H
 #define XLSXWORKSHEET_P_H
 
-#include <QHash>
-#include <QImage>
-#include <QObject>
-#include <QRegularExpression>
-#include <QString>
-#include <QVector>
-
 #include "xlsxabstractsheet_p.h"
 #include "xlsxcell.h"
 #include "xlsxcellformula.h"
 #include "xlsxconditionalformatting.h"
 #include "xlsxdatavalidation.h"
 #include "xlsxworksheet.h"
+
+#include <QHash>
+#include <QImage>
+#include <QObject>
+#include <QRegularExpression>
+#include <QString>
+#include <QVector>
 
 class QXmlStreamWriter;
 class QXmlStreamReader;
@@ -27,14 +27,21 @@ class SharedStrings;
 struct XlsxHyperlinkData {
     enum LinkType { External, Internal };
 
-    XlsxHyperlinkData(LinkType linkType = External, const QString &target = QString(),
-                      const QString &location = QString(), const QString &display = QString(),
-                      const QString &tip = QString())
-        : linkType(linkType), target(target), location(location), display(display), tooltip(tip) {
+    XlsxHyperlinkData(LinkType linkType       = External,
+                      const QString &target   = QString(),
+                      const QString &location = QString(),
+                      const QString &display  = QString(),
+                      const QString &tip      = QString())
+        : linkType(linkType)
+        , target(target)
+        , location(location)
+        , display(display)
+        , tooltip(tip)
+    {
     }
 
     LinkType linkType;
-    QString target;  // For External link
+    QString target; // For External link
     QString location;
     QString display;
     QString tooltip;
@@ -43,20 +50,26 @@ struct XlsxHyperlinkData {
 // ECMA-376 Part1 18.3.1.81
 struct XlsxSheetFormatProps {
     XlsxSheetFormatProps(
-        int baseColWidth = 8, bool customHeight = false,
+        int baseColWidth  = 8,
+        bool customHeight = false,
         double defaultColWidth =
-            8.430f,  // https://learn.microsoft.com/en-us/office/troubleshoot/excel/determine-column-widths
-        double defaultRowHeight = 15, quint8 outlineLevelCol = 0, quint8 outlineLevelRow = 0,
-        bool thickBottom = false, bool thickTop = false, bool zeroHeight = false)
-        : baseColWidth(baseColWidth),
-          customHeight(customHeight),
-          defaultColWidth(defaultColWidth),
-          defaultRowHeight(defaultRowHeight),
-          outlineLevelCol(outlineLevelCol),
-          outlineLevelRow(outlineLevelRow),
-          thickBottom(thickBottom),
-          thickTop(thickTop),
-          zeroHeight(zeroHeight) {
+            8.430f, // https://learn.microsoft.com/en-us/office/troubleshoot/excel/determine-column-widths
+        double defaultRowHeight = 15,
+        quint8 outlineLevelCol  = 0,
+        quint8 outlineLevelRow  = 0,
+        bool thickBottom        = false,
+        bool thickTop           = false,
+        bool zeroHeight         = false)
+        : baseColWidth(baseColWidth)
+        , customHeight(customHeight)
+        , defaultColWidth(defaultColWidth)
+        , defaultRowHeight(defaultRowHeight)
+        , outlineLevelCol(outlineLevelCol)
+        , outlineLevelRow(outlineLevelRow)
+        , thickBottom(thickBottom)
+        , thickTop(thickTop)
+        , zeroHeight(zeroHeight)
+    {
     }
 
     int baseColWidth;
@@ -72,12 +85,13 @@ struct XlsxSheetFormatProps {
 
 struct XlsxRowInfo {
     XlsxRowInfo(double height = 0, const Format &format = Format(), bool hidden = false)
-        : customHeight(false),
-          height(height),
-          format(format),
-          hidden(hidden),
-          outlineLevel(0),
-          collapsed(false) {
+        : customHeight(false)
+        , height(height)
+        , format(format)
+        , hidden(hidden)
+        , outlineLevel(0)
+        , collapsed(false)
+    {
     }
 
     bool customHeight;
@@ -89,19 +103,22 @@ struct XlsxRowInfo {
 };
 
 struct XlsxColumnInfo {
-    XlsxColumnInfo(int firstColumn,  // = 0,
-                   int lastColumn,   // = 1,
-                   bool isSetWidth, double width = 0, const Format &format = Format(),
-                   bool hidden = false)
-        : width(width),
-          format(format),
-          firstColumn(firstColumn),
-          lastColumn(lastColumn),
-          outlineLevel(0),
-          isSetWidth(isSetWidth),
-          customWidth(false),
-          hidden(hidden),
-          collapsed(false) {
+    XlsxColumnInfo(int firstColumn, // = 0,
+                   int lastColumn,  // = 1,
+                   bool isSetWidth,
+                   double width         = 0,
+                   const Format &format = Format(),
+                   bool hidden          = false)
+        : width(width)
+        , format(format)
+        , firstColumn(firstColumn)
+        , lastColumn(lastColumn)
+        , outlineLevel(0)
+        , isSetWidth(isSetWidth)
+        , customWidth(false)
+        , hidden(hidden)
+        , collapsed(false)
+    {
     }
 
     double width;
@@ -115,32 +132,38 @@ struct XlsxColumnInfo {
     bool collapsed;
 };
 
-class CellTable {
-   public:
-    static QList<int> sorteIntList(QList<int> &&keys) {
+class CellTable
+{
+public:
+    static QList<int> sorteIntList(QList<int> &&keys)
+    {
         std::sort(keys.begin(), keys.end());
         return keys;
     }
 
-    inline QList<int> sortedRows() const {
+    inline QList<int> sortedRows() const
+    {
         QList<int> keys = cells.keys();
         std::sort(keys.begin(), keys.end());
         return keys;
     }
 
-    void setValue(int row, int column, const std::shared_ptr<Cell> &cell) {
+    void setValue(int row, int column, const std::shared_ptr<Cell> &cell)
+    {
         cells[row].insert(column, cell);
-        firstRow = qMin(firstRow, row);
+        firstRow    = qMin(firstRow, row);
         firstColumn = qMin(firstColumn, column);
-        lastRow = qMin(lastRow, row);
-        lastColumn = qMin(lastColumn, column);
+        lastRow     = qMin(lastRow, row);
+        lastColumn  = qMin(lastColumn, column);
     }
 
-    std::shared_ptr<Cell> cellAt(int row, int column) const {
+    std::shared_ptr<Cell> cellAt(int row, int column) const
+    {
         return cells.value(row).value(column);
     }
 
-    bool contains(int row, int column) const {
+    bool contains(int row, int column) const
+    {
         auto it = cells.find(row);
         if (it != cells.end()) {
             return it->contains(column);
@@ -148,27 +171,26 @@ class CellTable {
         return false;
     }
 
-    bool isEmpty() const {
-        return cells.isEmpty();
-    }
+    bool isEmpty() const { return cells.isEmpty(); }
 
     // It's faster with a single QHash, but in Qt5 it's capacity limits
     // how much cells we can hold
     QHash<int, QHash<int, std::shared_ptr<Cell>>> cells;
-    int firstRow = -1;
+    int firstRow    = -1;
     int firstColumn = -1;
-    int lastRow = -1;
-    int lastColumn = -1;
+    int lastRow     = -1;
+    int lastColumn  = -1;
 };
 
-class WorksheetPrivate : public AbstractSheetPrivate {
+class WorksheetPrivate : public AbstractSheetPrivate
+{
     Q_DECLARE_PUBLIC(Worksheet)
 
-   public:
+public:
     WorksheetPrivate(Worksheet *p, Worksheet::CreateFlag flag);
     ~WorksheetPrivate();
 
-   public:
+public:
     int checkDimensions(int row, int col, bool ignore_row = false, bool ignore_col = false);
     Format cellFormat(int row, int col) const;
     QString generateDimensionString() const;
@@ -177,7 +199,9 @@ class WorksheetPrivate : public AbstractSheetPrivate {
     void validateDimension();
 
     void saveXmlSheetData(QXmlStreamWriter &writer) const;
-    void saveXmlCellData(QXmlStreamWriter &writer, int row, int col,
+    void saveXmlCellData(QXmlStreamWriter &writer,
+                         int row,
+                         int col,
                          std::shared_ptr<Cell> cell) const;
     void saveXmlMergeCells(QXmlStreamWriter &writer) const;
     void saveXmlHyperlinks(QXmlStreamWriter &writer) const;
@@ -202,7 +226,7 @@ class WorksheetPrivate : public AbstractSheetPrivate {
 
     SharedStrings *sharedStrings() const;
 
-   public:
+public:
     CellTable cellTable;
 
     QHash<int, QHash<int, QString>> comments;
@@ -215,7 +239,7 @@ class WorksheetPrivate : public AbstractSheetPrivate {
     QList<DataValidation> dataValidationsList;
     QList<ConditionalFormatting> conditionalFormattingList;
 
-    QHash<int, CellFormula> sharedFormulaMap;  // shared formula map
+    QHash<int, CellFormula> sharedFormulaMap; // shared formula map
 
     CellRange dimension;
 
@@ -245,7 +269,7 @@ class WorksheetPrivate : public AbstractSheetPrivate {
     // header footer, liufeijin
     QString MoodFooter;
     QString ModdHeader;
-    QString MoodalignWithMargins;  // add align 20190619
+    QString MoodalignWithMargins; // add align 20190619
 
     XlsxSheetFormatProps sheetFormatProps;
 
@@ -262,9 +286,9 @@ class WorksheetPrivate : public AbstractSheetPrivate {
 
     QRegularExpression urlPattern;
 
-   private:
+private:
     static double calculateColWidth(int characters);
 };
 
 QT_END_NAMESPACE_XLSX
-#endif  // XLSXWORKSHEET_P_H
+#endif // XLSXWORKSHEET_P_H

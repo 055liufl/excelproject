@@ -35,15 +35,16 @@
 //
 // We mean it.
 //
+#include "xlsxabstractooxmlfile.h"
+
 #include <QIODevice>
 #include <QString>
 
-#include "xlsxabstractooxmlfile.h"
-
 QT_BEGIN_NAMESPACE_XLSX
 
-class SimpleOOXmlFile : public AbstractOOXmlFile {
-   public:
+class SimpleOOXmlFile : public AbstractOOXmlFile
+{
+public:
     SimpleOOXmlFile(CreateFlag flag);
 
     void saveToXmlFile(QIODevice *device) const override;
@@ -56,4 +57,4 @@ class SimpleOOXmlFile : public AbstractOOXmlFile {
 
 QT_END_NAMESPACE_XLSX
 
-#endif  // XLSXSIMPLEOOXMLFILE_H
+#endif // XLSXSIMPLEOOXMLFILE_H

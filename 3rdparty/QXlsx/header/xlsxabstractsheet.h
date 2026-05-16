@@ -12,18 +12,19 @@ class Workbook;
 class Drawing;
 class AbstractSheetPrivate;
 
-class QXLSX_EXPORT AbstractSheet : public AbstractOOXmlFile {
+class QXLSX_EXPORT AbstractSheet : public AbstractOOXmlFile
+{
     Q_DECLARE_PRIVATE(AbstractSheet)
 
-   public:
+public:
     Workbook *workbook() const;
 
-   public:
+public:
     // NOTE: If all Qt  compiler supports C++1x, recommend to use a 'class enum'.
     enum SheetType { ST_WorkSheet, ST_ChartSheet, ST_DialogSheet, ST_MacroSheet };
     enum SheetState { SS_Visible, SS_Hidden, SS_VeryHidden };
 
-   public:
+public:
     QString sheetName() const;
     SheetType sheetType() const;
     SheetState sheetState() const;
@@ -33,7 +34,7 @@ class QXLSX_EXPORT AbstractSheet : public AbstractOOXmlFile {
     void setHidden(bool hidden);
     void setVisible(bool visible);
 
-   protected:
+protected:
     friend class Workbook;
     AbstractSheet(const QString &sheetName, int sheetId, Workbook *book, AbstractSheetPrivate *d);
     virtual AbstractSheet *copy(const QString &distName, int distId) const = 0;
@@ -45,4 +46,4 @@ class QXLSX_EXPORT AbstractSheet : public AbstractOOXmlFile {
 };
 
 QT_END_NAMESPACE_XLSX
-#endif  // XLSXABSTRACTSHEET_H
+#endif // XLSXABSTRACTSHEET_H

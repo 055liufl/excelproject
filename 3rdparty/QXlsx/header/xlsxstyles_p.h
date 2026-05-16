@@ -36,6 +36,8 @@
 // We mean it.
 //
 
+#include <memory>
+
 #include <QHash>
 #include <QIODevice>
 #include <QList>
@@ -44,8 +46,6 @@
 #include <QVector>
 #include <QXmlStreamReader>
 #include <QXmlStreamWriter>
-
-#include <memory>
 
 // class StylesTest;
 
@@ -59,15 +59,18 @@ class Format;
 class XlsxColor;
 
 struct XlsxFormatNumberData {
-    XlsxFormatNumberData() : formatIndex(0) {
+    XlsxFormatNumberData()
+        : formatIndex(0)
+    {
     }
 
     int formatIndex;
     QString formatString;
 };
 
-class Styles : public AbstractOOXmlFile {
-   public:
+class Styles : public AbstractOOXmlFile
+{
+public:
     Styles(CreateFlag flag);
     ~Styles();
     void addXfFormat(const Format &format, bool force = false);
@@ -80,7 +83,7 @@ class Styles : public AbstractOOXmlFile {
 
     QColor getColorByIndex(int idx);
 
-   private:
+private:
     friend class Format;
     // friend class ::StylesTest;
 
@@ -93,7 +96,9 @@ class Styles : public AbstractOOXmlFile {
     void writeFill(QXmlStreamWriter &writer, const Format &fill, bool isDxf = false) const;
     void writeBorders(QXmlStreamWriter &writer) const;
     void writeBorder(QXmlStreamWriter &writer, const Format &border, bool isDxf = false) const;
-    void writeSubBorder(QXmlStreamWriter &writer, const QString &type, int style,
+    void writeSubBorder(QXmlStreamWriter &writer,
+                        const QString &type,
+                        int style,
                         const XlsxColor &color) const;
     void writeCellXfs(QXmlStreamWriter &writer) const;
     void writeDxfs(QXmlStreamWriter &writer) const;
@@ -107,7 +112,9 @@ class Styles : public AbstractOOXmlFile {
     bool readFill(QXmlStreamReader &reader, Format &format);
     bool readBorders(QXmlStreamReader &reader);
     bool readBorder(QXmlStreamReader &reader, Format &format);
-    bool readSubBorder(QXmlStreamReader &reader, const QString &name, Format::BorderStyle &style,
+    bool readSubBorder(QXmlStreamReader &reader,
+                       const QString &name,
+                       Format::BorderStyle &style,
                        XlsxColor &color);
     bool readCellXfs(QXmlStreamReader &reader);
     bool readDxfs(QXmlStreamReader &reader);
@@ -142,4 +149,4 @@ class Styles : public AbstractOOXmlFile {
 
 QT_END_NAMESPACE_XLSX
 
-#endif  // XLSXSTYLES_H
+#endif // XLSXSTYLES_H

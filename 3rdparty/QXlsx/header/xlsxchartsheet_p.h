@@ -9,9 +9,10 @@
 
 QT_BEGIN_NAMESPACE_XLSX
 
-class ChartsheetPrivate : public AbstractSheetPrivate {
+class ChartsheetPrivate : public AbstractSheetPrivate
+{
     Q_DECLARE_PUBLIC(Chartsheet)
-   public:
+public:
     ChartsheetPrivate(Chartsheet *p, Chartsheet::CreateFlag flag);
     ~ChartsheetPrivate();
 
@@ -19,4 +20,4 @@ class ChartsheetPrivate : public AbstractSheetPrivate {
 };
 
 QT_END_NAMESPACE_XLSX
-#endif  // XLSXCHARTSHEET_P_H
+#endif // XLSXCHARTSHEET_P_H

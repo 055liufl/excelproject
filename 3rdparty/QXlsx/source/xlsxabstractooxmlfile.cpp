@@ -2,19 +2,24 @@
 
 #include "xlsxabstractooxmlfile.h"
 
+#include "xlsxabstractooxmlfile_p.h"
+
 #include <QBuffer>
 #include <QByteArray>
-
-#include "xlsxabstractooxmlfile_p.h"
 
 QT_BEGIN_NAMESPACE_XLSX
 
 AbstractOOXmlFilePrivate::AbstractOOXmlFilePrivate(
-    AbstractOOXmlFile *q, AbstractOOXmlFile::CreateFlag flag = AbstractOOXmlFile::F_NewFromScratch)
-    : relationships(new Relationships), flag(flag), q_ptr(q) {
+    AbstractOOXmlFile *q,
+    AbstractOOXmlFile::CreateFlag flag = AbstractOOXmlFile::F_NewFromScratch)
+    : relationships(new Relationships)
+    , flag(flag)
+    , q_ptr(q)
+{
 }
 
-AbstractOOXmlFilePrivate::~AbstractOOXmlFilePrivate() {
+AbstractOOXmlFilePrivate::~AbstractOOXmlFilePrivate()
+{
     delete relationships;
 }
 
@@ -27,17 +32,22 @@ AbstractOOXmlFilePrivate::~AbstractOOXmlFilePrivate() {
  */
 
 AbstractOOXmlFile::AbstractOOXmlFile(CreateFlag flag)
-    : d_ptr(new AbstractOOXmlFilePrivate(this, flag)) {
+    : d_ptr(new AbstractOOXmlFilePrivate(this, flag))
+{
 }
 
-AbstractOOXmlFile::AbstractOOXmlFile(AbstractOOXmlFilePrivate *d) : d_ptr(d) {
+AbstractOOXmlFile::AbstractOOXmlFile(AbstractOOXmlFilePrivate *d)
+    : d_ptr(d)
+{
 }
 
-AbstractOOXmlFile::~AbstractOOXmlFile() {
+AbstractOOXmlFile::~AbstractOOXmlFile()
+{
     delete d_ptr;
 }
 
-QByteArray AbstractOOXmlFile::saveToXmlData() const {
+QByteArray AbstractOOXmlFile::saveToXmlData() const
+{
     QByteArray data;
     QBuffer buffer(&data);
     buffer.open(QIODevice::WriteOnly);
@@ -46,7 +56,8 @@ QByteArray AbstractOOXmlFile::saveToXmlData() const {
     return data;
 }
 
-bool AbstractOOXmlFile::loadFromXmlData(const QByteArray &data) {
+bool AbstractOOXmlFile::loadFromXmlData(const QByteArray &data)
+{
     QBuffer buffer;
     buffer.setData(data);
     buffer.open(QIODevice::ReadOnly);
@@ -57,7 +68,8 @@ bool AbstractOOXmlFile::loadFromXmlData(const QByteArray &data) {
 /*!
  * \internal
  */
-void AbstractOOXmlFile::setFilePath(const QString path) {
+void AbstractOOXmlFile::setFilePath(const QString path)
+{
     Q_D(AbstractOOXmlFile);
     d->filePathInPackage = path;
 }
@@ -65,7 +77,8 @@ void AbstractOOXmlFile::setFilePath(const QString path) {
 /*!
  * \internal
  */
-QString AbstractOOXmlFile::filePath() const {
+QString AbstractOOXmlFile::filePath() const
+{
     Q_D(const AbstractOOXmlFile);
     return d->filePathInPackage;
 }
@@ -73,7 +86,8 @@ QString AbstractOOXmlFile::filePath() const {
 /*!
  * \internal
  */
-Relationships *AbstractOOXmlFile::relationships() const {
+Relationships *AbstractOOXmlFile::relationships() const
+{
     Q_D(const AbstractOOXmlFile);
     return d->relationships;
 }

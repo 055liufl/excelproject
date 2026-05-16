@@ -3,17 +3,18 @@
 #ifndef QXLSX_ZIPWRITER_H
 #define QXLSX_ZIPWRITER_H
 
+#include "xlsxglobal.h"
+
 #include <QIODevice>
 #include <QString>
-
-#include "xlsxglobal.h"
 
 class QZipWriter;
 
 QT_BEGIN_NAMESPACE_XLSX
 
-class ZipWriter {
-   public:
+class ZipWriter
+{
+public:
     explicit ZipWriter(const QString &filePath);
     explicit ZipWriter(QIODevice *device);
     ~ZipWriter();
@@ -23,10 +24,10 @@ class ZipWriter {
     bool error() const;
     void close();
 
-   private:
+private:
     QZipWriter *m_writer;
 };
 
 QT_END_NAMESPACE_XLSX
 
-#endif  // QXLSX_ZIPWRITER_H
+#endif // QXLSX_ZIPWRITER_H

@@ -1,24 +1,29 @@
 // xlsxdrawing.cpp
 
-#include <QBuffer>
-#include <QXmlStreamReader>
-#include <QXmlStreamWriter>
-
 #include "xlsxabstractsheet.h"
 #include "xlsxdrawing_p.h"
 #include "xlsxdrawinganchor_p.h"
 
+#include <QBuffer>
+#include <QXmlStreamReader>
+#include <QXmlStreamWriter>
+
 QT_BEGIN_NAMESPACE_XLSX
 
-Drawing::Drawing(AbstractSheet *sheet, CreateFlag flag) : AbstractOOXmlFile(flag), sheet(sheet) {
+Drawing::Drawing(AbstractSheet *sheet, CreateFlag flag)
+    : AbstractOOXmlFile(flag)
+    , sheet(sheet)
+{
     workbook = sheet->workbook();
 }
 
-Drawing::~Drawing() {
+Drawing::~Drawing()
+{
     qDeleteAll(anchors);
 }
 
-void Drawing::saveToXmlFile(QIODevice *device) const {
+void Drawing::saveToXmlFile(QIODevice *device) const
+{
     relationships()->clear();
 
     QXmlStreamWriter writer(device);
@@ -34,12 +39,13 @@ void Drawing::saveToXmlFile(QIODevice *device) const {
     for (DrawingAnchor *anchor : anchors)
         anchor->saveToXml(writer);
 
-    writer.writeEndElement();  // xdr:wsDr
+    writer.writeEndElement(); // xdr:wsDr
     writer.writeEndDocument();
 }
 
 // check point
-bool Drawing::loadFromXmlFile(QIODevice *device) {
+bool Drawing::loadFromXmlFile(QIODevice *device)
+{
     /*
     <xsd:group name="EG_Anchor">
         <xsd:choice>
@@ -55,15 +61,15 @@ bool Drawing::loadFromXmlFile(QIODevice *device) {
     while (!reader.atEnd()) {
         reader.readNextStartElement();
         if (reader.tokenType() == QXmlStreamReader::StartElement) {
-            if (reader.name() == QLatin1String("absoluteAnchor"))  // CT_AbsoluteAnchor
+            if (reader.name() == QLatin1String("absoluteAnchor")) // CT_AbsoluteAnchor
             {
                 auto *anchor = new DrawingAbsoluteAnchor(this);
                 anchor->loadFromXml(reader);
-            } else if (reader.name() == QLatin1String("oneCellAnchor"))  // CT_OneCellAnchor
+            } else if (reader.name() == QLatin1String("oneCellAnchor")) // CT_OneCellAnchor
             {
                 auto *anchor = new DrawingOneCellAnchor(this);
                 anchor->loadFromXml(reader);
-            } else if (reader.name() == QLatin1String("twoCellAnchor"))  // CT_TwoCellAnchor
+            } else if (reader.name() == QLatin1String("twoCellAnchor")) // CT_TwoCellAnchor
             {
                 auto *anchor = new DrawingTwoCellAnchor(this);
                 anchor->loadFromXml(reader);

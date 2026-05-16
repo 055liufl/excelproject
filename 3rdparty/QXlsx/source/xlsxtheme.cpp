@@ -1,8 +1,8 @@
 // xlsxtheme.cpp
 
-#include <QIODevice>
-
 #include "xlsxtheme_p.h"
+
+#include <QIODevice>
 
 QT_BEGIN_NAMESPACE_XLSX
 
@@ -197,29 +197,35 @@ const char *defaultXmlData =
     "<a:extraClrSchemeLst/>"
     "</a:theme>";
 
-Theme::Theme(CreateFlag flag) : AbstractOOXmlFile(flag) {
+Theme::Theme(CreateFlag flag)
+    : AbstractOOXmlFile(flag)
+{
 }
 
-void Theme::saveToXmlFile(QIODevice *device) const {
+void Theme::saveToXmlFile(QIODevice *device) const
+{
     if (xmlData.isEmpty())
         device->write(defaultXmlData);
     else
         device->write(xmlData);
 }
 
-QByteArray Theme::saveToXmlData() const {
+QByteArray Theme::saveToXmlData() const
+{
     if (xmlData.isEmpty())
         return defaultXmlData;
     else
         return xmlData;
 }
 
-bool Theme::loadFromXmlData(const QByteArray &data) {
+bool Theme::loadFromXmlData(const QByteArray &data)
+{
     xmlData = data;
     return true;
 }
 
-bool Theme::loadFromXmlFile(QIODevice *device) {
+bool Theme::loadFromXmlFile(QIODevice *device)
+{
     xmlData = device->readAll();
     return true;
 }

@@ -1,5 +1,11 @@
 // xlsxutility.cpp
 
+#include "xlsxcellreference.h"
+#include "xlsxutility_p.h"
+
+#include <cmath>
+#include <string>
+
 #include <QColor>
 #include <QDateTime>
 #include <QDebug>
@@ -9,14 +15,10 @@
 #include <QString>
 #include <QStringList>
 
-#include "xlsxcellreference.h"
-#include "xlsxutility_p.h"
-#include <cmath>
-#include <string>
-
 QT_BEGIN_NAMESPACE_XLSX
 
-bool parseXsdBoolean(const QString &value, bool defaultValue) {
+bool parseXsdBoolean(const QString &value, bool defaultValue)
+{
     if (value == QLatin1String("1") || value == QLatin1String("true"))
         return true;
     if (value == QLatin1String("0") || value == QLatin1String("false"))
@@ -24,7 +26,8 @@ bool parseXsdBoolean(const QString &value, bool defaultValue) {
     return defaultValue;
 }
 
-QStringList splitPath(const QString &path) {
+QStringList splitPath(const QString &path)
+{
     int idx = path.lastIndexOf(QLatin1Char('/'));
     if (idx == -1)
         return {QStringLiteral("."), path};
@@ -35,11 +38,12 @@ QStringList splitPath(const QString &path) {
 /*
  * Return the .rel file path based on filePath
  */
-QString getRelFilePath(const QString &filePath) {
+QString getRelFilePath(const QString &filePath)
+{
     QString ret;
 
     int idx = filePath.lastIndexOf(QLatin1Char('/'));
-    if (idx == -1)  // not found
+    if (idx == -1) // not found
     {
         // return QString();
 
@@ -53,16 +57,17 @@ QString getRelFilePath(const QString &filePath) {
     return ret;
 }
 
-double datetimeToNumber(const QDateTime &dt, bool is1904) {
+double datetimeToNumber(const QDateTime &dt, bool is1904)
+{
     // Note, for number 0, Excel2007 shown as 1900-1-0, which should be 1899-12-31
     QDateTime epoch(is1904 ? QDate(1904, 1, 1) : QDate(1899, 12, 31), QTime(0, 0));
 
     double excel_time = epoch.msecsTo(dt) / (1000 * 60 * 60 * 24.0);
 
-    if (dt.isDaylightTime())  // Add one hour if the date is Daylight
+    if (dt.isDaylightTime()) // Add one hour if the date is Daylight
         excel_time += 1.0 / 24.0;
 
-    if (!is1904 && excel_time > 59) {  // 31+28
+    if (!is1904 && excel_time > 59) { // 31+28
         // Account for Excel erroneously treating 1900 as a leap year.
         excel_time += 1;
     }
@@ -70,15 +75,17 @@ double datetimeToNumber(const QDateTime &dt, bool is1904) {
     return excel_time;
 }
 
-double timeToNumber(const QTime &time) {
+double timeToNumber(const QTime &time)
+{
     return QTime(0, 0).msecsTo(time) / (1000 * 60 * 60 * 24.0);
 }
 
-QVariant datetimeFromNumber(double num, bool is1904) {
+QVariant datetimeFromNumber(double num, bool is1904)
+{
     static qint64 msecs1904 = QDateTime(QDate(1904, 1, 1), QTime(0, 0)).toMSecsSinceEpoch();
     static qint64 msecs1899 = QDateTime(QDate(1899, 12, 31), QTime(0, 0)).toMSecsSinceEpoch();
 
-    if (!is1904 && num > 60)  // for mac os excel
+    if (!is1904 && num > 60) // for mac os excel
     {
         num = num - 1;
     }
@@ -93,12 +100,12 @@ QVariant datetimeFromNumber(double num, bool is1904) {
     QDateTime dtRet = QDateTime::fromMSecsSinceEpoch(msecs);
 
     // Remove one hour to see whether the date is Daylight
-    QDateTime dtNew = dtRet.addMSecs(-3600000);  // issue102
+    QDateTime dtNew = dtRet.addMSecs(-3600000); // issue102
     if (dtNew.isDaylightTime()) {
         dtRet = dtNew;
     }
 
-    double whole = 0;
+    double whole      = 0;
     double fractional = std::modf(num, &whole);
 
     if (num < double(1)) {
@@ -125,7 +132,8 @@ QVariant datetimeFromNumber(double num, bool is1904) {
 
   Invalid characters are replaced by one space character ' '.
  */
-QString createSafeSheetName(const QString &nameProposal) {
+QString createSafeSheetName(const QString &nameProposal)
+{
     if (nameProposal.isEmpty())
         return QString();
 
@@ -156,7 +164,8 @@ QString createSafeSheetName(const QString &nameProposal) {
  * When sheetName contains space or apostrophe, escaped is needed by
  * cellFormula/definedName/chartSerials.
  */
-QString escapeSheetName(const QString &sheetName) {
+QString escapeSheetName(const QString &sheetName)
+{
     // Already escaped.
     Q_ASSERT(!sheetName.startsWith(QLatin1Char('\'')) && !sheetName.endsWith(QLatin1Char('\'')));
 
@@ -173,7 +182,8 @@ QString escapeSheetName(const QString &sheetName) {
 
 /*
  */
-QString unescapeSheetName(const QString &sheetName) {
+QString unescapeSheetName(const QString &sheetName)
+{
     Q_ASSERT(sheetName.length() > 2 && sheetName.startsWith(QLatin1Char('\'')) &&
              sheetName.endsWith(QLatin1Char('\'')));
 
@@ -185,7 +195,8 @@ QString unescapeSheetName(const QString &sheetName) {
 /*
  * whether the string s starts or ends with space
  */
-bool isSpaceReserveNeeded(const QString &s) {
+bool isSpaceReserveNeeded(const QString &s)
+{
     QString spaces(QStringLiteral(" \t\n\r"));
     return !s.isEmpty() && (spaces.contains(s.at(0)) || spaces.contains(s.at(s.length() - 1)));
 }
@@ -201,8 +212,10 @@ bool isSpaceReserveNeeded(const QString &s) {
  *
  * For long run, we need a formula parser.
  */
-QString convertSharedFormula(const QString &rootFormula, const CellReference &rootCell,
-                             const CellReference &cell) {
+QString convertSharedFormula(const QString &rootFormula,
+                             const CellReference &rootCell,
+                             const CellReference &cell)
+{
     Q_UNUSED(rootCell)
     Q_UNUSED(cell)
     // Find all the "$?[A-Z]+$?[0-9]+" patterns in the rootFormula.
@@ -212,7 +225,7 @@ QString convertSharedFormula(const QString &rootFormula, const CellReference &ro
     bool inQuote = false;
     enum RefState { INVALID, PRE_AZ, AZ, PRE_09, _09 };
     RefState refState = INVALID;
-    int refFlag = 0;  // 0x00, 0x01, 0x02, 0x03 ==> A1, $A1, A$1, $A$1
+    int refFlag       = 0; // 0x00, 0x01, 0x02, 0x03 ==> A1, $A1, A$1, $A$1
     for (QChar ch : rootFormula) {
         if (inQuote) {
             segment.append(ch);
@@ -220,7 +233,7 @@ QString convertSharedFormula(const QString &rootFormula, const CellReference &ro
                 inQuote = false;
         } else {
             if (ch == QLatin1Char('"')) {
-                inQuote = true;
+                inQuote  = true;
                 refState = INVALID;
                 segment.append(ch);
             } else if (ch == QLatin1Char('$')) {
@@ -230,16 +243,16 @@ QString convertSharedFormula(const QString &rootFormula, const CellReference &ro
                     refFlag |= 0x02;
                 } else {
                     segments.append(std::make_pair(segment, refState == _09 ? refFlag : -1));
-                    segment = QString(ch);  // Start new segment.
+                    segment  = QString(ch); // Start new segment.
                     refState = PRE_AZ;
-                    refFlag = 0x01;
+                    refFlag  = 0x01;
                 }
             } else if (ch >= QLatin1Char('A') && ch <= QLatin1Char('Z')) {
                 if (refState == PRE_AZ || refState == AZ) {
                     segment.append(ch);
                 } else {
                     segments.append(std::make_pair(segment, refState == _09 ? refFlag : -1));
-                    segment = QString(ch);  // Start new segment.
+                    segment = QString(ch); // Start new segment.
                     refFlag = 0x00;
                 }
                 refState = AZ;
@@ -253,7 +266,7 @@ QString convertSharedFormula(const QString &rootFormula, const CellReference &ro
             } else {
                 if (refState == _09) {
                     segments.append(std::make_pair(segment, refFlag));
-                    segment = QString(ch);  // Start new segment.
+                    segment = QString(ch); // Start new segment.
                 } else {
                     segment.append(ch);
                 }
@@ -284,7 +297,8 @@ QString convertSharedFormula(const QString &rootFormula, const CellReference &ro
     return result.join(QString());
 }
 
-QString xsdBoolean(bool value) {
+QString xsdBoolean(bool value)
+{
     return value ? QStringLiteral("1") : QStringLiteral("0");
 }
 

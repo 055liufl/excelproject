@@ -3,19 +3,20 @@
 #ifndef XLSXDOCPROPSAPP_H
 #define XLSXDOCPROPSAPP_H
 
+#include "xlsxabstractooxmlfile.h"
+#include "xlsxglobal.h"
+
 #include <QList>
 #include <QMap>
 #include <QStringList>
-
-#include "xlsxabstractooxmlfile.h"
-#include "xlsxglobal.h"
 
 class QIODevice;
 
 QT_BEGIN_NAMESPACE_XLSX
 
-class DocPropsApp : public AbstractOOXmlFile {
-   public:
+class DocPropsApp : public AbstractOOXmlFile
+{
+public:
     DocPropsApp(CreateFlag flag);
 
     void addPartTitle(const QString &title);
@@ -28,7 +29,7 @@ class DocPropsApp : public AbstractOOXmlFile {
     void saveToXmlFile(QIODevice *device) const override;
     bool loadFromXmlFile(QIODevice *device) override;
 
-   private:
+private:
     QStringList m_titlesOfPartsList;
     QList<std::pair<QString, int>> m_headingPairsList;
     QMap<QString, QString> m_properties;
@@ -36,4 +37,4 @@ class DocPropsApp : public AbstractOOXmlFile {
 
 QT_END_NAMESPACE_XLSX
 
-#endif  // XLSXDOCPROPSAPP_H
+#endif // XLSXDOCPROPSAPP_H

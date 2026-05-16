@@ -3,11 +3,11 @@
 #ifndef QXLSX_DRAWING_H
 #define QXLSX_DRAWING_H
 
-#include <QList>
-#include <QString>
-
 #include "xlsxabstractooxmlfile.h"
 #include "xlsxrelationships_p.h"
+
+#include <QList>
+#include <QString>
 
 class QIODevice;
 class QXmlStreamWriter;
@@ -19,8 +19,9 @@ class Workbook;
 class AbstractSheet;
 class MediaFile;
 
-class Drawing : public AbstractOOXmlFile {
-   public:
+class Drawing : public AbstractOOXmlFile
+{
+public:
     Drawing(AbstractSheet *sheet, CreateFlag flag);
     ~Drawing();
     void saveToXmlFile(QIODevice *device) const override;
@@ -33,4 +34,4 @@ class Drawing : public AbstractOOXmlFile {
 
 QT_END_NAMESPACE_XLSX
 
-#endif  // QXLSX_DRAWING_H
+#endif // QXLSX_DRAWING_H

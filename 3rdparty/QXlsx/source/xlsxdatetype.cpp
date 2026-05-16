@@ -7,7 +7,8 @@
 
 QT_BEGIN_NAMESPACE_XLSX
 
-DateType::DateType() {
+DateType::DateType()
+{
 }
 
 /*

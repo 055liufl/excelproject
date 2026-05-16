@@ -3,13 +3,13 @@
 #ifndef QXLSX_XLSXDATAVALIDATION_H
 #define QXLSX_XLSXDATAVALIDATION_H
 
+#include "xlsxglobal.h"
+
 #include <QList>
 #include <QSharedDataPointer>
 #include <QString>
 #include <QXmlStreamReader>
 #include <QXmlStreamWriter>
-
-#include "xlsxglobal.h"
 
 class QXmlStreamReader;
 class QXmlStreamWriter;
@@ -21,8 +21,9 @@ class CellRange;
 class CellReference;
 
 class DataValidationPrivate;
-class QXLSX_EXPORT DataValidation {
-   public:
+class QXLSX_EXPORT DataValidation
+{
+public:
     enum ValidationType { None, Whole, Decimal, List, Date, Time, TextLength, Custom };
 
     enum ValidationOperator {
@@ -39,9 +40,11 @@ class QXLSX_EXPORT DataValidation {
     enum ErrorStyle { Stop, Warning, Information };
 
     DataValidation();
-    DataValidation(ValidationType type, ValidationOperator op = Between,
-                   const QString &formula1 = QString(), const QString &formula2 = QString(),
-                   bool allowBlank = false);
+    DataValidation(ValidationType type,
+                   ValidationOperator op   = Between,
+                   const QString &formula1 = QString(),
+                   const QString &formula2 = QString(),
+                   bool allowBlank         = false);
     DataValidation(const DataValidation &other);
     ~DataValidation();
 
@@ -80,10 +83,10 @@ class QXLSX_EXPORT DataValidation {
     bool saveToXml(QXmlStreamWriter &writer) const;
     static DataValidation loadFromXml(QXmlStreamReader &reader);
 
-   private:
+private:
     QSharedDataPointer<DataValidationPrivate> d;
 };
 
 QT_END_NAMESPACE_XLSX
 
-#endif  // QXLSX_XLSXDATAVALIDATION_H
+#endif // QXLSX_XLSXDATAVALIDATION_H

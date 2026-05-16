@@ -1,15 +1,16 @@
-#include "xlsxreadsax.h"
-
-#include <QXmlStreamReader>
-#include <QtCore>
-
 #include "xlsxdocument.h"
 #include "xlsxworkbook.h"
-#include "xlsxzipreader_p.h"  // QXlsx internal zip reader (adjust include as per project structure)
+#include "xlsxzipreader_p.h"    // QXlsx internal zip reader (adjust include as per project structure)
+
+#include "xlsxreadsax.h"
+
+#include <QtCore>
+#include <QXmlStreamReader>
 
 namespace QXlsx {
 
-int parse_col_letters(const QStringView& s, int* letters_len) {
+int parse_col_letters(const QStringView& s, int* letters_len)
+{
     // A -> 1, Z -> 26, AA -> 27 ...
     int col = 0;
     int len = 0;
@@ -25,7 +26,8 @@ int parse_col_letters(const QStringView& s, int* letters_len) {
     return col;
 }
 
-bool parse_cell_ref(const QString& r, int* out_row, int* out_col) {
+bool parse_cell_ref(const QString& r, int* out_row, int* out_col)
+{
     // Example: "C12"
     int letters_len = 0;
     int col = parse_col_letters(QStringView(r), &letters_len);
@@ -35,14 +37,13 @@ bool parse_cell_ref(const QString& r, int* out_row, int* out_col) {
     int row = r.mid(letters_len).toInt(&ok);
     if (!ok || row <= 0)
         return false;
-    if (out_row)
-        *out_row = row;
-    if (out_col)
-        *out_col = col;
+    if (out_row) *out_row = row;
+    if (out_col) *out_col = col;
     return true;
 }
 
-QStringList load_shared_strings_all(ZipReader& zip) {
+QStringList load_shared_strings_all(ZipReader& zip)
+{
     QStringList out;
     const QByteArray xml = zip.fileData(QStringLiteral("xl/sharedStrings.xml"));
     if (xml.isEmpty())
@@ -74,8 +75,11 @@ QStringList load_shared_strings_all(ZipReader& zip) {
     return out;
 }
 
-bool read_sheet_xml_sax(const QByteArray& sheet_xml, const sax_options& opt,
-                        const QStringList* shared_strings, const sax_cell_callback& on_cell) {
+bool read_sheet_xml_sax(const QByteArray& sheet_xml,
+                        const sax_options& opt,
+                        const QStringList* shared_strings,
+                        const sax_cell_callback& on_cell)
+{
     QXmlStreamReader rd(sheet_xml);
 
     bool in_sheetdata = false;
@@ -161,4 +165,4 @@ bool read_sheet_xml_sax(const QByteArray& sheet_xml, const sax_options& opt,
     return !rd.hasError();
 }
 
-}  // namespace QXlsx
+} // namespace QXlsx

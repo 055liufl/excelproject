@@ -3,9 +3,9 @@
 #ifndef XLSXCHARTSHEET_H
 #define XLSXCHARTSHEET_H
 
-#include <QStringList>
-
 #include "xlsxabstractsheet.h"
+
+#include <QStringList>
 
 QT_BEGIN_NAMESPACE_XLSX
 
@@ -14,14 +14,15 @@ class DocumentPrivate;
 class ChartsheetPrivate;
 class Chart;
 
-class QXLSX_EXPORT Chartsheet : public AbstractSheet {
+class QXLSX_EXPORT Chartsheet : public AbstractSheet
+{
     Q_DECLARE_PRIVATE(Chartsheet)
 
-   public:
+public:
     ~Chartsheet();
     Chart *chart();
 
-   private:
+private:
     friend class DocumentPrivate;
     friend class Workbook;
 
@@ -33,4 +34,4 @@ class QXLSX_EXPORT Chartsheet : public AbstractSheet {
 };
 
 QT_END_NAMESPACE_XLSX
-#endif  // XLSXCHARTSHEET_H
+#endif // XLSXCHARTSHEET_H

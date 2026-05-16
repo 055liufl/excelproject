@@ -3,9 +3,9 @@
 #ifndef QXLSX_XLSXCELLFORMULA_H
 #define QXLSX_XLSXCELLFORMULA_H
 
-#include <QExplicitlySharedDataPointer>
-
 #include "xlsxglobal.h"
+
+#include <QExplicitlySharedDataPointer>
 
 class QXmlStreamWriter;
 class QXmlStreamReader;
@@ -17,11 +17,12 @@ class CellRange;
 class Worksheet;
 class WorksheetPrivate;
 
-class QXLSX_EXPORT CellFormula {
-   public:
+class QXLSX_EXPORT CellFormula
+{
+public:
     enum FormulaType { NormalType, ArrayType, DataTableType, SharedType };
 
-   public:
+public:
     CellFormula();
     CellFormula(const char *formula, FormulaType type = NormalType);
     CellFormula(const QString &formula, FormulaType type = NormalType);
@@ -29,7 +30,7 @@ class QXLSX_EXPORT CellFormula {
     CellFormula(const CellFormula &other);
     ~CellFormula();
 
-   public:
+public:
     CellFormula &operator=(const CellFormula &other);
     bool isValid() const;
 
@@ -44,7 +45,7 @@ class QXLSX_EXPORT CellFormula {
     bool saveToXml(QXmlStreamWriter &writer) const;
     bool loadFromXml(QXmlStreamReader &reader);
 
-   private:
+private:
     friend class Worksheet;
     friend class WorksheetPrivate;
     QExplicitlySharedDataPointer<CellFormulaPrivate> d;
@@ -52,4 +53,4 @@ class QXLSX_EXPORT CellFormula {
 
 QT_END_NAMESPACE_XLSX
 
-#endif  // QXLSX_XLSXCELLFORMULA_H
+#endif // QXLSX_XLSXCELLFORMULA_H

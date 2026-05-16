@@ -3,17 +3,18 @@
 #ifndef XLSXCONTENTTYPES_H
 #define XLSXCONTENTTYPES_H
 
+#include "xlsxabstractooxmlfile.h"
+
 #include <QIODevice>
 #include <QMap>
 #include <QString>
 #include <QStringList>
 
-#include "xlsxabstractooxmlfile.h"
-
 QT_BEGIN_NAMESPACE_XLSX
 
-class ContentTypes : public AbstractOOXmlFile {
-   public:
+class ContentTypes : public AbstractOOXmlFile
+{
+public:
     ContentTypes(CreateFlag flag);
 
     void addDefault(const QString &key, const QString &value);
@@ -42,7 +43,7 @@ class ContentTypes : public AbstractOOXmlFile {
     void saveToXmlFile(QIODevice *device) const override;
     bool loadFromXmlFile(QIODevice *device) override;
 
-   private:
+private:
     QMap<QString, QString> m_defaults;
     QMap<QString, QString> m_overrides;
 
@@ -51,4 +52,4 @@ class ContentTypes : public AbstractOOXmlFile {
 };
 
 QT_END_NAMESPACE_XLSX
-#endif  // XLSXCONTENTTYPES_H
+#endif // XLSXCONTENTTYPES_H

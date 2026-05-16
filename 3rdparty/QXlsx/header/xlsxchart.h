@@ -3,10 +3,10 @@
 #ifndef QXLSX_CHART_H
 #define QXLSX_CHART_H
 
+#include "xlsxabstractooxmlfile.h"
+
 #include <QXmlStreamReader>
 #include <QXmlStreamWriter>
-
-#include "xlsxabstractooxmlfile.h"
 
 QT_BEGIN_NAMESPACE_XLSX
 
@@ -16,11 +16,12 @@ class ChartPrivate;
 class CellRange;
 class DrawingAnchor;
 
-class QXLSX_EXPORT Chart : public AbstractOOXmlFile {
+class QXLSX_EXPORT Chart : public AbstractOOXmlFile
+{
     Q_DECLARE_PRIVATE(Chart)
-   public:
-    enum ChartType {              // 16 type of chart (ECMA 376)
-        CT_NoStatementChart = 0,  // Zero is internally used for unknown types
+public:
+    enum ChartType {             // 16 type of chart (ECMA 376)
+        CT_NoStatementChart = 0, // Zero is internally used for unknown types
         CT_AreaChart,
         CT_Area3DChart,
         CT_LineChart,
@@ -40,21 +41,24 @@ class QXLSX_EXPORT Chart : public AbstractOOXmlFile {
     };
     enum ChartAxisPos { None = (-1), Left = 0, Right, Top, Bottom };
 
-   private:
+private:
     friend class AbstractSheet;
     friend class Worksheet;
     friend class Chartsheet;
     friend class DrawingAnchor;
 
-   private:
+private:
     Chart(AbstractSheet *parent, CreateFlag flag);
 
-   public:
+public:
     ~Chart();
 
-   public:
-    void addSeries(const CellRange &range, AbstractSheet *sheet = nullptr, bool headerH = false,
-                   bool headerV = false, bool swapHeaders = false);
+public:
+    void addSeries(const CellRange &range,
+                   AbstractSheet *sheet = nullptr,
+                   bool headerH         = false,
+                   bool headerV         = false,
+                   bool swapHeaders     = false);
     void setChartType(ChartType type);
     void setChartStyle(int id);
     void setAxisTitle(Chart::ChartAxisPos pos, QString axisTitle);
@@ -62,11 +66,11 @@ class QXLSX_EXPORT Chart : public AbstractOOXmlFile {
     void setChartLegend(Chart::ChartAxisPos legendPos, bool overlap = false);
     void setGridlinesEnable(bool majorGridlinesEnable = false, bool minorGridlinesEnable = false);
 
-   public:
+public:
     bool loadFromXmlFile(QIODevice *device) override;
     void saveToXmlFile(QIODevice *device) const override;
 };
 
 QT_END_NAMESPACE_XLSX
 
-#endif  // QXLSX_CHART_H
+#endif // QXLSX_CHART_H

@@ -3,15 +3,15 @@
 #ifndef QXLSX_XLSXDOCUMENT_H
 #define QXLSX_XLSXDOCUMENT_H
 
+#include "xlsxformat.h"
+#include "xlsxglobal.h"
+#include "xlsxworksheet.h"
+#include "xlsxreadsax.h"
+
 #include <QIODevice>
 #include <QImage>
 #include <QObject>
 #include <QVariant>
-
-#include "xlsxformat.h"
-#include "xlsxglobal.h"
-#include "xlsxreadsax.h"
-#include "xlsxworksheet.h"
 
 QT_BEGIN_NAMESPACE_XLSX
 
@@ -24,11 +24,12 @@ class Chart;
 class CellReference;
 class DocumentPrivate;
 
-class QXLSX_EXPORT Document : public QObject {
+class QXLSX_EXPORT Document : public QObject
+{
     Q_OBJECT
-    Q_DECLARE_PRIVATE(Document)  // D-Pointer. Qt classes have a Q_DECLARE_PRIVATE
-                                 // macro in the public class. The macro reads: qglobal.h
-   public:
+    Q_DECLARE_PRIVATE(Document) // D-Pointer. Qt classes have a Q_DECLARE_PRIVATE
+                                // macro in the public class. The macro reads: qglobal.h
+public:
     explicit Document(QObject *parent = nullptr);
     Document(const QString &xlsxName, QObject *parent = nullptr);
     Document(QIODevice *device, QObject *parent = nullptr);
@@ -84,8 +85,10 @@ class QXLSX_EXPORT Document : public QObject {
     std::shared_ptr<Cell> cellAt(const CellReference &cell) const;
     std::shared_ptr<Cell> cellAt(int row, int col) const;
 
-    bool defineName(const QString &name, const QString &formula, const QString &comment = QString(),
-                    const QString &scope = QString());
+    bool defineName(const QString &name,
+                    const QString &formula,
+                    const QString &comment = QString(),
+                    const QString &scope   = QString());
 
     CellRange dimension() const;
 
@@ -94,9 +97,10 @@ class QXLSX_EXPORT Document : public QObject {
     QStringList documentPropertyNames() const;
 
     QStringList sheetNames() const;
-    bool addSheet(const QString &name = QString(),
+    bool addSheet(const QString &name           = QString(),
                   AbstractSheet::SheetType type = AbstractSheet::ST_WorkSheet);
-    bool insertSheet(int index, const QString &name = QString(),
+    bool insertSheet(int index,
+                     const QString &name           = QString(),
                      AbstractSheet::SheetType type = AbstractSheet::ST_WorkSheet);
     bool selectSheet(const QString &name);
     bool selectSheet(int index);
@@ -120,31 +124,35 @@ class QXLSX_EXPORT Document : public QObject {
     static bool copyStyle(const QString &from, const QString &to);
 
     bool isLoadPackage() const;
-    bool load() const;  // equals to isLoadPackage()
+    bool load() const; // equals to isLoadPackage()
 
-    bool changeimage(int filenoinmidea, QString newfile);  // add by liufeijin20181025
+    bool changeimage(int filenoinmidea, QString newfile); // add by liufeijin20181025
 
     bool autosizeColumnWidth(const CellRange &range);
     bool autosizeColumnWidth(int column);
     bool autosizeColumnWidth(int colFirst, int colLast);
     bool autosizeColumnWidth();
 
+
     /////////////////////////////////
     // New feature: Stream sheet cells with callback "without saving"
-    bool read_sheet_sax(const QString &sheet_name, const sax_options &opt,
-                        const sax_cell_callback &on_cell);
+    bool read_sheet_sax(const QString& sheet_name,
+                        const sax_options& opt,
+                        const sax_cell_callback& on_cell);
 
-    bool read_sheet_sax(int sheet_index, const sax_options &opt, const sax_cell_callback &on_cell);
+    bool read_sheet_sax(int sheet_index,
+                        const sax_options& opt,
+                        const sax_cell_callback& on_cell);
 
-   private:
+private:
     QMap<int, int> getMaximalColumnWidth(int firstRow = 1, int lastRow = INT_MAX);
 
-   private:
-    Q_DISABLE_COPY(Document)  // Disables the use of copy constructors and
-                              // assignment operators for the given Class.
+private:
+    Q_DISABLE_COPY(Document) // Disables the use of copy constructors and
+                             // assignment operators for the given Class.
     DocumentPrivate *const d_ptr;
 };
 
 QT_END_NAMESPACE_XLSX
 
-#endif  // QXLSX_XLSXDOCUMENT_H
+#endif // QXLSX_XLSXDOCUMENT_H

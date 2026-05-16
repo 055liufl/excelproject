@@ -2,11 +2,11 @@
 
 #include "xlsxcellrange.h"
 
+#include "xlsxcellreference.h"
+
 #include <QPoint>
 #include <QString>
 #include <QStringList>
-
-#include "xlsxcellreference.h"
 
 QT_BEGIN_NAMESPACE_XLSX
 
@@ -23,7 +23,12 @@ QT_BEGIN_NAMESPACE_XLSX
     Constructs an range, i.e. a range
     whose rowCount() and columnCount() are 0.
 */
-CellRange::CellRange() : top(-1), left(-1), bottom(-2), right(-2) {
+CellRange::CellRange()
+    : top(-1)
+    , left(-1)
+    , bottom(-2)
+    , right(-2)
+{
 }
 
 /*!
@@ -33,21 +38,27 @@ CellRange::CellRange() : top(-1), left(-1), bottom(-2), right(-2) {
     \sa topRow(), leftColumn(), bottomRow(), rightColumn()
 */
 CellRange::CellRange(int top, int left, int bottom, int right)
-    : top(top), left(left), bottom(bottom), right(right) {
+    : top(top)
+    , left(left)
+    , bottom(bottom)
+    , right(right)
+{
 }
 
 CellRange::CellRange(const CellReference &topLeft, const CellReference &bottomRight)
-    : top(topLeft.row()),
-      left(topLeft.column()),
-      bottom(bottomRight.row()),
-      right(bottomRight.column()) {
+    : top(topLeft.row())
+    , left(topLeft.column())
+    , bottom(bottomRight.row())
+    , right(bottomRight.column())
+{
 }
 
 /*!
     \overload
     Constructs the range form the given \a range string.
 */
-CellRange::CellRange(const QString &range) {
+CellRange::CellRange(const QString &range)
+{
     init(range);
 }
 
@@ -55,25 +66,27 @@ CellRange::CellRange(const QString &range) {
     \overload
     Constructs the range form the given \a range string.
 */
-CellRange::CellRange(const char *range) {
+CellRange::CellRange(const char *range)
+{
     init(QString::fromLatin1(range));
 }
 
-void CellRange::init(const QString &range) {
+void CellRange::init(const QString &range)
+{
     QStringList rs = range.split(QLatin1Char(':'));
     if (rs.size() == 2) {
         CellReference start(rs[0]);
         CellReference end(rs[1]);
-        top = start.row();
-        left = start.column();
+        top    = start.row();
+        left   = start.column();
         bottom = end.row();
-        right = end.column();
+        right  = end.column();
     } else {
         CellReference p(rs[0]);
-        top = p.row();
-        left = p.column();
+        top    = p.row();
+        left   = p.column();
         bottom = p.row();
-        right = p.column();
+        right  = p.column();
     }
 }
 
@@ -82,19 +95,25 @@ void CellRange::init(const QString &range) {
     other range.
 */
 CellRange::CellRange(const CellRange &other)
-    : top(other.top), left(other.left), bottom(other.bottom), right(other.right) {
+    : top(other.top)
+    , left(other.left)
+    , bottom(other.bottom)
+    , right(other.right)
+{
 }
 
 /*!
     Destroys the range.
 */
-CellRange::~CellRange() {
+CellRange::~CellRange()
+{
 }
 
 /*!
      Convert the range to string notation, such as "A1:B5".
 */
-QString CellRange::toString(bool row_abs, bool col_abs) const {
+QString CellRange::toString(bool row_abs, bool col_abs) const
+{
     if (!isValid())
         return QString();
 
@@ -111,7 +130,8 @@ QString CellRange::toString(bool row_abs, bool col_abs) const {
 /*!
  * Returns true if the Range is valid.
  */
-bool CellRange::isValid() const {
+bool CellRange::isValid() const
+{
     return left <= right && top <= bottom;
 }
 

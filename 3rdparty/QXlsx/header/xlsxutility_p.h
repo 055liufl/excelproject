@@ -3,6 +3,8 @@
 #ifndef XLSXUTILITY_H
 #define XLSXUTILITY_H
 
+#include "xlsxglobal.h"
+
 #include <QColor>
 #include <QDate>
 #include <QDateTime>
@@ -12,8 +14,6 @@
 #include <QStringList>
 #include <QTime>
 #include <QVariant>
-
-#include "xlsxglobal.h"
 
 QT_BEGIN_NAMESPACE_XLSX
 
@@ -35,8 +35,9 @@ QString unescapeSheetName(const QString &sheetName);
 
 bool isSpaceReserveNeeded(const QString &string);
 
-QString convertSharedFormula(const QString &rootFormula, const CellReference &rootCell,
+QString convertSharedFormula(const QString &rootFormula,
+                             const CellReference &rootCell,
                              const CellReference &cell);
 
 QT_END_NAMESPACE_XLSX
-#endif  // XLSXUTILITY_H
+#endif // XLSXUTILITY_H

@@ -2,13 +2,6 @@
 
 #include "xlsxworkbook.h"
 
-#include <QBuffer>
-#include <QDir>
-#include <QFile>
-#include <QXmlStreamReader>
-#include <QXmlStreamWriter>
-#include <QtDebug>
-
 #include "xlsxchart.h"
 #include "xlsxchartsheet.h"
 #include "xlsxformat.h"
@@ -21,40 +14,52 @@
 #include "xlsxworksheet.h"
 #include "xlsxworksheet_p.h"
 
+#include <QBuffer>
+#include <QDir>
+#include <QFile>
+#include <QXmlStreamReader>
+#include <QXmlStreamWriter>
+#include <QtDebug>
+
 QT_BEGIN_NAMESPACE_XLSX
 
 WorkbookPrivate::WorkbookPrivate(Workbook *q, Workbook::CreateFlag flag)
-    : AbstractOOXmlFilePrivate(q, flag) {
+    : AbstractOOXmlFilePrivate(q, flag)
+{
     sharedStrings = std::make_shared<SharedStrings>(flag);
-    styles = std::make_shared<Styles>(flag);
-    theme = std::make_shared<Theme>(flag);
+    styles        = std::make_shared<Styles>(flag);
+    theme         = std::make_shared<Theme>(flag);
 
-    x_window = 240;
-    y_window = 15;
-    window_width = 16095;
+    x_window      = 240;
+    y_window      = 15;
+    window_width  = 16095;
     window_height = 9660;
 
-    strings_to_numbers_enabled = false;
+    strings_to_numbers_enabled    = false;
     strings_to_hyperlinks_enabled = true;
-    html_to_richstring_enabled = false;
-    date1904 = false;
-    defaultDateFormat = QStringLiteral("yyyy-mm-dd");
-    activesheetIndex = 0;
-    firstsheet = 0;
-    table_count = 0;
+    html_to_richstring_enabled    = false;
+    date1904                      = false;
+    defaultDateFormat             = QStringLiteral("yyyy-mm-dd");
+    activesheetIndex              = 0;
+    firstsheet                    = 0;
+    table_count                   = 0;
 
-    last_worksheet_index = 0;
+    last_worksheet_index  = 0;
     last_chartsheet_index = 0;
-    last_sheet_id = 0;
+    last_sheet_id         = 0;
 }
 
-Workbook::Workbook(CreateFlag flag) : AbstractOOXmlFile(new WorkbookPrivate(this, flag)) {
+Workbook::Workbook(CreateFlag flag)
+    : AbstractOOXmlFile(new WorkbookPrivate(this, flag))
+{
 }
 
-Workbook::~Workbook() {
+Workbook::~Workbook()
+{
 }
 
-bool Workbook::isDate1904() const {
+bool Workbook::isDate1904() const
+{
     Q_D(const Workbook);
     return d->date1904;
 }
@@ -69,7 +74,8 @@ bool Workbook::isDate1904() const {
   \note This function should be called before any date/time
   has been written.
 */
-void Workbook::setDate1904(bool date1904) {
+void Workbook::setDate1904(bool date1904)
+{
     Q_D(Workbook);
     d->date1904 = date1904;
 }
@@ -81,42 +87,50 @@ void Workbook::setDate1904(bool date1904) {
 
   The default is false
  */
-void Workbook::setStringsToNumbersEnabled(bool enable) {
+void Workbook::setStringsToNumbersEnabled(bool enable)
+{
     Q_D(Workbook);
     d->strings_to_numbers_enabled = enable;
 }
 
-bool Workbook::isStringsToNumbersEnabled() const {
+bool Workbook::isStringsToNumbersEnabled() const
+{
     Q_D(const Workbook);
     return d->strings_to_numbers_enabled;
 }
 
-void Workbook::setStringsToHyperlinksEnabled(bool enable) {
+void Workbook::setStringsToHyperlinksEnabled(bool enable)
+{
     Q_D(Workbook);
     d->strings_to_hyperlinks_enabled = enable;
 }
 
-bool Workbook::isStringsToHyperlinksEnabled() const {
+bool Workbook::isStringsToHyperlinksEnabled() const
+{
     Q_D(const Workbook);
     return d->strings_to_hyperlinks_enabled;
 }
 
-void Workbook::setHtmlToRichStringEnabled(bool enable) {
+void Workbook::setHtmlToRichStringEnabled(bool enable)
+{
     Q_D(Workbook);
     d->html_to_richstring_enabled = enable;
 }
 
-bool Workbook::isHtmlToRichStringEnabled() const {
+bool Workbook::isHtmlToRichStringEnabled() const
+{
     Q_D(const Workbook);
     return d->html_to_richstring_enabled;
 }
 
-QString Workbook::defaultDateFormat() const {
+QString Workbook::defaultDateFormat() const
+{
     Q_D(const Workbook);
     return d->defaultDateFormat;
 }
 
-void Workbook::setDefaultDateFormat(const QString &format) {
+void Workbook::setDefaultDateFormat(const QString &format)
+{
     Q_D(Workbook);
     d->defaultDateFormat = format;
 }
@@ -129,8 +143,11 @@ void Workbook::setDefaultDateFormat(const QString &format) {
  * \param scope The name of one worksheet, or empty which means global scope.
  * \return Return false if the name invalid.
  */
-bool Workbook::defineName(const QString &name, const QString &formula, const QString &comment,
-                          const QString &scope) {
+bool Workbook::defineName(const QString &name,
+                          const QString &formula,
+                          const QString &comment,
+                          const QString &scope)
+{
     Q_D(Workbook);
 
     // Remove the = sign from the formula if it exists.
@@ -152,7 +169,8 @@ bool Workbook::defineName(const QString &name, const QString &formula, const QSt
     return true;
 }
 
-AbstractSheet *Workbook::addSheet(const QString &name, AbstractSheet::SheetType type) {
+AbstractSheet *Workbook::addSheet(const QString &name, AbstractSheet::SheetType type)
+{
     Q_D(Workbook);
     return insertSheet(d->sheets.size(), name, type);
 }
@@ -160,7 +178,8 @@ AbstractSheet *Workbook::addSheet(const QString &name, AbstractSheet::SheetType 
 /*!
  * \internal
  */
-QStringList Workbook::worksheetNames() const {
+QStringList Workbook::worksheetNames() const
+{
     Q_D(const Workbook);
     return d->sheetNames;
 }
@@ -169,7 +188,8 @@ QStringList Workbook::worksheetNames() const {
  * \internal
  * Used only when load the xlsx file!!
  */
-AbstractSheet *Workbook::addSheet(const QString &name, int sheetId, AbstractSheet::SheetType type) {
+AbstractSheet *Workbook::addSheet(const QString &name, int sheetId, AbstractSheet::SheetType type)
+{
     Q_D(Workbook);
     if (sheetId > d->last_sheet_id)
         d->last_sheet_id = sheetId;
@@ -192,8 +212,8 @@ AbstractSheet *Workbook::addSheet(const QString &name, int sheetId, AbstractShee
     return sheet;
 }
 
-AbstractSheet *Workbook::insertSheet(int index, const QString &name,
-                                     AbstractSheet::SheetType type) {
+AbstractSheet *Workbook::insertSheet(int index, const QString &name, AbstractSheet::SheetType type)
+{
     Q_D(Workbook);
     QString sheetName = createSafeSheetName(name);
     if (index < 0 || index > d->sheets.size()) {
@@ -243,14 +263,16 @@ AbstractSheet *Workbook::insertSheet(int index, const QString &name,
 /*!
  * Returns current active worksheet.
  */
-AbstractSheet *Workbook::activeSheet() const {
+AbstractSheet *Workbook::activeSheet() const
+{
     Q_D(const Workbook);
     if (d->sheets.isEmpty())
         const_cast<Workbook *>(this)->addSheet();
     return d->sheets[d->activesheetIndex].get();
 }
 
-bool Workbook::setActiveSheet(int index) {
+bool Workbook::setActiveSheet(int index)
+{
     Q_D(Workbook);
     if (index < 0 || index >= d->sheets.size()) {
         // warning
@@ -263,7 +285,8 @@ bool Workbook::setActiveSheet(int index) {
 /*!
  * Rename the worksheet at the \a index to \a newName.
  */
-bool Workbook::renameSheet(int index, const QString &newName) {
+bool Workbook::renameSheet(int index, const QString &newName)
+{
     Q_D(Workbook);
     QString name = createSafeSheetName(newName);
     if (index < 0 || index >= d->sheets.size())
@@ -283,7 +306,8 @@ bool Workbook::renameSheet(int index, const QString &newName) {
 /*!
  * Remove the worksheet at pos \a index.
  */
-bool Workbook::deleteSheet(int index) {
+bool Workbook::deleteSheet(int index)
+{
     Q_D(Workbook);
     if (d->sheets.size() <= 1)
         return false;
@@ -297,7 +321,8 @@ bool Workbook::deleteSheet(int index) {
 /*!
  * Moves the worksheet form \a srcIndex to \a distIndex.
  */
-bool Workbook::moveSheet(int srcIndex, int distIndex) {
+bool Workbook::moveSheet(int srcIndex, int distIndex)
+{
     Q_D(Workbook);
     if (srcIndex == distIndex)
         return false;
@@ -317,7 +342,8 @@ bool Workbook::moveSheet(int srcIndex, int distIndex) {
     return true;
 }
 
-bool Workbook::copySheet(int index, const QString &newName) {
+bool Workbook::copySheet(int index, const QString &newName)
+{
     Q_D(Workbook);
     if (index < 0 || index >= d->sheets.size())
         return false;
@@ -341,13 +367,14 @@ bool Workbook::copySheet(int index, const QString &newName) {
     d->sheets.append(std::shared_ptr<AbstractSheet>(sheet));
     d->sheetNames.append(sheet->sheetName());
 
-    return true;  // #162
+    return true; // #162
 }
 
 /*!
  * Returns count of worksheets.
  */
-int Workbook::sheetCount() const {
+int Workbook::sheetCount() const
+{
     Q_D(const Workbook);
     return d->sheets.count();
 }
@@ -355,24 +382,28 @@ int Workbook::sheetCount() const {
 /*!
  * Returns the sheet object at index \a sheetIndex.
  */
-AbstractSheet *Workbook::sheet(int index) const {
+AbstractSheet *Workbook::sheet(int index) const
+{
     Q_D(const Workbook);
     if (index < 0 || index >= d->sheets.size())
         return nullptr;
     return d->sheets.at(index).get();
 }
 
-SharedStrings *Workbook::sharedStrings() const {
+SharedStrings *Workbook::sharedStrings() const
+{
     Q_D(const Workbook);
     return d->sharedStrings.get();
 }
 
-Styles *Workbook::styles() {
+Styles *Workbook::styles()
+{
     Q_D(Workbook);
     return d->styles.get();
 }
 
-Theme *Workbook::theme() {
+Theme *Workbook::theme()
+{
     Q_D(Workbook);
     return d->theme.get();
 }
@@ -382,7 +413,8 @@ Theme *Workbook::theme() {
  *
  * Unlike media files, drawing file is a property of the sheet.
  */
-QList<Drawing *> Workbook::drawings() {
+QList<Drawing *> Workbook::drawings()
+{
     Q_D(Workbook);
     QList<Drawing *> ds;
     for (int i = 0; i < d->sheets.size(); ++i) {
@@ -397,8 +429,9 @@ QList<Drawing *> Workbook::drawings() {
 /*!
  * \internal
  */
-QList<std::shared_ptr<AbstractSheet>> Workbook::getSheetsByTypes(
-    AbstractSheet::SheetType type) const {
+QList<std::shared_ptr<AbstractSheet>>
+    Workbook::getSheetsByTypes(AbstractSheet::SheetType type) const
+{
     Q_D(const Workbook);
     QList<std::shared_ptr<AbstractSheet>> list;
     for (int i = 0; i < d->sheets.size(); ++i) {
@@ -408,7 +441,8 @@ QList<std::shared_ptr<AbstractSheet>> Workbook::getSheetsByTypes(
     return list;
 }
 
-void Workbook::saveToXmlFile(QIODevice *device) const {
+void Workbook::saveToXmlFile(QIODevice *device) const
+{
     Q_D(const Workbook);
     d->relationships->clear();
     if (d->sheets.isEmpty())
@@ -451,10 +485,10 @@ void Workbook::saveToXmlFile(QIODevice *device) const {
     // Store the activeTab when it isn't the first sheet
     if (d->activesheetIndex > 0)
         writer.writeAttribute(QStringLiteral("activeTab"), QString::number(d->activesheetIndex));
-    writer.writeEndElement();  // bookViews
+    writer.writeEndElement(); // bookViews
 
     writer.writeStartElement(QStringLiteral("sheets"));
-    int worksheetIndex = 0;
+    int worksheetIndex  = 0;
     int chartsheetIndex = 0;
     for (int i = 0; i < d->sheets.size(); ++i) {
         std::shared_ptr<AbstractSheet> sheet = d->sheets[i];
@@ -478,7 +512,7 @@ void Workbook::saveToXmlFile(QIODevice *device) const {
         writer.writeAttribute(QStringLiteral("r:id"),
                               QStringLiteral("rId%1").arg(d->relationships->count()));
     }
-    writer.writeEndElement();  // sheets
+    writer.writeEndElement(); // sheets
 
     if (!d->externalLinks.isEmpty()) {
         writer.writeStartElement(QStringLiteral("externalReferences"));
@@ -490,7 +524,7 @@ void Workbook::saveToXmlFile(QIODevice *device) const {
             writer.writeAttribute(QStringLiteral("r:id"),
                                   QStringLiteral("rId%1").arg(d->relationships->count()));
         }
-        writer.writeEndElement();  // externalReferences
+        writer.writeEndElement(); // externalReferences
     }
 
     if (!d->definedNamesList.isEmpty()) {
@@ -510,16 +544,16 @@ void Workbook::saveToXmlFile(QIODevice *device) const {
                 }
             }
             writer.writeCharacters(data.formula);
-            writer.writeEndElement();  // definedName
+            writer.writeEndElement(); // definedName
         }
-        writer.writeEndElement();  // definedNames
+        writer.writeEndElement(); // definedNames
     }
 
     writer.writeStartElement(QStringLiteral("calcPr"));
     writer.writeAttribute(QStringLiteral("calcId"), QStringLiteral("124519"));
-    writer.writeEndElement();  // calcPr
+    writer.writeEndElement(); // calcPr
 
-    writer.writeEndElement();  // workbook
+    writer.writeEndElement(); // workbook
     writer.writeEndDocument();
 
     d->relationships->addDocumentRelationship(QStringLiteral("/theme"),
@@ -531,7 +565,8 @@ void Workbook::saveToXmlFile(QIODevice *device) const {
                                                   QStringLiteral("sharedStrings.xml"));
 }
 
-bool Workbook::loadFromXmlFile(QIODevice *device) {
+bool Workbook::loadFromXmlFile(QIODevice *device)
+{
     Q_D(Workbook);
 
     QXmlStreamReader reader(device);
@@ -621,7 +656,7 @@ bool Workbook::loadFromXmlFile(QIODevice *device) {
                 }
             } else if (reader.name() == QLatin1String("externalReference")) {
                 QXmlStreamAttributes attributes = reader.attributes();
-                const QString rId = attributes.value(QLatin1String("r:id")).toString();
+                const QString rId             = attributes.value(QLatin1String("r:id")).toString();
                 XlsxRelationship relationship = d->relationships->getRelationshipById(rId);
 
                 std::shared_ptr<SimpleOOXmlFile> link(new SimpleOOXmlFile(F_LoadFromExists));
@@ -640,8 +675,8 @@ bool Workbook::loadFromXmlFile(QIODevice *device) {
                 if (attrs.hasAttribute(QLatin1String("comment")))
                     data.comment = attrs.value(QLatin1String("comment")).toString();
                 if (attrs.hasAttribute(QLatin1String("localSheetId"))) {
-                    int localId = attrs.value(QLatin1String("localSheetId")).toInt();
-                    int sheetId = d->sheets.at(localId)->sheetId();
+                    int localId  = attrs.value(QLatin1String("localSheetId")).toInt();
+                    int sheetId  = d->sheets.at(localId)->sheetId();
                     data.sheetId = sheetId;
                 }
                 data.formula = reader.readElementText();
@@ -655,7 +690,8 @@ bool Workbook::loadFromXmlFile(QIODevice *device) {
 /*!
  * \internal
  */
-QList<std::shared_ptr<MediaFile>> Workbook::mediaFiles() const {
+QList<std::shared_ptr<MediaFile>> Workbook::mediaFiles() const
+{
     Q_D(const Workbook);
 
     return d->mediaFiles;
@@ -664,7 +700,8 @@ QList<std::shared_ptr<MediaFile>> Workbook::mediaFiles() const {
 /*!
  * \internal
  */
-void Workbook::addMediaFile(std::shared_ptr<MediaFile> media, bool force) {
+void Workbook::addMediaFile(std::shared_ptr<MediaFile> media, bool force)
+{
     Q_D(Workbook);
 
     if (!force) {
@@ -683,7 +720,8 @@ void Workbook::addMediaFile(std::shared_ptr<MediaFile> media, bool force) {
 /*!
  * \internal
  */
-QList<std::shared_ptr<Chart>> Workbook::chartFiles() const {
+QList<std::shared_ptr<Chart>> Workbook::chartFiles() const
+{
     Q_D(const Workbook);
 
     return d->chartFiles;
@@ -692,19 +730,22 @@ QList<std::shared_ptr<Chart>> Workbook::chartFiles() const {
 /*!
  * \internal
  */
-void Workbook::addChartFile(std::shared_ptr<Chart> chart) {
+void Workbook::addChartFile(std::shared_ptr<Chart> chart)
+{
     Q_D(Workbook);
 
     if (!d->chartFiles.contains(chart))
         d->chartFiles.append(chart);
 }
 
-void Workbook::setWriteDatesAsText(bool enable) {
+void Workbook::setWriteDatesAsText(bool enable)
+{
     Q_D(Workbook);
     d->writeDatesAsText = enable;
 }
 
-bool Workbook::writeDatesAsText() const {
+bool Workbook::writeDatesAsText() const
+{
     Q_D(const Workbook);
     return d->writeDatesAsText;
 }

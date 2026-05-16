@@ -1,59 +1,71 @@
 // xlsxcolor.cpp
 
+#include "xlsxcolor_p.h"
+#include "xlsxstyles_p.h"
+#include "xlsxutility_p.h"
+
 #include <QDataStream>
 #include <QDebug>
 #include <QXmlStreamReader>
 #include <QXmlStreamWriter>
 
-#include "xlsxcolor_p.h"
-#include "xlsxstyles_p.h"
-#include "xlsxutility_p.h"
-
 QT_BEGIN_NAMESPACE_XLSX
 
-XlsxColor::XlsxColor(const QColor &color) {
+XlsxColor::XlsxColor(const QColor &color)
+{
     if (color.isValid())
         val.setValue(color);
 }
 
 XlsxColor::XlsxColor(const QString &theme, const QString &tint)
-    : val(QStringList() << theme << tint) {
+    : val(QStringList() << theme << tint)
+{
 }
 
-XlsxColor::XlsxColor(int index) : val(index) {
+XlsxColor::XlsxColor(int index)
+    : val(index)
+{
 }
 
-bool XlsxColor::isRgbColor() const {
+bool XlsxColor::isRgbColor() const
+{
     return val.userType() == qMetaTypeId<QColor>() && val.value<QColor>().isValid();
 }
 
-bool XlsxColor::isIndexedColor() const {
+bool XlsxColor::isIndexedColor() const
+{
     return val.userType() == QMetaType::Int;
 }
 
-bool XlsxColor::isThemeColor() const {
+bool XlsxColor::isThemeColor() const
+{
     return val.userType() == QMetaType::QStringList;
 }
 
-bool XlsxColor::isInvalid() const {
+bool XlsxColor::isInvalid() const
+{
     return !val.isValid();
 }
 
-QColor XlsxColor::rgbColor() const {
+QColor XlsxColor::rgbColor() const
+{
     return isRgbColor() ? val.value<QColor>() : QColor();
 }
 
-int XlsxColor::indexedColor() const {
+int XlsxColor::indexedColor() const
+{
     return isIndexedColor() ? val.toInt() : -1;
 }
 
-QStringList XlsxColor::themeColor() const {
+QStringList XlsxColor::themeColor() const
+{
     return isThemeColor() ? val.toStringList() : QStringList();
 }
 
-bool XlsxColor::saveToXml(QXmlStreamWriter &writer, const QString &node) const {
+bool XlsxColor::saveToXml(QXmlStreamWriter &writer, const QString &node) const
+{
     if (!node.isEmpty())
-        writer.writeEmptyElement(node);  // color, bgColor, fgColor
+        writer.writeEmptyElement(node); // color, bgColor, fgColor
     else
         writer.writeEmptyElement(QStringLiteral("color"));
 
@@ -73,7 +85,8 @@ bool XlsxColor::saveToXml(QXmlStreamWriter &writer, const QString &node) const {
     return true;
 }
 
-bool XlsxColor::loadFromXml(QXmlStreamReader &reader) {
+bool XlsxColor::loadFromXml(QXmlStreamReader &reader)
+{
     const auto &attributes = reader.attributes();
 
     if (attributes.hasAttribute(QLatin1String("rgb"))) {
@@ -84,15 +97,16 @@ bool XlsxColor::loadFromXml(QXmlStreamReader &reader) {
         val.setValue(index);
     } else if (attributes.hasAttribute(QLatin1String("theme"))) {
         const auto &theme = attributes.value(QLatin1String("theme")).toString();
-        const auto &tint = attributes.value(QLatin1String("tint")).toString();
+        const auto &tint  = attributes.value(QLatin1String("tint")).toString();
         val.setValue(QStringList() << theme << tint);
     }
     return true;
 }
 
-XlsxColor::operator QVariant() const {
+XlsxColor::operator QVariant() const
+{
     const auto &cref
-#if QT_VERSION >= 0x060000  // Qt 6.0 or over
+#if QT_VERSION >= 0x060000 // Qt 6.0 or over
         = QMetaType::fromType<XlsxColor>();
 #else
         = qMetaTypeId<XlsxColor>();
@@ -100,7 +114,8 @@ XlsxColor::operator QVariant() const {
     return QVariant(cref, this);
 }
 
-QColor XlsxColor::fromARGBString(const QString &c) {
+QColor XlsxColor::fromARGBString(const QString &c)
+{
 #if QT_VERSION >= QT_VERSION_CHECK(6, 4, 0)
     if (c.startsWith(u'#')) {
         return QColor::fromString(c);
@@ -118,12 +133,14 @@ QColor XlsxColor::fromARGBString(const QString &c) {
 #endif
 }
 
-QString XlsxColor::toARGBString(const QColor &c) {
+QString XlsxColor::toARGBString(const QColor &c)
+{
     return QString::asprintf("%02X%02X%02X%02X", c.alpha(), c.red(), c.green(), c.blue());
 }
 
 #if !defined(QT_NO_DATASTREAM)
-QDataStream &operator<<(QDataStream &s, const XlsxColor &color) {
+QDataStream &operator<<(QDataStream &s, const XlsxColor &color)
+{
     if (color.isInvalid())
         s << 0;
     else if (color.isRgbColor())
@@ -138,7 +155,8 @@ QDataStream &operator<<(QDataStream &s, const XlsxColor &color) {
     return s;
 }
 
-QDataStream &operator>>(QDataStream &s, XlsxColor &color) {
+QDataStream &operator>>(QDataStream &s, XlsxColor &color)
+{
     int marker(4);
     s >> marker;
     if (marker == 0) {
@@ -163,7 +181,8 @@ QDataStream &operator>>(QDataStream &s, XlsxColor &color) {
 #endif
 
 #ifndef QT_NO_DEBUG_STREAM
-QDebug operator<<(QDebug dbg, const XlsxColor &c) {
+QDebug operator<<(QDebug dbg, const XlsxColor &c)
+{
     if (c.isInvalid())
         dbg.nospace() << "XlsxColor(invalid)";
     else if (c.isRgbColor())

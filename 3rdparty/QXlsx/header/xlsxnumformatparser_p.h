@@ -40,11 +40,12 @@
 
 QT_BEGIN_NAMESPACE_XLSX
 
-class NumFormatParser {
-   public:
+class NumFormatParser
+{
+public:
     static bool isDateTime(const QString &formatCode);
 };
 
 QT_END_NAMESPACE_XLSX
 
-#endif  // QXLSX_NUMFORMATPARSER_H
+#endif // QXLSX_NUMFORMATPARSER_H

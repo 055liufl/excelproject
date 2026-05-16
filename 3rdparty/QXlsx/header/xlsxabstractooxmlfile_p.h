@@ -9,15 +9,16 @@
 
 QT_BEGIN_NAMESPACE_XLSX
 
-class AbstractOOXmlFilePrivate {
+class AbstractOOXmlFilePrivate
+{
     Q_DECLARE_PUBLIC(AbstractOOXmlFile)
 
-   public:
+public:
     AbstractOOXmlFilePrivate(AbstractOOXmlFile *q, AbstractOOXmlFile::CreateFlag flag);
     virtual ~AbstractOOXmlFilePrivate();
 
-   public:
-    QString filePathInPackage;  // such as "xl/worksheets/sheet1.xml"
+public:
+    QString filePathInPackage; // such as "xl/worksheets/sheet1.xml"
 
     Relationships *relationships;
     AbstractOOXmlFile::CreateFlag flag;
@@ -26,4 +27,4 @@ class AbstractOOXmlFilePrivate {
 
 QT_END_NAMESPACE_XLSX
 
-#endif  // XLSXOOXMLFILE_P_H
+#endif // XLSXOOXMLFILE_P_H

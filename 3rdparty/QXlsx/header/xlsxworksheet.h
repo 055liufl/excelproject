@@ -3,6 +3,12 @@
 #ifndef XLSXWORKSHEET_H
 #define XLSXWORKSHEET_H
 
+#include "xlsxabstractsheet.h"
+#include "xlsxcell.h"
+#include "xlsxcelllocation.h"
+#include "xlsxcellrange.h"
+#include "xlsxcellreference.h"
+
 #include <QDateTime>
 #include <QIODevice>
 #include <QImage>
@@ -12,12 +18,6 @@
 #include <QStringList>
 #include <QUrl>
 #include <QVariant>
-
-#include "xlsxabstractsheet.h"
-#include "xlsxcell.h"
-#include "xlsxcelllocation.h"
-#include "xlsxcellrange.h"
-#include "xlsxcellreference.h"
 
 class WorksheetTest;
 
@@ -35,47 +35,60 @@ class Relationships;
 class Chart;
 
 class WorksheetPrivate;
-class QXLSX_EXPORT Worksheet : public AbstractSheet {
+class QXLSX_EXPORT Worksheet : public AbstractSheet
+{
     Q_DECLARE_PRIVATE(Worksheet)
 
-   private:
+private:
     friend class DocumentPrivate;
     friend class Workbook;
     friend class ::WorksheetTest;
     Worksheet(const QString &sheetName, int sheetId, Workbook *book, CreateFlag flag);
     Worksheet *copy(const QString &distName, int distId) const override;
 
-   public:
+public:
     ~Worksheet();
 
-   public:
-    bool write(const CellReference &row_column, const QVariant &value,
+public:
+    bool write(const CellReference &row_column,
+               const QVariant &value,
                const Format &format = Format());
     bool write(int row, int column, const QVariant &value, const Format &format = Format());
 
     QVariant read(const CellReference &row_column) const;
     QVariant read(int row, int column) const;
 
-    bool writeString(const CellReference &row_column, const QString &value,
+    bool writeString(const CellReference &row_column,
+                     const QString &value,
                      const Format &format = Format());
     bool writeString(int row, int column, const QString &value, const Format &format = Format());
-    bool writeString(const CellReference &row_column, const RichString &value,
+    bool writeString(const CellReference &row_column,
+                     const RichString &value,
                      const Format &format = Format());
     bool writeString(int row, int column, const RichString &value, const Format &format = Format());
 
-    bool writeInlineString(const CellReference &row_column, const QString &value,
+    bool writeInlineString(const CellReference &row_column,
+                           const QString &value,
                            const Format &format = Format());
-    bool writeInlineString(int row, int column, const QString &value,
+    bool writeInlineString(int row,
+                           int column,
+                           const QString &value,
                            const Format &format = Format());
 
-    bool writeNumeric(const CellReference &row_column, double value,
+    bool writeNumeric(const CellReference &row_column,
+                      double value,
                       const Format &format = Format());
     bool writeNumeric(int row, int column, double value, const Format &format = Format());
 
-    bool writeFormula(const CellReference &row_column, const CellFormula &formula,
-                      const Format &format = Format(), double result = 0);
-    bool writeFormula(int row, int column, const CellFormula &formula,
-                      const Format &format = Format(), double result = 0);
+    bool writeFormula(const CellReference &row_column,
+                      const CellFormula &formula,
+                      const Format &format = Format(),
+                      double result        = 0);
+    bool writeFormula(int row,
+                      int column,
+                      const CellFormula &formula,
+                      const Format &format = Format(),
+                      double result        = 0);
 
     bool writeBlank(const CellReference &row_column, const Format &format = Format());
     bool writeBlank(int row, int column, const Format &format = Format());
@@ -83,24 +96,32 @@ class QXLSX_EXPORT Worksheet : public AbstractSheet {
     bool writeBool(const CellReference &row_column, bool value, const Format &format = Format());
     bool writeBool(int row, int column, bool value, const Format &format = Format());
 
-    bool writeDateTime(const CellReference &row_column, const QDateTime &dt,
+    bool writeDateTime(const CellReference &row_column,
+                       const QDateTime &dt,
                        const Format &format = Format());
     bool writeDateTime(int row, int column, const QDateTime &dt, const Format &format = Format());
 
     // dev67
-    bool writeDate(const CellReference &row_column, const QDate &dt,
+    bool writeDate(const CellReference &row_column,
+                   const QDate &dt,
                    const Format &format = Format());
     bool writeDate(int row, int column, const QDate &dt, const Format &format = Format());
 
-    bool writeTime(const CellReference &row_column, const QTime &t,
-                   const Format &format = Format());
+    bool
+        writeTime(const CellReference &row_column, const QTime &t, const Format &format = Format());
     bool writeTime(int row, int column, const QTime &t, const Format &format = Format());
 
-    bool writeHyperlink(const CellReference &row_column, const QUrl &url,
-                        const Format &format = Format(), const QString &display = QString(),
-                        const QString &tip = QString());
-    bool writeHyperlink(int row, int column, const QUrl &url, const Format &format = Format(),
-                        const QString &display = QString(), const QString &tip = QString());
+    bool writeHyperlink(const CellReference &row_column,
+                        const QUrl &url,
+                        const Format &format   = Format(),
+                        const QString &display = QString(),
+                        const QString &tip     = QString());
+    bool writeHyperlink(int row,
+                        int column,
+                        const QUrl &url,
+                        const Format &format   = Format(),
+                        const QString &display = QString(),
+                        const QString &tip     = QString());
 
     bool addDataValidation(const DataValidation &validation);
     bool addConditionalFormatting(const ConditionalFormatting &cf);
@@ -163,14 +184,14 @@ class QXLSX_EXPORT Worksheet : public AbstractSheet {
     void setOutlineSymbolsVisible(bool visible);
     bool isWhiteSpaceVisible() const;
     void setWhiteSpaceVisible(bool visible);
-    bool setStartPage(int spagen);  // add by liufeijin20181028
+    bool setStartPage(int spagen); // add by liufeijin20181028
 
     QVector<CellLocation> getFullCells(int *maxRow, int *maxCol) const;
 
-   private:
+private:
     void saveToXmlFile(QIODevice *device) const override;
     bool loadFromXmlFile(QIODevice *device) override;
 };
 
 QT_END_NAMESPACE_XLSX
-#endif  // XLSXWORKSHEET_H
+#endif // XLSXWORKSHEET_H

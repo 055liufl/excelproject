@@ -8,12 +8,14 @@
 QT_BEGIN_NAMESPACE_XLSX
 
 AbstractSheetPrivate::AbstractSheetPrivate(AbstractSheet *p, AbstractSheet::CreateFlag flag)
-    : AbstractOOXmlFilePrivate(p, flag) {
-    type = AbstractSheet::ST_WorkSheet;
+    : AbstractOOXmlFilePrivate(p, flag)
+{
+    type       = AbstractSheet::ST_WorkSheet;
     sheetState = AbstractSheet::SS_Visible;
 }
 
-AbstractSheetPrivate::~AbstractSheetPrivate() {
+AbstractSheetPrivate::~AbstractSheetPrivate()
+{
 }
 
 /*!
@@ -49,18 +51,22 @@ AbstractSheetPrivate::~AbstractSheetPrivate() {
 /*!
  * \internal
  */
-AbstractSheet::AbstractSheet(const QString &name, int id, Workbook *workbook,
+AbstractSheet::AbstractSheet(const QString &name,
+                             int id,
+                             Workbook *workbook,
                              AbstractSheetPrivate *d)
-    : AbstractOOXmlFile(d) {
-    d_func()->name = name;
-    d_func()->id = id;
+    : AbstractOOXmlFile(d)
+{
+    d_func()->name     = name;
+    d_func()->id       = id;
     d_func()->workbook = workbook;
 }
 
 /*!
  * Returns the name of the sheet.
  */
-QString AbstractSheet::sheetName() const {
+QString AbstractSheet::sheetName() const
+{
     Q_D(const AbstractSheet);
     return d->name;
 }
@@ -68,7 +74,8 @@ QString AbstractSheet::sheetName() const {
 /*!
  * \internal
  */
-void AbstractSheet::setSheetName(const QString &sheetName) {
+void AbstractSheet::setSheetName(const QString &sheetName)
+{
     Q_D(AbstractSheet);
     d->name = sheetName;
 }
@@ -76,7 +83,8 @@ void AbstractSheet::setSheetName(const QString &sheetName) {
 /*!
  * Returns the type of the sheet.
  */
-AbstractSheet::SheetType AbstractSheet::sheetType() const {
+AbstractSheet::SheetType AbstractSheet::sheetType() const
+{
     Q_D(const AbstractSheet);
     return d->type;
 }
@@ -84,7 +92,8 @@ AbstractSheet::SheetType AbstractSheet::sheetType() const {
 /*!
  * \internal
  */
-void AbstractSheet::setSheetType(SheetType type) {
+void AbstractSheet::setSheetType(SheetType type)
+{
     Q_D(AbstractSheet);
     d->type = type;
 }
@@ -94,7 +103,8 @@ void AbstractSheet::setSheetType(SheetType type) {
  *
  * \sa isHidden(), isVisible(), setSheetState()
  */
-AbstractSheet::SheetState AbstractSheet::sheetState() const {
+AbstractSheet::SheetState AbstractSheet::sheetState() const
+{
     Q_D(const AbstractSheet);
     return d->sheetState;
 }
@@ -102,7 +112,8 @@ AbstractSheet::SheetState AbstractSheet::sheetState() const {
 /*!
  * Set the state of the sheet to \a state.
  */
-void AbstractSheet::setSheetState(SheetState state) {
+void AbstractSheet::setSheetState(SheetState state)
+{
     Q_D(AbstractSheet);
     d->sheetState = state;
 }
@@ -112,7 +123,8 @@ void AbstractSheet::setSheetState(SheetState state) {
  *
  * \sa sheetState(), setHidden()
  */
-bool AbstractSheet::isHidden() const {
+bool AbstractSheet::isHidden() const
+{
     Q_D(const AbstractSheet);
     return d->sheetState != SS_Visible;
 }
@@ -120,14 +132,16 @@ bool AbstractSheet::isHidden() const {
 /*!
  * Returns true if the sheet is visible.
  */
-bool AbstractSheet::isVisible() const {
+bool AbstractSheet::isVisible() const
+{
     return !isHidden();
 }
 
 /*!
  * Make the sheet hidden or visible based on \a hidden.
  */
-void AbstractSheet::setHidden(bool hidden) {
+void AbstractSheet::setHidden(bool hidden)
+{
     Q_D(AbstractSheet);
     if (hidden == isHidden())
         return;
@@ -138,14 +152,16 @@ void AbstractSheet::setHidden(bool hidden) {
 /*!
  * Convenience function, equivalent to setHidden(! \a visible).
  */
-void AbstractSheet::setVisible(bool visible) {
+void AbstractSheet::setVisible(bool visible)
+{
     setHidden(!visible);
 }
 
 /*!
  * \internal
  */
-int AbstractSheet::sheetId() const {
+int AbstractSheet::sheetId() const
+{
     Q_D(const AbstractSheet);
     return d->id;
 }
@@ -153,7 +169,8 @@ int AbstractSheet::sheetId() const {
 /*!
  * \internal
  */
-Drawing *AbstractSheet::drawing() const {
+Drawing *AbstractSheet::drawing() const
+{
     Q_D(const AbstractSheet);
     return d->drawing.get();
 }
@@ -161,7 +178,8 @@ Drawing *AbstractSheet::drawing() const {
 /*!
  * Return the workbook
  */
-Workbook *AbstractSheet::workbook() const {
+Workbook *AbstractSheet::workbook() const
+{
     Q_D(const AbstractSheet);
     return d->workbook;
 }

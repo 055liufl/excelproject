@@ -3,14 +3,15 @@
 #ifndef XLSXWORKBOOK_H
 #define XLSXWORKBOOK_H
 
-#include <QIODevice>
-#include <QImage>
-#include <QList>
-
 #include "xlsxabstractooxmlfile.h"
 #include "xlsxabstractsheet.h"
 #include "xlsxglobal.h"
+
 #include <memory>
+
+#include <QIODevice>
+#include <QImage>
+#include <QList>
 
 QT_BEGIN_NAMESPACE_XLSX
 
@@ -27,17 +28,19 @@ class Chartsheet;
 class Worksheet;
 class WorkbookPrivate;
 
-class QXLSX_EXPORT Workbook : public AbstractOOXmlFile {
+class QXLSX_EXPORT Workbook : public AbstractOOXmlFile
+{
     Q_DECLARE_PRIVATE(Workbook)
-   public:
+public:
     ~Workbook();
 
     int sheetCount() const;
     AbstractSheet *sheet(int index) const;
 
-    AbstractSheet *addSheet(const QString &name = QString(),
+    AbstractSheet *addSheet(const QString &name           = QString(),
                             AbstractSheet::SheetType type = AbstractSheet::ST_WorkSheet);
-    AbstractSheet *insertSheet(int index, const QString &name = QString(),
+    AbstractSheet *insertSheet(int index,
+                               const QString &name           = QString(),
                                AbstractSheet::SheetType type = AbstractSheet::ST_WorkSheet);
     bool renameSheet(int index, const QString &name);
     bool deleteSheet(int index);
@@ -48,8 +51,10 @@ class QXLSX_EXPORT Workbook : public AbstractOOXmlFile {
     bool setActiveSheet(int index);
 
     //    void addChart();
-    bool defineName(const QString &name, const QString &formula, const QString &comment = QString(),
-                    const QString &scope = QString());
+    bool defineName(const QString &name,
+                    const QString &formula,
+                    const QString &comment = QString(),
+                    const QString &scope   = QString());
     bool isDate1904() const;
     void setDate1904(bool date1904);
     bool isStringsToNumbersEnabled() const;
@@ -69,7 +74,7 @@ class QXLSX_EXPORT Workbook : public AbstractOOXmlFile {
     void addChartFile(std::shared_ptr<Chart> chartFile);
     QList<std::shared_ptr<Chart>> chartFiles() const;
 
-   private:
+private:
     friend class Worksheet;
     friend class Chartsheet;
     friend class WorksheetPrivate;
@@ -88,10 +93,11 @@ class QXLSX_EXPORT Workbook : public AbstractOOXmlFile {
     QList<Drawing *> drawings();
     QList<std::shared_ptr<AbstractSheet>> getSheetsByTypes(AbstractSheet::SheetType type) const;
     QStringList worksheetNames() const;
-    AbstractSheet *addSheet(const QString &name, int sheetId,
+    AbstractSheet *addSheet(const QString &name,
+                            int sheetId,
                             AbstractSheet::SheetType type = AbstractSheet::ST_WorkSheet);
 };
 
 QT_END_NAMESPACE_XLSX
 
-#endif  // XLSXWORKBOOK_H
+#endif // XLSXWORKBOOK_H

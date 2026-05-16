@@ -40,8 +40,9 @@
 
 QT_BEGIN_NAMESPACE_XLSX
 
-class RichStringPrivate : public QSharedData {
-   public:
+class RichStringPrivate : public QSharedData
+{
+public:
     RichStringPrivate();
     RichStringPrivate(const RichStringPrivate &other);
     ~RichStringPrivate();
@@ -56,4 +57,4 @@ class RichStringPrivate : public QSharedData {
 
 QT_END_NAMESPACE_XLSX
 
-#endif  // XLSXRICHSTRING_P_H
+#endif // XLSXRICHSTRING_P_H

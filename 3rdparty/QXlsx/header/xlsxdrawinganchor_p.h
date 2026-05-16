@@ -3,14 +3,15 @@
 #ifndef QXLSX_XLSXDRAWINGANCHOR_P_H
 #define QXLSX_XLSXDRAWINGANCHOR_P_H
 
+#include "xlsxglobal.h"
+
+#include <memory>
+
 #include <QPoint>
 #include <QSize>
 #include <QString>
 #include <QXmlStreamReader>
 #include <QXmlStreamWriter>
-
-#include "xlsxglobal.h"
-#include <memory>
 
 QT_BEGIN_NAMESPACE_XLSX
 
@@ -20,31 +21,25 @@ class Chart;
 
 // Helper class
 struct XlsxMarker {
-    XlsxMarker() {
-    }
+    XlsxMarker() {}
     XlsxMarker(int row, int column, int rowOffset, int colOffset)
-        : cell(QPoint(row, column)), offset(rowOffset, colOffset) {
+        : cell(QPoint(row, column))
+        , offset(rowOffset, colOffset)
+    {
     }
 
-    int row() const {
-        return cell.x();
-    }
-    int col() const {
-        return cell.y();
-    }
-    int rowOff() const {
-        return offset.width();
-    }
-    int colOff() const {
-        return offset.height();
-    }
+    int row() const { return cell.x(); }
+    int col() const { return cell.y(); }
+    int rowOff() const { return offset.width(); }
+    int colOff() const { return offset.height(); }
 
     QPoint cell;
     QSize offset;
 };
 
-class DrawingAnchor {
-   public:
+class DrawingAnchor
+{
+public:
     enum ObjectType { GraphicFrame, Shape, GroupShape, ConnectionShape, Picture, Unknown };
 
     DrawingAnchor(Drawing *drawing, ObjectType objectType);
@@ -55,13 +50,13 @@ class DrawingAnchor {
 
     void setObjectGraphicFrame(std::shared_ptr<QXlsx::Chart> chart);
 
-    virtual bool loadFromXml(QXmlStreamReader &reader) = 0;
+    virtual bool loadFromXml(QXmlStreamReader &reader)     = 0;
     virtual void saveToXml(QXmlStreamWriter &writer) const = 0;
 
     virtual int row() const;
     virtual int col() const;
 
-   protected:
+protected:
     QPoint loadXmlPos(QXmlStreamReader &reader);
     QSize loadXmlExt(QXmlStreamReader &reader);
     XlsxMarker loadXmlMarker(QXmlStreamReader &reader, const QString &node);
@@ -74,7 +69,8 @@ class DrawingAnchor {
 
     void saveXmlPos(QXmlStreamWriter &writer, const QPoint &pos) const;
     void saveXmlExt(QXmlStreamWriter &writer, const QSize &ext) const;
-    void saveXmlMarker(QXmlStreamWriter &writer, const XlsxMarker &marker,
+    void saveXmlMarker(QXmlStreamWriter &writer,
+                       const XlsxMarker &marker,
                        const QString &node) const;
     void saveXmlObject(QXmlStreamWriter &writer) const;
     void saveXmlObjectShape(QXmlStreamWriter &writer) const;
@@ -90,27 +86,27 @@ class DrawingAnchor {
 
     int m_id;
 
-   public:
+public:
     int getm_id();
 
-   protected:
+protected:
     // liufeij {{
-    void setObjectShape(const QImage &img);  // liufeij
+    void setObjectShape(const QImage &img); // liufeij
 
     QString editASName;
     // below only for twocellanchor shape
-    QPoint posTA;        // for shape liufeij 20181024
-    QSize extTA;         // for shape liufeij 20181024
-    int rotWithShapeTA;  //// for shape liufeij 20181024
-    int dpiTA;           //// for shape liufeij 20181024
+    QPoint posTA;       // for shape liufeij 20181024
+    QSize extTA;        // for shape liufeij 20181024
+    int rotWithShapeTA; //// for shape liufeij 20181024
+    int dpiTA;          //// for shape liufeij 20181024
     QString sp_textlink, sp_macro, sp_blip_cstate, sp_blip_rembed;
 
     // BELOW only for cxnSp shape
     QString cxnSp_filpV, cxnSp_macro;
     // below for cxnsp and sp
-    QString xsp_cNvPR_name, xsp_cNvPR_id;        // x measns shape and cxnSp together using
-    QString xbwMode;                             // same as above
-    QString xIn_algn, xIn_cmpd, xIn_cap, xIn_w;  // cxnSp only need xIn_w
+    QString xsp_cNvPR_name, xsp_cNvPR_id;       // x measns shape and cxnSp together using
+    QString xbwMode;                            // same as above
+    QString xIn_algn, xIn_cmpd, xIn_cap, xIn_w; // cxnSp only need xIn_w
     QString xprstGeom_prst;
     QString x_headEnd_w, x_headEnd_len, x_headEnd_tyep;
     QString x_tailEnd_w, x_tailEnd_len, x_tailEnd_tyep;
@@ -119,8 +115,9 @@ class DrawingAnchor {
     // liufeij }}
 };
 
-class DrawingAbsoluteAnchor : public DrawingAnchor {
-   public:
+class DrawingAbsoluteAnchor : public DrawingAnchor
+{
+public:
     DrawingAbsoluteAnchor(Drawing *drawing, ObjectType objectType = Unknown);
 
     QPoint pos;
@@ -130,8 +127,9 @@ class DrawingAbsoluteAnchor : public DrawingAnchor {
     void saveToXml(QXmlStreamWriter &writer) const override;
 };
 
-class DrawingOneCellAnchor : public DrawingAnchor {
-   public:
+class DrawingOneCellAnchor : public DrawingAnchor
+{
+public:
     DrawingOneCellAnchor(Drawing *drawing, ObjectType objectType = Unknown);
 
     XlsxMarker from;
@@ -144,8 +142,9 @@ class DrawingOneCellAnchor : public DrawingAnchor {
     void saveToXml(QXmlStreamWriter &writer) const override;
 };
 
-class DrawingTwoCellAnchor : public DrawingAnchor {
-   public:
+class DrawingTwoCellAnchor : public DrawingAnchor
+{
+public:
     DrawingTwoCellAnchor(Drawing *drawing, ObjectType objectType = Unknown);
 
     XlsxMarker from;
@@ -160,4 +159,4 @@ class DrawingTwoCellAnchor : public DrawingAnchor {
 
 QT_END_NAMESPACE_XLSX
 
-#endif  // QXLSX_XLSXDRAWINGANCHOR_P_H
+#endif // QXLSX_XLSXDRAWINGANCHOR_P_H

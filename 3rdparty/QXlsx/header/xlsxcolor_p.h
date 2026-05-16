@@ -3,19 +3,20 @@
 #ifndef QXLSX_XLSXCOLOR_P_H
 #define QXLSX_XLSXCOLOR_P_H
 
+#include "xlsxglobal.h"
+
 #include <QColor>
 #include <QVariant>
 #include <QXmlStreamReader>
 #include <QXmlStreamWriter>
 
-#include "xlsxglobal.h"
-
 QT_BEGIN_NAMESPACE_XLSX
 
 class Styles;
 
-class XlsxColor {
-   public:
+class XlsxColor
+{
+public:
     explicit XlsxColor(const QColor &color = QColor());
     explicit XlsxColor(const QString &theme, const QString &tint = QString());
     explicit XlsxColor(int index);
@@ -37,7 +38,7 @@ class XlsxColor {
     bool saveToXml(QXmlStreamWriter &writer, const QString &node = QString()) const;
     bool loadFromXml(QXmlStreamReader &reader);
 
-   private:
+private:
     QVariant val;
 };
 
@@ -54,4 +55,4 @@ QT_END_NAMESPACE_XLSX
 
 Q_DECLARE_METATYPE(QXlsx::XlsxColor)
 
-#endif  // QXLSX_XLSXCOLOR_P_H
+#endif // QXLSX_XLSXCOLOR_P_H

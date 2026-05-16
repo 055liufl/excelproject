@@ -3,6 +3,8 @@
 #ifndef QXLSX_XLSXDATETYPE_H
 #define QXLSX_XLSXDATETYPE_H
 
+#include "xlsxglobal.h"
+
 #include <QDate>
 #include <QDateTime>
 #include <QObject>
@@ -10,12 +12,11 @@
 #include <QStringList>
 #include <QTime>
 
-#include "xlsxglobal.h"
-
 QT_BEGIN_NAMESPACE_XLSX
 
-class QXLSX_EXPORT DateType {
-   public:
+class QXLSX_EXPORT DateType
+{
+public:
     DateType();
     /*
         DateType(bool is1904 = false);

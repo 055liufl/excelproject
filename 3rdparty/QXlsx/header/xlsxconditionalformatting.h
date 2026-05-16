@@ -3,16 +3,16 @@
 #ifndef QXLSX_XLSXCONDITIONALFORMATTING_H
 #define QXLSX_XLSXCONDITIONALFORMATTING_H
 
+#include "xlsxcellrange.h"
+#include "xlsxcellreference.h"
+#include "xlsxglobal.h"
+
 #include <QColor>
 #include <QList>
 #include <QSharedDataPointer>
 #include <QString>
 #include <QXmlStreamReader>
 #include <QXmlStreamWriter>
-
-#include "xlsxcellrange.h"
-#include "xlsxcellreference.h"
-#include "xlsxglobal.h"
 
 class ConditionalFormattingTest;
 
@@ -23,8 +23,9 @@ class Worksheet;
 class Styles;
 class ConditionalFormattingPrivate;
 
-class QXLSX_EXPORT ConditionalFormatting {
-   public:
+class QXLSX_EXPORT ConditionalFormatting
+{
+public:
     enum HighlightRuleType {
         Highlight_LessThan,
         Highlight_LessThanOrEqual,
@@ -70,26 +71,37 @@ class QXLSX_EXPORT ConditionalFormatting {
 
     enum ValueObjectType { VOT_Formula, VOT_Max, VOT_Min, VOT_Num, VOT_Percent, VOT_Percentile };
 
-   public:
+public:
     ConditionalFormatting();
     ConditionalFormatting(const ConditionalFormatting &other);
     ~ConditionalFormatting();
 
-   public:
-    bool addHighlightCellsRule(HighlightRuleType type, const Format &format,
+public:
+    bool addHighlightCellsRule(HighlightRuleType type,
+                               const Format &format,
                                bool stopIfTrue = false);
-    bool addHighlightCellsRule(HighlightRuleType type, const QString &formula1,
-                               const Format &format, bool stopIfTrue = false);
-    bool addHighlightCellsRule(HighlightRuleType type, const QString &formula1,
-                               const QString &formula2, const Format &format,
+    bool addHighlightCellsRule(HighlightRuleType type,
+                               const QString &formula1,
+                               const Format &format,
+                               bool stopIfTrue = false);
+    bool addHighlightCellsRule(HighlightRuleType type,
+                               const QString &formula1,
+                               const QString &formula2,
+                               const Format &format,
                                bool stopIfTrue = false);
     bool addDataBarRule(const QColor &color, bool showData = true, bool stopIfTrue = false);
-    bool addDataBarRule(const QColor &color, ValueObjectType type1, const QString &val1,
-                        ValueObjectType type2, const QString &val2, bool showData = true,
+    bool addDataBarRule(const QColor &color,
+                        ValueObjectType type1,
+                        const QString &val1,
+                        ValueObjectType type2,
+                        const QString &val2,
+                        bool showData   = true,
                         bool stopIfTrue = false);
-    bool add2ColorScaleRule(const QColor &minColor, const QColor &maxColor,
-                            bool stopIfTrue = false);
-    bool add3ColorScaleRule(const QColor &minColor, const QColor &midColor, const QColor &maxColor,
+    bool
+        add2ColorScaleRule(const QColor &minColor, const QColor &maxColor, bool stopIfTrue = false);
+    bool add3ColorScaleRule(const QColor &minColor,
+                            const QColor &midColor,
+                            const QColor &maxColor,
                             bool stopIfTrue = false);
 
     QList<CellRange> ranges() const;
@@ -102,11 +114,11 @@ class QXLSX_EXPORT ConditionalFormatting {
     // needed by QSharedDataPointer!!
     ConditionalFormatting &operator=(const ConditionalFormatting &other);
 
-   private:
+private:
     friend class Worksheet;
     friend class ::ConditionalFormattingTest;
 
-   private:
+private:
     bool saveToXml(QXmlStreamWriter &writer) const;
     bool loadFromXml(QXmlStreamReader &reader, Styles *styles = nullptr);
 
@@ -115,4 +127,4 @@ class QXLSX_EXPORT ConditionalFormatting {
 
 QT_END_NAMESPACE_XLSX
 
-#endif  // QXLSX_XLSXCONDITIONALFORMATTING_H
+#endif // QXLSX_XLSXCONDITIONALFORMATTING_H

@@ -2,13 +2,6 @@
 
 #include "xlsxdocument.h"
 
-#include <QBuffer>
-#include <QDebug>
-#include <QDir>
-#include <QFile>
-#include <QPointF>
-#include <QTemporaryFile>
-
 #include "xlsxchart.h"
 #include "xlsxcontenttypes_p.h"
 #include "xlsxdocpropsapp_p.h"
@@ -16,7 +9,6 @@
 #include "xlsxdocument_p.h"
 #include "xlsxdrawing_p.h"
 #include "xlsxmediafile_p.h"
-#include "xlsxreadsax.h"
 #include "xlsxrelationships_p.h"
 #include "xlsxsharedstrings_p.h"
 #include "xlsxstyles_p.h"
@@ -27,6 +19,15 @@
 #include "xlsxworksheet.h"
 #include "xlsxzipreader_p.h"
 #include "xlsxzipwriter_p.h"
+
+#include "xlsxreadsax.h"
+
+#include <QBuffer>
+#include <QDebug>
+#include <QDir>
+#include <QFile>
+#include <QPointF>
+#include <QTemporaryFile>
 
 /*
         From Wikipedia: The Open Packaging Conventions (OPC) is a
@@ -66,10 +67,11 @@
 QT_BEGIN_NAMESPACE_XLSX
 
 namespace xlsxDocumentCpp {
-std::string copyTag(const std::string &sFrom, const std::string &sTo, const std::string &tag) {
+std::string copyTag(const std::string &sFrom, const std::string &sTo, const std::string &tag)
+{
     const std::string tagToFindStart = "<" + tag;
-    const std::string tagToFindEnd = "</" + tag;
-    const std::string tagEnd = "</" + tag + ">";
+    const std::string tagToFindEnd   = "</" + tag;
+    const std::string tagEnd         = "</" + tag + ">";
 
     // search all occurrences of tag in 'sFrom'
     std::string sFromData;
@@ -77,10 +79,10 @@ std::string copyTag(const std::string &sFrom, const std::string &sTo, const std:
     while (true) {
         std::size_t startPos = sFrom.find(tagToFindStart, startIndex);
         if (startPos != std::string::npos) {
-            std::size_t endPos = sFrom.find(tagToFindEnd, startPos);
+            std::size_t endPos    = sFrom.find(tagToFindEnd, startPos);
             std::string tagEndTmp = tagEnd;
-            if (endPos == std::string::npos) {  // second try to find the ending, maybe it is "/>"
-                endPos = sFrom.find("/>", startPos);
+            if (endPos == std::string::npos) { // second try to find the ending, maybe it is "/>"
+                endPos    = sFrom.find("/>", startPos);
                 tagEndTmp = "/>";
             }
             if (endPos != std::string::npos) {
@@ -94,19 +96,19 @@ std::string copyTag(const std::string &sFrom, const std::string &sTo, const std:
         }
     }
 
-    std::string sOut = sTo;  // copy 'sTo' in the output string
+    std::string sOut = sTo; // copy 'sTo' in the output string
 
-    if (!sFromData.empty()) {  // tag found in 'from'?
-                               // search all occurrences of tag in 'sOut' and delete them
+    if (!sFromData.empty()) { // tag found in 'from'?
+                              // search all occurrences of tag in 'sOut' and delete them
         std::size_t firstPosTag = std::string::npos;
         while (true) {
             std::size_t startPos = sOut.find(tagToFindStart);
             if (startPos != std::string::npos) {
-                std::size_t endPos = sOut.find(tagToFindEnd);
+                std::size_t endPos    = sOut.find(tagToFindEnd);
                 std::string tagEndTmp = tagEnd;
                 if (endPos ==
-                    std::string::npos) {  // second try to find the ending, maybe it is "/>"
-                    endPos = sOut.find("/>", startPos);
+                    std::string::npos) { // second try to find the ending, maybe it is "/>"
+                    endPos    = sOut.find("/>", startPos);
                     tagEndTmp = "/>";
                 }
                 if (endPos != std::string::npos) {
@@ -115,7 +117,7 @@ std::string copyTag(const std::string &sFrom, const std::string &sTo, const std:
                     std::string stringBefore = sOut.substr(0, startPos);
                     endPos += strlen(tagEndTmp.c_str());
                     std::string stringAfter = sOut.substr(endPos, strlen(sOut.c_str()) - endPos);
-                    sOut = stringBefore + stringAfter;
+                    sOut                    = stringBefore + stringAfter;
                 } else {
                     break;
                 }
@@ -141,20 +143,24 @@ std::string copyTag(const std::string &sFrom, const std::string &sTo, const std:
         // add in the position of the first tag found in 'sOut' ('firstPosTag')
         if (firstPosTag != std::string::npos) {
             std::string stringBefore = sOut.substr(0, firstPosTag);
-            std::string stringAfter = sOut.substr(firstPosTag, strlen(sOut.c_str()) - firstPosTag);
-            sOut = stringBefore + sFromData + stringAfter;
+            std::string stringAfter  = sOut.substr(firstPosTag, strlen(sOut.c_str()) - firstPosTag);
+            sOut                     = stringBefore + sFromData + stringAfter;
         }
     }
 
     return sOut;
 }
-}  // namespace xlsxDocumentCpp
+} // namespace xlsxDocumentCpp
 
 DocumentPrivate::DocumentPrivate(Document *p)
-    : q_ptr(p), defaultPackageName(QStringLiteral("Book1.xlsx")), isLoad(false) {
+    : q_ptr(p)
+    , defaultPackageName(QStringLiteral("Book1.xlsx"))
+    , isLoad(false)
+{
 }
 
-void DocumentPrivate::init() {
+void DocumentPrivate::init()
+{
     if (!contentTypes)
         contentTypes = std::make_shared<ContentTypes>(ContentTypes::F_NewFromScratch);
 
@@ -162,7 +168,8 @@ void DocumentPrivate::init() {
         workbook = std::shared_ptr<Workbook>(new Workbook(Workbook::F_NewFromScratch));
 }
 
-bool DocumentPrivate::loadPackage(QIODevice *device) {
+bool DocumentPrivate::loadPackage(QIODevice *device)
+{
     Q_Q(Document);
     ZipReader zipReader(device);
     QStringList filePaths = zipReader.filePaths();
@@ -217,9 +224,9 @@ bool DocumentPrivate::loadPackage(QIODevice *device) {
     if (rels_xl.isEmpty())
         return false;
     const QString xlworkbook_Path = rels_xl[0].target;
-    const auto parts = splitPath(xlworkbook_Path);
-    const QString xlworkbook_Dir = parts.first();
-    const QString relFilePath = getRelFilePath(xlworkbook_Path);
+    const auto parts              = splitPath(xlworkbook_Path);
+    const QString xlworkbook_Dir  = parts.first();
+    const QString relFilePath     = getRelFilePath(xlworkbook_Path);
 
     workbook->relationships()->loadFromXmlData(zipReader.fileData(relFilePath));
     workbook->setFilePath(xlworkbook_Path);
@@ -234,7 +241,7 @@ bool DocumentPrivate::loadPackage(QIODevice *device) {
 
         // dev34
         QString path;
-        if (xlworkbook_Dir == QLatin1String("."))  // root
+        if (xlworkbook_Dir == QLatin1String(".")) // root
         {
             path = name;
         } else {
@@ -269,8 +276,8 @@ bool DocumentPrivate::loadPackage(QIODevice *device) {
     // load sheets
     for (int i = 0; i < workbook->sheetCount(); ++i) {
         AbstractSheet *sheet = workbook->sheet(i);
-        QString strFilePath = sheet->filePath();
-        QString rel_path = getRelFilePath(strFilePath);
+        QString strFilePath  = sheet->filePath();
+        QString rel_path     = getRelFilePath(strFilePath);
         // If the .rel file exists, load it.
         if (zipReader.filePaths().contains(rel_path))
             sheet->relationships()->loadFromXmlData(zipReader.fileData(rel_path));
@@ -280,7 +287,7 @@ bool DocumentPrivate::loadPackage(QIODevice *device) {
     // load external links
     for (int i = 0; i < workbook->d_func()->externalLinks.count(); ++i) {
         SimpleOOXmlFile *link = workbook->d_func()->externalLinks[i].get();
-        QString rel_path = getRelFilePath(link->filePath());
+        QString rel_path      = getRelFilePath(link->filePath());
         // If the .rel file exists, load it.
         if (zipReader.filePaths().contains(rel_path))
             link->relationships()->loadFromXmlData(zipReader.fileData(rel_path));
@@ -306,7 +313,7 @@ bool DocumentPrivate::loadPackage(QIODevice *device) {
     // load media files
     const auto mediaFileToLoad = workbook->mediaFiles();
     for (const auto &mf : mediaFileToLoad) {
-        const QString path = mf->fileName();
+        const QString path   = mf->fileName();
         const QString suffix = path.mid(path.lastIndexOf(QLatin1Char('.')) + 1);
         mf->set(zipReader.fileData(path), suffix);
     }
@@ -315,7 +322,8 @@ bool DocumentPrivate::loadPackage(QIODevice *device) {
     return true;
 }
 
-bool DocumentPrivate::savePackage(QIODevice *device) const {
+bool DocumentPrivate::savePackage(QIODevice *device) const
+{
     Q_Q(const Document);
 
     ZipWriter zipWriter(device);
@@ -466,12 +474,14 @@ bool DocumentPrivate::savePackage(QIODevice *device) const {
 // j2doll/csv branch
 //
 // Save from XLSX to CSV
-bool DocumentPrivate::saveCsv(QString mainCSVFileName) const {
+bool DocumentPrivate::saveCsv(QString mainCSVFileName) const
+{
     Q_Q(const Document);
 
-    int sheetIndexNumber = 0;
+    int sheetIndexNumber  = 0;
     const auto sheetNames = q->sheetNames();
     for (const auto &curretnSheetName : sheetNames) {
+
         QXlsx::AbstractSheet *currentSheet = q->sheet(curretnSheetName);
         if (currentSheet == nullptr) {
             continue;
@@ -488,7 +498,7 @@ bool DocumentPrivate::saveCsv(QString mainCSVFileName) const {
             continue;
         }
 
-        QString strSheetName = wsheet->sheetName();  // sheet name
+        QString strSheetName = wsheet->sheetName(); // sheet name
 
         // Fix bug: Invalid function call order. I am sorry.
         const QVector<CellLocation> clList = wsheet->getFullCells(&maxRow, &maxCol);
@@ -509,9 +519,9 @@ bool DocumentPrivate::saveCsv(QString mainCSVFileName) const {
             int row = cl.row - 1;
             int col = cl.col - 1;
 
-            std::shared_ptr<Cell> ptrCell = cl.cell;  // cell pointer
-            QVariant var = ptrCell->value();
-            QString str = var.toString();
+            std::shared_ptr<Cell> ptrCell = cl.cell; // cell pointer
+            QVariant var                  = ptrCell->value();
+            QString str                   = var.toString();
 
             cellValues[row][col] = str;
         }
@@ -530,16 +540,17 @@ bool DocumentPrivate::saveCsv(QString mainCSVFileName) const {
 
         for (int rc = 0; rc < maxRow; rc++) {
             for (int cc = 0; cc < maxCol; cc++) {
+
                 QString cellData = cellValues[rc][cc];
 
                 if (cellData.size() >= 0) {
-                    csvFile.write(cellData.toUtf8());  // cell data
+                    csvFile.write(cellData.toUtf8()); // cell data
                 }
 
-                csvFile.write(",");  // delimeter
+                csvFile.write(","); // delimeter
             }
 
-            csvFile.write("\n");  // CR
+            csvFile.write("\n"); // CR
 
             csvFile.flush();
         }
@@ -548,12 +559,13 @@ bool DocumentPrivate::saveCsv(QString mainCSVFileName) const {
 
         csvFile.close();
 
-    }  // foreach (QString curretnSheetName, q->sheetNames()) ...
+    } // foreach (QString curretnSheetName, q->sheetNames()) ...
 
     return true;
 }
 
-bool DocumentPrivate::copyStyle(const QString &from, const QString &to) {
+bool DocumentPrivate::copyStyle(const QString &from, const QString &to)
+{
     // create a temp file because the zip writer cannot modify already existing zips
     QTemporaryFile tempFile;
     if (!tempFile.open()) {
@@ -574,8 +586,8 @@ bool DocumentPrivate::copyStyle(const QString &from, const QString &to) {
         // copy all files from "to" zip except those related to style
         for (const QString &toFilePath : toFilePaths) {
             if (toFilePath.contains(QLatin1String("xl/styles"))) {
-                if (filePaths.contains(toFilePath)) {  // style file exist in 'from' as well
-                                                       // modify style file
+                if (filePaths.contains(toFilePath)) { // style file exist in 'from' as well
+                                                      // modify style file
                     std::string fromData =
                         QString::fromUtf8(zipReader.fileData(toFilePath)).toStdString();
                     std::string toData =
@@ -589,8 +601,8 @@ bool DocumentPrivate::copyStyle(const QString &from, const QString &to) {
             }
 
             if (toFilePath.contains(QLatin1String("xl/workbook"))) {
-                if (filePaths.contains(toFilePath)) {  // workbook file exist in 'from' as well
-                                                       // modify workbook file
+                if (filePaths.contains(toFilePath)) { // workbook file exist in 'from' as well
+                                                      // modify workbook file
                     std::string fromData =
                         QString::fromUtf8(zipReader.fileData(toFilePath)).toStdString();
                     std::string toData =
@@ -603,8 +615,8 @@ bool DocumentPrivate::copyStyle(const QString &from, const QString &to) {
             }
 
             if (toFilePath.contains(QLatin1String("xl/worksheets/sheet"))) {
-                if (filePaths.contains(toFilePath)) {  // sheet file exist in 'from' as well
-                                                       // modify sheet file
+                if (filePaths.contains(toFilePath)) { // sheet file exist in 'from' as well
+                                                      // modify sheet file
                     std::string fromData =
                         QString::fromUtf8(zipReader.fileData(toFilePath)).toStdString();
                     std::string toData =
@@ -642,7 +654,10 @@ bool DocumentPrivate::copyStyle(const QString &from, const QString &to) {
  * Creates a new empty xlsx document.
  * The \a parent argument is passed to QObject's constructor.
  */
-Document::Document(QObject *parent) : QObject(parent), d_ptr(new DocumentPrivate(this)) {
+Document::Document(QObject *parent)
+    : QObject(parent)
+    , d_ptr(new DocumentPrivate(this))
+{
     d_ptr->init();
 }
 
@@ -652,7 +667,9 @@ Document::Document(QObject *parent) : QObject(parent), d_ptr(new DocumentPrivate
  * The \a parent argument is passed to QObject's constructor.
  */
 Document::Document(const QString &name, QObject *parent)
-    : QObject(parent), d_ptr(new DocumentPrivate(this)) {
+    : QObject(parent)
+    , d_ptr(new DocumentPrivate(this))
+{
     d_ptr->packageName = name;
 
     if (QFile::exists(name)) {
@@ -673,7 +690,9 @@ Document::Document(const QString &name, QObject *parent)
  * The \a parent argument is passed to QObject's constructor.
  */
 Document::Document(QIODevice *device, QObject *parent)
-    : QObject(parent), d_ptr(new DocumentPrivate(this)) {
+    : QObject(parent)
+    , d_ptr(new DocumentPrivate(this))
+{
     if (device && device->isReadable()) {
         if (!d_ptr->loadPackage(device)) {
             // NOTICE: failed to load package
@@ -687,7 +706,8 @@ Document::Document(QIODevice *device, QObject *parent)
 
         Write \a value to cell \a row_column with the given \a format.
  */
-bool Document::write(const CellReference &row_column, const QVariant &value, const Format &format) {
+bool Document::write(const CellReference &row_column, const QVariant &value, const Format &format)
+{
     if (Worksheet *sheet = currentWorksheet())
         return sheet->write(row_column, value, format);
     return false;
@@ -697,7 +717,8 @@ bool Document::write(const CellReference &row_column, const QVariant &value, con
  * Write \a value to cell (\a row, \a col) with the \a format.
  * Returns true on success.
  */
-bool Document::write(int row, int col, const QVariant &value, const Format &format) {
+bool Document::write(int row, int col, const QVariant &value, const Format &format)
+{
     if (Worksheet *sheet = currentWorksheet())
         return sheet->write(row, col, value, format);
     return false;
@@ -709,7 +730,8 @@ bool Document::write(int row, int col, const QVariant &value, const Format &form
 
         \sa cellAt()
 */
-QVariant Document::read(const CellReference &cell) const {
+QVariant Document::read(const CellReference &cell) const
+{
     if (Worksheet *sheet = currentWorksheet())
         return sheet->read(cell);
     return QVariant();
@@ -720,7 +742,8 @@ QVariant Document::read(const CellReference &cell) const {
 
         \sa cellAt()
  */
-QVariant Document::read(int row, int col) const {
+QVariant Document::read(int row, int col) const
+{
     if (Worksheet *sheet = currentWorksheet())
         return sheet->read(row, col);
     return QVariant();
@@ -730,28 +753,32 @@ QVariant Document::read(int row, int col) const {
  * Insert an \a image to current active worksheet at the position \a row, \a column
  * Returns true if success.
  */
-int Document::insertImage(int row, int column, const QImage &image) {
+int Document::insertImage(int row, int column, const QImage &image)
+{
     if (Worksheet *sheet = currentWorksheet())
         return sheet->insertImage(row, column, image);
 
     return 0;
 }
 
-bool Document::getImage(int imageIndex, QImage &img) {
+bool Document::getImage(int imageIndex, QImage &img)
+{
     if (Worksheet *sheet = currentWorksheet())
         return sheet->getImage(imageIndex, img);
 
     return false;
 }
 
-bool Document::getImage(int row, int col, QImage &img) {
+bool Document::getImage(int row, int col, QImage &img)
+{
     if (Worksheet *sheet = currentWorksheet())
         return sheet->getImage(row, col, img);
 
     return false;
 }
 
-uint Document::getImageCount() {
+uint Document::getImageCount()
+{
     if (Worksheet *sheet = currentWorksheet())
         return sheet->getImageCount();
 
@@ -763,7 +790,8 @@ uint Document::getImageCount() {
  * active worksheet at the position \a row, \a col.
  * The chart will be returned.
  */
-Chart *Document::insertChart(int row, int col, const QSize &size) {
+Chart *Document::insertChart(int row, int col, const QSize &size)
+{
     if (Worksheet *sheet = currentWorksheet())
         return sheet->insertChart(row, col, size);
     return nullptr;
@@ -776,7 +804,8 @@ Chart *Document::insertChart(int row, int col, const QSize &size) {
 
   \note All cells except the top-left one will be cleared.
  */
-bool Document::mergeCells(const CellRange &range, const Format &format) {
+bool Document::mergeCells(const CellRange &range, const Format &format)
+{
     if (Worksheet *sheet = currentWorksheet())
         return sheet->mergeCells(range, format);
     return false;
@@ -786,7 +815,8 @@ bool Document::mergeCells(const CellRange &range, const Format &format) {
   Unmerge the cells in the \a range.
   Returns true on success.
 */
-bool Document::unmergeCells(const CellRange &range) {
+bool Document::unmergeCells(const CellRange &range)
+{
     if (Worksheet *sheet = currentWorksheet())
         return sheet->unmergeCells(range);
     return false;
@@ -796,7 +826,8 @@ bool Document::unmergeCells(const CellRange &range) {
   Sets width in characters of columns with the given \a range and \a width.
   Returns true on success.
  */
-bool Document::setColumnWidth(const CellRange &range, double width) {
+bool Document::setColumnWidth(const CellRange &range, double width)
+{
     if (Worksheet *sheet = currentWorksheet())
         return sheet->setColumnWidth(range, width);
     return false;
@@ -806,7 +837,8 @@ bool Document::setColumnWidth(const CellRange &range, double width) {
   Sets format property of columns with the given \a range and \a format.
   Returns true on success.
  */
-bool Document::setColumnFormat(const CellRange &range, const Format &format) {
+bool Document::setColumnFormat(const CellRange &range, const Format &format)
+{
     if (Worksheet *sheet = currentWorksheet())
         return sheet->setColumnFormat(range, format);
     return false;
@@ -817,7 +849,8 @@ bool Document::setColumnFormat(const CellRange &range, const Format &format) {
   Hidden columns are not visible.
   Returns true on success.
  */
-bool Document::setColumnHidden(const CellRange &range, bool hidden) {
+bool Document::setColumnHidden(const CellRange &range, bool hidden)
+{
     if (Worksheet *sheet = currentWorksheet())
         return sheet->setColumnHidden(range, hidden);
     return false;
@@ -827,7 +860,8 @@ bool Document::setColumnHidden(const CellRange &range, bool hidden) {
   Sets width in characters \a column to \a width. Columns are 1-indexed.
   Returns true on success.
  */
-bool Document::setColumnWidth(int column, double width) {
+bool Document::setColumnWidth(int column, double width)
+{
     return setColumnWidth(column, column, width);
 }
 
@@ -835,7 +869,8 @@ bool Document::setColumnWidth(int column, double width) {
   Sets format property \a column to \a format. Columns are 1-indexed.
   Returns true on success.
  */
-bool Document::setColumnFormat(int column, const Format &format) {
+bool Document::setColumnFormat(int column, const Format &format)
+{
     return setColumnFormat(column, column, format);
 }
 
@@ -843,7 +878,8 @@ bool Document::setColumnFormat(int column, const Format &format) {
   Sets hidden property of a \a column. Columns are 1-indexed.
   Returns true on success.
  */
-bool Document::setColumnHidden(int column, bool hidden) {
+bool Document::setColumnHidden(int column, bool hidden)
+{
     return setColumnHidden(column, column, hidden);
 }
 
@@ -851,7 +887,8 @@ bool Document::setColumnHidden(int column, bool hidden) {
   Sets width in characters for columns [\a colFirst, \a colLast]. Columns are 1-indexed.
   Returns true on success.
  */
-bool Document::setColumnWidth(int colFirst, int colLast, double width) {
+bool Document::setColumnWidth(int colFirst, int colLast, double width)
+{
     if (Worksheet *sheet = currentWorksheet())
         return sheet->setColumnWidth(colFirst, colLast, width);
     return false;
@@ -862,7 +899,8 @@ bool Document::setColumnWidth(int colFirst, int colLast, double width) {
   Columns are 1-indexed.
   Returns true on success.
  */
-bool Document::setColumnFormat(int colFirst, int colLast, const Format &format) {
+bool Document::setColumnFormat(int colFirst, int colLast, const Format &format)
+{
     if (Worksheet *sheet = currentWorksheet())
         return sheet->setColumnFormat(colFirst, colLast, format);
     return false;
@@ -873,7 +911,8 @@ bool Document::setColumnFormat(int colFirst, int colLast, const Format &format) 
   Columns are 1-indexed.
   Returns true on success.
  */
-bool Document::setColumnHidden(int colFirst, int colLast, bool hidden) {
+bool Document::setColumnHidden(int colFirst, int colLast, bool hidden)
+{
     if (Worksheet *sheet = currentWorksheet())
         return sheet->setColumnHidden(colFirst, colLast, hidden);
     return false;
@@ -884,7 +923,8 @@ bool Document::setColumnHidden(int colFirst, int colLast, bool hidden) {
   Columns are 1-indexed.
   Returns true on success.
  */
-double Document::columnWidth(int column) {
+double Document::columnWidth(int column)
+{
     if (Worksheet *sheet = currentWorksheet())
         return sheet->columnWidth(column);
     return 0.0;
@@ -893,7 +933,8 @@ double Document::columnWidth(int column) {
 /*!
   Returns formatting of the \a column. Columns are 1-indexed.
  */
-Format Document::columnFormat(int column) {
+Format Document::columnFormat(int column)
+{
     if (Worksheet *sheet = currentWorksheet())
         return sheet->columnFormat(column);
     return Format();
@@ -902,7 +943,8 @@ Format Document::columnFormat(int column) {
 /*!
   Returns true if \a column is hidden. Columns are 1-indexed.
  */
-bool Document::isColumnHidden(int column) {
+bool Document::isColumnHidden(int column)
+{
     if (Worksheet *sheet = currentWorksheet())
         return sheet->isColumnHidden(column);
     return false;
@@ -914,7 +956,8 @@ bool Document::isColumnHidden(int column) {
 
   Returns true if success.
 */
-bool Document::setRowFormat(int row, const Format &format) {
+bool Document::setRowFormat(int row, const Format &format)
+{
     return setRowFormat(row, row, format);
 }
 
@@ -924,7 +967,8 @@ bool Document::setRowFormat(int row, const Format &format) {
 
   Returns true if success.
 */
-bool Document::setRowFormat(int rowFirst, int rowLast, const Format &format) {
+bool Document::setRowFormat(int rowFirst, int rowLast, const Format &format)
+{
     if (Worksheet *sheet = currentWorksheet())
         return sheet->setRowFormat(rowFirst, rowLast, format);
     return false;
@@ -936,7 +980,8 @@ bool Document::setRowFormat(int rowFirst, int rowLast, const Format &format) {
 
   Returns true if success.
 */
-bool Document::setRowHidden(int row, bool hidden) {
+bool Document::setRowHidden(int row, bool hidden)
+{
     return setRowHidden(row, row, hidden);
 }
 
@@ -946,7 +991,8 @@ bool Document::setRowHidden(int row, bool hidden) {
 
   Returns true if success.
 */
-bool Document::setRowHidden(int rowFirst, int rowLast, bool hidden) {
+bool Document::setRowHidden(int rowFirst, int rowLast, bool hidden)
+{
     if (Worksheet *sheet = currentWorksheet())
         return sheet->setRowHidden(rowFirst, rowLast, hidden);
     return false;
@@ -959,7 +1005,8 @@ bool Document::setRowHidden(int rowFirst, int rowLast, bool hidden) {
 
   Returns true if success.
 */
-bool Document::setRowHeight(int row, double height) {
+bool Document::setRowHeight(int row, double height)
+{
     return setRowHeight(row, row, height);
 }
 
@@ -970,7 +1017,8 @@ bool Document::setRowHeight(int row, double height) {
 
   Returns true if success.
 */
-bool Document::setRowHeight(int rowFirst, int rowLast, double height) {
+bool Document::setRowHeight(int rowFirst, int rowLast, double height)
+{
     if (Worksheet *sheet = currentWorksheet())
         return sheet->setRowHeight(rowFirst, rowLast, height);
     return false;
@@ -979,7 +1027,8 @@ bool Document::setRowHeight(int rowFirst, int rowLast, double height) {
 /*!
  Returns height of \a row in points.
 */
-double Document::rowHeight(int row) {
+double Document::rowHeight(int row)
+{
     if (Worksheet *sheet = currentWorksheet())
         return sheet->rowHeight(row);
     return 0.0;
@@ -988,7 +1037,8 @@ double Document::rowHeight(int row) {
 /*!
  Returns format of \a row.
 */
-Format Document::rowFormat(int row) {
+Format Document::rowFormat(int row)
+{
     if (Worksheet *sheet = currentWorksheet())
         return sheet->rowFormat(row);
     return Format();
@@ -997,7 +1047,8 @@ Format Document::rowFormat(int row) {
 /*!
  Returns true if \a row is hidden.
 */
-bool Document::isRowHidden(int row) {
+bool Document::isRowHidden(int row)
+{
     if (Worksheet *sheet = currentWorksheet())
         return sheet->isRowHidden(row);
     return false;
@@ -1007,7 +1058,8 @@ bool Document::isRowHidden(int row) {
    Groups rows from \a rowFirst to \a rowLast with the given \a collapsed.
    Returns false if error occurs.
  */
-bool Document::groupRows(int rowFirst, int rowLast, bool collapsed) {
+bool Document::groupRows(int rowFirst, int rowLast, bool collapsed)
+{
     if (Worksheet *sheet = currentWorksheet())
         return sheet->groupRows(rowFirst, rowLast, collapsed);
     return false;
@@ -1017,7 +1069,8 @@ bool Document::groupRows(int rowFirst, int rowLast, bool collapsed) {
    Groups columns from \a colFirst to \a colLast with the given \a collapsed.
    Returns false if error occurs.
  */
-bool Document::groupColumns(int colFirst, int colLast, bool collapsed) {
+bool Document::groupColumns(int colFirst, int colLast, bool collapsed)
+{
     if (Worksheet *sheet = currentWorksheet())
         return sheet->groupColumns(colFirst, colLast, collapsed);
     return false;
@@ -1026,7 +1079,8 @@ bool Document::groupColumns(int colFirst, int colLast, bool collapsed) {
 /*!
  *  Add a data \a validation rule for current worksheet. Returns true if successful.
  */
-bool Document::addDataValidation(const DataValidation &validation) {
+bool Document::addDataValidation(const DataValidation &validation)
+{
     if (Worksheet *sheet = currentWorksheet())
         return sheet->addDataValidation(validation);
     return false;
@@ -1035,7 +1089,8 @@ bool Document::addDataValidation(const DataValidation &validation) {
 /*!
  *  Add a  conditional formatting \a cf for current worksheet. Returns true if successful.
  */
-bool Document::addConditionalFormatting(const ConditionalFormatting &cf) {
+bool Document::addConditionalFormatting(const ConditionalFormatting &cf)
+{
     if (Worksheet *sheet = currentWorksheet())
         return sheet->addConditionalFormatting(cf);
     return false;
@@ -1048,7 +1103,8 @@ bool Document::addConditionalFormatting(const ConditionalFormatting &cf) {
  *
  * \sa read()
  */
-std::shared_ptr<Cell> Document::cellAt(const CellReference &pos) const {
+std::shared_ptr<Cell> Document::cellAt(const CellReference &pos) const
+{
     if (Worksheet *sheet = currentWorksheet())
         return sheet->cellAt(pos);
     return nullptr;
@@ -1060,7 +1116,8 @@ std::shared_ptr<Cell> Document::cellAt(const CellReference &pos) const {
  *
  * \sa read()
  */
-std::shared_ptr<Cell> Document::cellAt(int row, int col) const {
+std::shared_ptr<Cell> Document::cellAt(int row, int col) const
+{
     if (Worksheet *sheet = currentWorksheet())
         return sheet->cellAt(row, col);
     return {};
@@ -1075,8 +1132,11 @@ std::shared_ptr<Cell> Document::cellAt(int row, int col) const {
  * \param scope The name of one worksheet, or empty which means global scope.
  * \return Return false if the name invalid.
  */
-bool Document::defineName(const QString &name, const QString &formula, const QString &comment,
-                          const QString &scope) {
+bool Document::defineName(const QString &name,
+                          const QString &formula,
+                          const QString &comment,
+                          const QString &scope)
+{
     Q_D(Document);
 
     return d->workbook->defineName(name, formula, comment, scope);
@@ -1085,7 +1145,8 @@ bool Document::defineName(const QString &name, const QString &formula, const QSt
 /*!
         Return the range that contains cell data.
  */
-CellRange Document::dimension() const {
+CellRange Document::dimension() const
+{
     if (Worksheet *sheet = currentWorksheet())
         return sheet->dimension();
     return CellRange();
@@ -1094,7 +1155,8 @@ CellRange Document::dimension() const {
 /*!
  * Returns the value of the document's \a key property.
  */
-QString Document::documentProperty(const QString &key) const {
+QString Document::documentProperty(const QString &key) const
+{
     Q_D(const Document);
     auto it = d->documentProperties.constFind(key);
     if (it != d->documentProperties.constEnd())
@@ -1125,7 +1187,8 @@ QString Document::documentProperty(const QString &key) const {
         \li status
         \endlist
 */
-void Document::setDocumentProperty(const QString &key, const QString &property) {
+void Document::setDocumentProperty(const QString &key, const QString &property)
+{
     Q_D(Document);
     d->documentProperties[key] = property;
 }
@@ -1133,7 +1196,8 @@ void Document::setDocumentProperty(const QString &key, const QString &property) 
 /*!
  * Returns the names of all properties that were addedusing setDocumentProperty().
  */
-QStringList Document::documentPropertyNames() const {
+QStringList Document::documentPropertyNames() const
+{
     Q_D(const Document);
     return d->documentProperties.keys();
 }
@@ -1141,7 +1205,8 @@ QStringList Document::documentPropertyNames() const {
 /*!
  * Return the internal Workbook object.
  */
-Workbook *Document::workbook() const {
+Workbook *Document::workbook() const
+{
     Q_D(const Document);
     return d->workbook.get();
 }
@@ -1149,7 +1214,8 @@ Workbook *Document::workbook() const {
 /*!
  * Returns the sheet object named \a sheetName.
  */
-AbstractSheet *Document::sheet(const QString &sheetName) const {
+AbstractSheet *Document::sheet(const QString &sheetName) const
+{
     Q_D(const Document);
     return d->workbook->sheet(sheetNames().indexOf(sheetName));
 }
@@ -1158,7 +1224,8 @@ AbstractSheet *Document::sheet(const QString &sheetName) const {
  * Creates and append an sheet with the given \a name and \a type.
  * Return true if success.
  */
-bool Document::addSheet(const QString &name, AbstractSheet::SheetType type) {
+bool Document::addSheet(const QString &name, AbstractSheet::SheetType type)
+{
     Q_D(Document);
     return d->workbook->addSheet(name, type);
 }
@@ -1167,7 +1234,8 @@ bool Document::addSheet(const QString &name, AbstractSheet::SheetType type) {
  * Creates and inserts an document with the given \a name and \a type at the \a index.
  * Returns false if the \a name already used.
  */
-bool Document::insertSheet(int index, const QString &name, AbstractSheet::SheetType type) {
+bool Document::insertSheet(int index, const QString &name, AbstractSheet::SheetType type)
+{
     Q_D(Document);
     return d->workbook->insertSheet(index, name, type);
 }
@@ -1176,7 +1244,8 @@ bool Document::insertSheet(int index, const QString &name, AbstractSheet::SheetT
    Rename the worksheet from \a oldName to \a newName.
    Returns true if the success.
  */
-bool Document::renameSheet(const QString &oldName, const QString &newName) {
+bool Document::renameSheet(const QString &oldName, const QString &newName)
+{
     Q_D(Document);
     if (oldName == newName)
         return false;
@@ -1187,7 +1256,8 @@ bool Document::renameSheet(const QString &oldName, const QString &newName) {
    Make a copy of the worksheet \a srcName with the new name \a distName.
    Returns true if the success.
  */
-bool Document::copySheet(const QString &srcName, const QString &distName) {
+bool Document::copySheet(const QString &srcName, const QString &distName)
+{
     Q_D(Document);
     if (srcName == distName)
         return false;
@@ -1198,7 +1268,8 @@ bool Document::copySheet(const QString &srcName, const QString &distName) {
    Move the worksheet \a srcName to the new pos \a distIndex.
    Returns true if the success.
  */
-bool Document::moveSheet(const QString &srcName, int distIndex) {
+bool Document::moveSheet(const QString &srcName, int distIndex)
+{
     Q_D(Document);
     return d->workbook->moveSheet(sheetNames().indexOf(srcName), distIndex);
 }
@@ -1207,7 +1278,8 @@ bool Document::moveSheet(const QString &srcName, int distIndex) {
    Delete the worksheet \a name.
    Returns true if current sheet was deleted successfully.
  */
-bool Document::deleteSheet(const QString &name) {
+bool Document::deleteSheet(const QString &name)
+{
     Q_D(Document);
     return d->workbook->deleteSheet(sheetNames().indexOf(name));
 }
@@ -1215,7 +1287,8 @@ bool Document::deleteSheet(const QString &name) {
 /*!
  * \brief Return pointer of current sheet.
  */
-AbstractSheet *Document::currentSheet() const {
+AbstractSheet *Document::currentSheet() const
+{
     Q_D(const Document);
 
     return d->workbook->activeSheet();
@@ -1225,7 +1298,8 @@ AbstractSheet *Document::currentSheet() const {
  * \brief Return pointer of current worksheet.
  * If the type of sheet is not AbstractSheet::ST_WorkSheet, then 0 will be returned.
  */
-Worksheet *Document::currentWorksheet() const {
+Worksheet *Document::currentWorksheet() const
+{
     AbstractSheet *st = currentSheet();
     if (st && st->sheetType() == AbstractSheet::ST_WorkSheet)
         return static_cast<Worksheet *>(st);
@@ -1237,7 +1311,8 @@ Worksheet *Document::currentWorksheet() const {
  * \brief Set worksheet named \a name to be active sheet.
  * Returns true if success.
  */
-bool Document::selectSheet(const QString &name) {
+bool Document::selectSheet(const QString &name)
+{
     Q_D(Document);
     return d->workbook->setActiveSheet(sheetNames().indexOf(name));
 }
@@ -1246,7 +1321,8 @@ bool Document::selectSheet(const QString &name) {
  * \brief Set worksheet whose index is \a index to be active sheet.
  * Returns true if success.
  */
-bool Document::selectSheet(int index) {
+bool Document::selectSheet(int index)
+{
     Q_D(Document);
     return d->workbook->setActiveSheet(index);
 }
@@ -1254,7 +1330,8 @@ bool Document::selectSheet(int index) {
 /*!
  * Returns the names of worksheets contained in current document.
  */
-QStringList Document::sheetNames() const {
+QStringList Document::sheetNames() const
+{
     Q_D(const Document);
     return d->workbook->worksheetNames();
 }
@@ -1264,7 +1341,8 @@ QStringList Document::sheetNames() const {
  * the document constructed, a default name "book1.xlsx" will be used.
  * Returns true if saved successfully.
  */
-bool Document::save() const {
+bool Document::save() const
+{
     Q_D(const Document);
     QString name = d->packageName.isEmpty() ? d->defaultPackageName : d->packageName;
 
@@ -1275,7 +1353,8 @@ bool Document::save() const {
  * Saves the document to the file with the given \a name.
  * Returns true if saved successfully.
  */
-bool Document::saveAs(const QString &name) const {
+bool Document::saveAs(const QString &name) const
+{
     QFile file(name);
     if (file.open(QIODevice::WriteOnly))
         return saveAs(&file);
@@ -1288,45 +1367,52 @@ bool Document::saveAs(const QString &name) const {
  *
  * \warning The \a device will be closed when this function returned.
  */
-bool Document::saveAs(QIODevice *device) const {
+bool Document::saveAs(QIODevice *device) const
+{
     Q_D(const Document);
     return d->savePackage(device);
 }
 
-bool Document::saveAsCsv(const QString mainCSVFileName) const {
+bool Document::saveAsCsv(const QString mainCSVFileName) const
+{
     Q_D(const Document);
 
     return d->saveCsv(mainCSVFileName);
 }
 
-bool Document::isLoadPackage() const {
+bool Document::isLoadPackage() const
+{
     Q_D(const Document);
     return d->isLoad;
 }
 
-bool Document::load() const {
+bool Document::load() const
+{
     return isLoadPackage();
 }
 
-bool Document::copyStyle(const QString &from, const QString &to) {
+bool Document::copyStyle(const QString &from, const QString &to)
+{
     return DocumentPrivate::copyStyle(from, to);
 }
 
 /*!
  * Destroys the document and cleans up.
  */
-Document::~Document() {
+Document::~Document()
+{
     delete d_ptr;
 }
 
 //  add by liufeijin 20181025 {{
-bool Document::changeimage(int filenoinmidea, QString newfile) {
+bool Document::changeimage(int filenoinmidea, QString newfile)
+{
     Q_D(const Document);
 
     QImage newpic(newfile);
 
     auto mediaFileToLoad = d->workbook->mediaFiles();
-    const auto mf = mediaFileToLoad[filenoinmidea];
+    const auto mf        = mediaFileToLoad[filenoinmidea];
 
     const QString suffix = newfile.mid(newfile.lastIndexOf(QLatin1Char('.')) + 1);
     QString mimetypemy;
@@ -1355,10 +1441,11 @@ bool Document::changeimage(int filenoinmidea, QString newfile) {
 /*!
   Returns map of columns with there maximal width
  */
-QMap<int, int> Document::getMaximalColumnWidth(int firstRow, int lastRow) {
-    const int defaultPixelSize = 11;  // Default font pixel size of excel?
-    int maxRows = -1;
-    int maxCols = -1;
+QMap<int, int> Document::getMaximalColumnWidth(int firstRow, int lastRow)
+{
+    const int defaultPixelSize = 11; // Default font pixel size of excel?
+    int maxRows                = -1;
+    int maxCols                = -1;
     QMap<int, int> colWidth;
     if (!currentWorksheet())
         return colWidth;
@@ -1367,7 +1454,7 @@ QMap<int, int> Document::getMaximalColumnWidth(int firstRow, int lastRow) {
     for (int i = 0; i < cellLocation.size(); i++) {
         int col = cellLocation.at(i).col;
         int row = cellLocation.at(i).row;
-        int fs = cellLocation.at(i).cell->format().fontSize();
+        int fs  = cellLocation.at(i).cell->format().fontSize();
         if (fs <= 0) {
             fs = defaultPixelSize;
         }
@@ -1376,7 +1463,7 @@ QMap<int, int> Document::getMaximalColumnWidth(int firstRow, int lastRow) {
         QString str = read(row, col).toString();
 
         double w = str.length() * double(fs) / defaultPixelSize +
-                   1;  // width not perfect, but works reasonably well
+                   1; // width not perfect, but works reasonably well
 
         if ((row >= firstRow) && (row <= lastRow)) {
             if (w > colWidth.value(col)) {
@@ -1392,7 +1479,8 @@ QMap<int, int> Document::getMaximalColumnWidth(int firstRow, int lastRow) {
   Auto ets width in characters of columns with the given \a range.
   Returns true on success.
  */
-bool Document::autosizeColumnWidth(const CellRange &range) {
+bool Document::autosizeColumnWidth(const CellRange &range)
+{
     bool erg = false;
 
     if (!range.isValid()) {
@@ -1400,7 +1488,7 @@ bool Document::autosizeColumnWidth(const CellRange &range) {
     }
 
     const QMap<int, int> colWidth = getMaximalColumnWidth(range.firstRow(), range.lastRow());
-    auto it = colWidth.constBegin();
+    auto it                       = colWidth.constBegin();
     while (it != colWidth.constEnd()) {
         if ((it.key() >= range.firstColumn()) && (it.key() <= range.lastColumn())) {
             erg |= setColumnWidth(it.key(), it.value());
@@ -1415,11 +1503,12 @@ bool Document::autosizeColumnWidth(const CellRange &range) {
   Auto sets width in characters \a column . Columns are 1-indexed.
   Returns true on success.
  */
-bool Document::autosizeColumnWidth(int column) {
+bool Document::autosizeColumnWidth(int column)
+{
     bool erg = false;
 
     const QMap<int, int> colWidth = getMaximalColumnWidth();
-    auto it = colWidth.constBegin();
+    auto it                       = colWidth.constBegin();
     while (it != colWidth.constEnd()) {
         if (it.key() == column) {
             erg |= setColumnWidth(it.key(), it.value());
@@ -1434,13 +1523,14 @@ bool Document::autosizeColumnWidth(int column) {
   Auto sets width in characters for columns [\a colFirst, \a colLast]. Columns are 1-indexed.
   Returns true on success.
  */
-bool Document::autosizeColumnWidth(int colFirst, int colLast) {
+bool Document::autosizeColumnWidth(int colFirst, int colLast)
+{
     Q_UNUSED(colFirst)
     Q_UNUSED(colLast)
     bool erg = false;
 
     const QMap<int, int> colWidth = getMaximalColumnWidth();
-    auto it = colWidth.constBegin();
+    auto it                       = colWidth.constBegin();
     while (it != colWidth.constEnd()) {
         if ((it.key() >= colFirst) && (it.key() <= colLast)) {
             erg |= setColumnWidth(it.key(), it.value());
@@ -1455,11 +1545,12 @@ bool Document::autosizeColumnWidth(int colFirst, int colLast) {
   Auto sets width in characters for all columns.
   Returns true on success.
  */
-bool Document::autosizeColumnWidth() {
+bool Document::autosizeColumnWidth()
+{
     bool erg = false;
 
     const QMap<int, int> colWidth = getMaximalColumnWidth();
-    auto it = colWidth.constBegin();
+    auto it                       = colWidth.constBegin();
     while (it != colWidth.constEnd()) {
         erg |= setColumnWidth(it.key(), it.value());
         ++it;
@@ -1470,12 +1561,14 @@ bool Document::autosizeColumnWidth() {
 
 /////////////////////////////////////////////////////////////////////
 // ======================= SAX streaming API =========================
-bool Document::read_sheet_sax(int sheet_index, const sax_options &opt,
-                              const sax_cell_callback &on_cell) {
+bool Document::read_sheet_sax(int sheet_index,
+                              const sax_options& opt,
+                              const sax_cell_callback& on_cell)
+{
     if (!d_ptr || !d_ptr->workbook)
         return false;
 
-    // Open zip (supports both file path and QIODevice based)
+           // Open zip (supports both file path and QIODevice based)
     std::unique_ptr<QIODevice> owned_device;
 
     if (!d_ptr->packageName.isEmpty()) {
@@ -1494,13 +1587,13 @@ bool Document::read_sheet_sax(int sheet_index, const sax_options &opt,
 
     ZipReader zip(owned_device.get());
 
-    // shared strings (optional)
+           // shared strings (optional)
     QStringList shared_strings;
     if (opt.resolve_shared_strings) {
         shared_strings = QXlsx::load_shared_strings_all(zip);
     }
 
-    // sheet XML path: workbook already has filePath (actual path determined by relationship (rels))
+           // sheet XML path: workbook already has filePath (actual path determined by relationship (rels))
     AbstractSheet *abs_sheet = d_ptr->workbook->sheet(sheet_index);
     if (!abs_sheet)
         return false;
@@ -1511,12 +1604,15 @@ bool Document::read_sheet_sax(int sheet_index, const sax_options &opt,
     if (sheet_xml.isEmpty())
         return false;
 
-    return QXlsx::read_sheet_xml_sax(
-        sheet_xml, opt, opt.resolve_shared_strings ? &shared_strings : nullptr, on_cell);
+    return QXlsx::read_sheet_xml_sax(sheet_xml, opt,
+                                     opt.resolve_shared_strings ? &shared_strings : nullptr,
+                                     on_cell);
 }
 
-bool Document::read_sheet_sax(const QString &sheet_name, const sax_options &opt,
-                              const sax_cell_callback &on_cell) {
+bool Document::read_sheet_sax(const QString& sheet_name,
+                              const sax_options& opt,
+                              const sax_cell_callback& on_cell)
+{
     const QStringList names = d_ptr->workbook->worksheetNames();
     const int idx = names.indexOf(sheet_name);
     if (idx < 0)
@@ -1524,5 +1620,6 @@ bool Document::read_sheet_sax(const QString &sheet_name, const sax_options &opt,
     return read_sheet_sax(idx, opt, on_cell);
 }
 //////////////////////////////////////////////////////////////////////
+
 
 QT_END_NAMESPACE_XLSX

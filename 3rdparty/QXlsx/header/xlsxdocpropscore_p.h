@@ -3,18 +3,19 @@
 #ifndef XLSXDOCPROPSCORE_H
 #define XLSXDOCPROPSCORE_H
 
-#include <QMap>
-#include <QStringList>
-
 #include "xlsxabstractooxmlfile.h"
 #include "xlsxglobal.h"
+
+#include <QMap>
+#include <QStringList>
 
 class QIODevice;
 
 QT_BEGIN_NAMESPACE_XLSX
 
-class DocPropsCore : public AbstractOOXmlFile {
-   public:
+class DocPropsCore : public AbstractOOXmlFile
+{
+public:
     explicit DocPropsCore(CreateFlag flag);
 
     bool setProperty(const QString &name, const QString &value);
@@ -24,10 +25,10 @@ class DocPropsCore : public AbstractOOXmlFile {
     void saveToXmlFile(QIODevice *device) const override;
     bool loadFromXmlFile(QIODevice *device) override;
 
-   private:
+private:
     QMap<QString, QString> m_properties;
 };
 
 QT_END_NAMESPACE_XLSX
 
-#endif  // XLSXDOCPROPSCORE_H
+#endif // XLSXDOCPROPSCORE_H

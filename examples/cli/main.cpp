@@ -2,10 +2,29 @@
 #include "dbridge/Types.h"
 
 #include <QCoreApplication>
-#include <QDebug>
+#include <QFile>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QString>
 
 #include <iostream>
+
+static QString readProfileName(const QString& path, QString* err) {
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly)) {
+        if (err)
+            *err = QStringLiteral("Cannot open profile file: ") + path;
+        return {};
+    }
+    QJsonParseError pe;
+    QJsonDocument doc = QJsonDocument::fromJson(f.readAll(), &pe);
+    if (doc.isNull() || !doc.isObject()) {
+        if (err)
+            *err = QStringLiteral("Profile JSON invalid: ") + pe.errorString();
+        return {};
+    }
+    return doc.object().value(QStringLiteral("profileName")).toString();
+}
 
 int main(int argc, char* argv[]) {
     QCoreApplication app(argc, argv);
@@ -20,11 +39,17 @@ int main(int argc, char* argv[]) {
     QString xlsxPath = QString::fromLocal8Bit(argv[3]);
     QString mode = argc > 4 ? QString::fromLocal8Bit(argv[4]) : QStringLiteral("import");
 
+    QString err;
+    QString profileName = readProfileName(profilePath, &err);
+    if (profileName.isEmpty()) {
+        std::cerr << "Failed to read profileName: " << err.toStdString() << '\n';
+        return 1;
+    }
+
     dbridge::DataBridge bridge;
     dbridge::ConnectionSpec cs;
     cs.sqlitePath = dbPath;
 
-    QString err;
     if (!bridge.open(cs, &err)) {
         std::cerr << "Failed to open DB: " << err.toStdString() << '\n';
         return 1;
@@ -35,11 +60,9 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // For simplicity, use the profile name from the file (assume it was loaded)
-    // In real usage, you'd parse the JSON to get the profileName
     if (mode == QStringLiteral("import")) {
         dbridge::ImportOptions opts;
-        opts.profileName = QStringLiteral("profile");  // placeholder
+        opts.profileName = profileName;
         auto result = bridge.importExcel(xlsxPath, opts);
         if (result.ok) {
             std::cout << "Imported " << result.writtenRows << " rows\n";
@@ -53,14 +76,21 @@ int main(int argc, char* argv[]) {
         }
     } else if (mode == QStringLiteral("export")) {
         dbridge::ExportOptions opts;
-        opts.profileName = QStringLiteral("profile");  // placeholder
+        opts.profileName = profileName;
         auto result = bridge.exportExcel(xlsxPath, opts);
         if (result.ok) {
             std::cout << "Exported " << result.writtenRows << " rows\n";
         } else {
-            std::cerr << "Export failed\n";
+            std::cerr << "Export failed with " << result.errors.size() << " errors:\n";
+            for (const auto& e : result.errors) {
+                std::cerr << "  [" << e.code.toStdString() << "] " << e.message.toStdString()
+                          << '\n';
+            }
             return 1;
         }
+    } else {
+        std::cerr << "Unknown mode: " << mode.toStdString() << " (expected import|export)\n";
+        return 1;
     }
 
     bridge.close();

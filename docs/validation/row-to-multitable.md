@@ -165,7 +165,7 @@ SELECT COUNT(*) FROM order_items WHERE order_no IS NULL;   -- I-V3：期望 0
   export
 ```
 
-对账（`tools/xlsx2csv.py` 是纯 stdlib 实现，默认 dump 第一个 sheet；如需指定 sheet 加 `--sheet Orders`）：
+对账（工具详情见 [§工具：`tools/xlsx2csv.py`](#工具toolsxlsx2csvpy)）：
 
 ```bash
 python3 tools/xlsx2csv.py tests/data/xlsx/Orders.xlsx  > /tmp/in_I.csv
@@ -463,7 +463,7 @@ SELECT COUNT(*) FROM invoice_lines   WHERE invoice_no  NOT IN (SELECT invoice_no
 - A 行 / B 行 / C 行各自占据相应的列分组，其他列为空 —— 与输入对称。
 - 行总数 = `order_items` 2 + `shipment_legs` 2 + `invoice_lines` 2 = 6，恰好等于输入 6 行。
 
-对账（参见 §I-4.3 关于 `tools/xlsx2csv.py` 的说明）：
+对账（工具详情见 [§工具：`tools/xlsx2csv.py`](#工具toolsxlsx2csvpy)）：
 
 ```bash
 python3 tools/xlsx2csv.py tests/data/xlsx/Mixed.xlsx  > /tmp/in_II.csv
@@ -503,6 +503,84 @@ SELECT (SELECT COUNT(*) FROM orders)
 2. 场景 II §II-4 全部断言通过；尤其要确认 A/B/C 行**没有**互相污染对方的表集合。
 3. 两个场景的负向用例都返回预期错误码，库内计数仍为 0。
 4. 两个场景的导出对账 CSV 哈希一致。
+
+---
+
+## 工具：`tools/xlsx2csv.py`
+
+`tools/xlsx2csv.py` 是为本验证流程配套的 xlsx → CSV 转储器，**纯 Python 标准库实现**（`zipfile` + `xml.etree.ElementTree`），与 dbridge 主仓库独立，不需要 `pip install`。它在 §I-4.3 / §II-4.3 的导出对账步骤中把输入与输出两份 xlsx 拉平成 CSV 后做哈希比对。
+
+### 调用形式
+
+```bash
+python3 tools/xlsx2csv.py <path.xlsx> [--sheet <name>]
+```
+
+| 选项 | 含义 |
+|---|---|
+| `<path.xlsx>` | 输入 xlsx 文件路径（位置参数，必填） |
+| `--sheet <name>` | 指定 sheet 名；省略时取 `xl/workbook.xml` 中**第一个**声明的 sheet |
+
+CSV 写到 stdout。退出码：
+
+| code | 含义 |
+|---|---|
+| `0` | 成功 |
+| `2` | sheet 不存在 / 无 sheet（stderr 会打印可用的 sheet 名列表） |
+
+### 解析能力
+
+| Excel 形态 | 处理结果 |
+|---|---|
+| Shared string（`t="s"` + `<v>` index） | 解 `xl/sharedStrings.xml` 还原原文 |
+| Inline string（`t="inlineStr"` + `<is><t>`） | 直接读出 |
+| 数值（`t="n"` 或无 `t`） | 原样输出 |
+| 布尔（`t="b"`） | `TRUE` / `FALSE` |
+| 错误（`t="e"`） | 输出错误码字符串（如 `#DIV/0!`） |
+| 公式（`<f>` + cached `<v>`） | 取缓存值，不二次求值 |
+| 日期单元格（数值 + 日期样式） | 读 `xl/styles.xml`，识别内建 numFmtId（14–22 / 27–36 / 45–47 / 50–58）与含 `y`/`d` 的自定义格式 → 转 ISO 日期 `2026-05-20` |
+| 时间单元格（数值 + 仅含 `h`/`s` 的格式） | 转 `HH:MM:SS` |
+| 含日期与时间的格式 | 转 `YYYY-MM-DD HH:MM:SS` |
+| 稀疏行 / 稀疏列 | 缺失单元格填空字符串，行宽对齐全表最大列 |
+
+### 日期换算说明（Excel 1900 闰年 bug）
+
+Excel 1900 模式有"1900-02-29 不存在却被算作存在"的著名 bug。脚本按惯例处理：
+
+- `serial >= 60` → 锚点 `1899-12-30`（跳过虚构的 1900-02-29）
+- `serial < 60` → 锚点 `1899-12-31`
+
+实例：`46162` → `1899-12-30 + 46162 天` = **`2026-05-20`**，与 Excel UI 显示一致。
+
+### 局限
+
+- 单次调用只 dump 一个 sheet；多 sheet 需多次调用。
+- 公式不重新求值，依赖 Excel 写出来的 `<v>` 缓存值（与 Excel UI 显示一致即可）。
+- 日期识别基于 numFmtId / 格式码字面；用户自造的奇怪格式（不含 `y/d/h/s` 字符）会被视作普通数值。
+- 输出 CSV 用 Python 内置 `csv` 模块，不带 BOM，UTF-8。
+
+### 与 dbridge 配合的对账配方
+
+```bash
+# 1. 导出 xlsx
+./build/examples/cli/dbridge-cli /tmp/scenarioII.db \
+    tests/data/profiles/mixed_abc_multitable.json \
+    /tmp/Mixed.exported.xlsx export
+
+# 2. 拉平两份 xlsx 为 CSV
+python3 tools/xlsx2csv.py tests/data/xlsx/Mixed.xlsx > /tmp/in.csv
+python3 tools/xlsx2csv.py /tmp/Mixed.exported.xlsx > /tmp/out.csv
+
+# 3. 排序后做哈希比对（顺序无关）
+sort /tmp/in.csv  | sha256sum
+sort /tmp/out.csv | sha256sum
+```
+
+注意：dbridge 导入侧走 QXlsx（也读得懂日期样式），所以**库内 `eta` 列存的是 ISO 字符串**；导出时再写成 xlsx，eta 单元格会回归"日期格式 + serial"。两份 xlsx 经 `xlsx2csv.py` 拉平后日期都会被还原为同一形态的 ISO 字符串，对账 sha256 才能命中。
+
+### 自检（开发用）
+
+工具自身的最小回归就是这套验证流程：场景 I / II 的对账步骤实际跑通即可。如果未来给它加新形态（多 sheet / 流式 / 日期时区），建议同时在 `docs/validation/row-to-multitable.md` 末尾追加最小测试用例描述，避免再次出现"工具显示与 dbridge 实际行为不一致"那种坑。
 
 ---
 

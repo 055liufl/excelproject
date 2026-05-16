@@ -20,6 +20,22 @@
 - [11. 关键算法详解](#11-关键算法详解)
 - [12. 三种 Profile 模式对比](#12-三种-profile-模式对比)
 - [13. 错误码体系](#13-错误码体系)
+- [14. 完整使用指南（手把手）](#14-完整使用指南手把手)
+  - [14.1 系统要求与依赖](#141-系统要求与依赖)
+  - [14.2 从源码构建 dbridge](#142-从源码构建-dbridge)
+  - [14.3 集成到你的 Qt 项目](#143-集成到你的-qt-项目)
+  - [14.4 公共 API 参考（6 个方法）](#144-公共-api-参考6-个方法)
+  - [14.5 配置结构体详解](#145-配置结构体详解)
+  - [14.6 第一个完整示例：从零到成功导入](#146-第一个完整示例从零到成功导入)
+  - [14.7 编写 Profile JSON](#147-编写-profile-json)
+  - [14.8 验证器（Validators）完整清单](#148-验证器validators完整清单)
+  - [14.9 三种导入模式分步教程](#149-三种导入模式分步教程)
+  - [14.10 导出 Excel 教程](#1410-导出-excel-教程)
+  - [14.11 自动生成 Profile（AutoProfile）](#1411-自动生成-profileautoprofile)
+  - [14.12 错误处理模式](#1412-错误处理模式)
+  - [14.13 CLI 工具完整参考](#1413-cli-工具完整参考)
+  - [14.14 性能调优与实用技巧](#1414-性能调优与实用技巧)
+  - [14.15 常见坑与排查](#1415-常见坑与排查)
 
 ---
 
@@ -1113,6 +1129,941 @@ graph LR
 - `message`：人类可读的描述
 
 宿主拿到 `errors` 列表后，可以一次性高亮全部错误单元格，**不需要让用户改一处跑一次**。
+
+---
+
+## 14. 完整使用指南（手把手）
+
+> 这一节是给**完全没接触过这个库的人**写的。从环境准备到第一次跑通示例，每一步都讲清楚。
+> 如果你只想跑通一个 demo，直接看 [14.6 第一个完整示例](#146-第一个完整示例从零到成功导入)。
+
+### 14.1 系统要求与依赖
+
+| 依赖 | 最低版本 | 说明 |
+|---|---|---|
+| **操作系统** | Linux / macOS / Windows | MVP 在 Linux 上验证；其他平台理论可行 |
+| **编译器** | GCC 9+ / Clang 10+ / MSVC 2019+ | 必须支持 C++17 |
+| **CMake** | 3.16+ | 项目使用现代 CMake target 写法 |
+| **Qt** | **5.12.12 LTS** | 必须包含 `Core` + `Sql` + `Gui` 三个模块；运行测试还需 `Test` |
+| **SQLite** | **3.24.0+** | 因为依赖 `INSERT ... ON CONFLICT(...) DO UPDATE`，库会在 `open()` 时检查版本，低版本直接报 `E_OPEN_DB` |
+| **QXlsx** | 已 vendored 在 `3rdparty/QXlsx/` | **不需要单独安装**，构建系统会自动编译它 |
+
+**怎么检查环境是否满足？**
+
+```bash
+# 1. 编译器
+g++ --version                  # 应 >= 9.0
+
+# 2. CMake
+cmake --version                # 应 >= 3.16
+
+# 3. Qt（看你装在哪）
+ls /opt/Qt5.12.12/5.12.12/gcc_64/lib/libQt5Core.so* 2>/dev/null
+
+# 4. SQLite（命令行工具版本通常和 lib 版本一致）
+sqlite3 --version              # 应 >= 3.24
+# 也可以用 SQL 查询库内置版本：
+sqlite3 :memory: 'SELECT sqlite_version();'
+```
+
+> **新手提示**：本库不依赖系统的 `libsqlite3`——Qt5::Sql 内置 SQLite 驱动。
+> 但 ON CONFLICT DO UPDATE 是 SQLite 3.24+ 才有的语法，**Qt 5.12 自带的 SQLite 一般是 3.x**，
+> 大多数情况下没问题。报错就升级 Qt 或者用系统 SQLite。
+
+### 14.2 从源码构建 dbridge
+
+#### 14.2.1 克隆仓库 + 子模块
+
+```bash
+git clone <your-repo-url>
+cd <repo-root>
+# 如果 QXlsx 是 submodule（本项目是 vendored 的，可跳过这步）
+git submodule update --init --recursive
+```
+
+#### 14.2.2 配置 CMake
+
+```bash
+# Debug 构建 + 启用测试 + 启用 examples
+cmake -S . -B build \
+  -DCMAKE_BUILD_TYPE=Debug \
+  -DBUILD_TESTING=ON \
+  -DDBRIDGE_BUILD_EXAMPLES=ON \
+  -DCMAKE_PREFIX_PATH=/opt/Qt5.12.12/5.12.12/gcc_64
+```
+
+**CMake 选项详解：**
+
+| 选项 | 默认值 | 作用 |
+|---|---|---|
+| `CMAKE_BUILD_TYPE` | 空 | 推荐 `Debug` 或 `Release`；调试时用 Debug，发布用 Release |
+| `BUILD_TESTING` | `ON`（CTest 默认） | 关掉可减少构建时间：`-DBUILD_TESTING=OFF` |
+| `DBRIDGE_BUILD_EXAMPLES` | `ON` | 关掉就不会构建 `dbridge-cli`：`-DDBRIDGE_BUILD_EXAMPLES=OFF` |
+| `CMAKE_PREFIX_PATH` | 系统默认 | 必须指向你 Qt5.12 的 `gcc_64` 目录（即包含 `lib/cmake/Qt5/` 的那一层） |
+| `CMAKE_INSTALL_PREFIX` | `/usr/local` | 如果你打算 `make install`，改成你想装的路径 |
+
+#### 14.2.3 编译
+
+```bash
+cmake --build build -j$(nproc)
+# 或：cd build && make -j$(nproc)
+```
+
+构建产物：
+- `build/libdbridge.so`（Linux） / `dbridge.dll`（Windows） / `libdbridge.dylib`（macOS）
+- `build/examples/cli/dbridge-cli`（CLI 工具）
+- `build/tests/*`（单元 + 集成测试）
+
+#### 14.2.4 运行测试
+
+```bash
+cd build
+ctest --output-on-failure          # 全部测试
+ctest --output-on-failure -V       # 详细日志
+ctest -R profile_loader_test       # 只跑某个测试
+```
+
+#### 14.2.5 安装（可选）
+
+```bash
+cmake --install build --prefix /opt/dbridge
+# 会装到：
+# /opt/dbridge/lib/libdbridge.so
+# /opt/dbridge/include/dbridge/*.h
+```
+
+> 注意：当前 `CMakeLists.txt` **未配置 `install()` 规则**——MVP 阶段建议直接以源码集成（见 14.3）。
+
+### 14.3 集成到你的 Qt 项目
+
+#### 方式 A：CMake `add_subdirectory`（推荐）
+
+把 `dbridge` 仓库放到你项目下，比如 `third_party/dbridge`：
+
+```cmake
+# your_project/CMakeLists.txt
+cmake_minimum_required(VERSION 3.16)
+project(my_app LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_AUTOMOC ON)
+
+find_package(Qt5 5.12 REQUIRED COMPONENTS Core Sql Gui Widgets)
+
+# 把 dbridge 当成子目录纳入
+add_subdirectory(third_party/dbridge)
+
+add_executable(my_app main.cpp MainWindow.cpp)
+target_link_libraries(my_app PRIVATE dbridge Qt5::Widgets)
+```
+
+**好处**：
+- 不需要先编译安装 dbridge
+- 你项目里 `#include "dbridge/DataBridge.h"` 就能用
+- `dbridge` 是 PRIVATE/PUBLIC 透传 Qt5::Core + Qt5::Sql 的，无需重复 `target_link_libraries`
+
+#### 方式 B：CMake `find_package`（库已安装时）
+
+```cmake
+find_package(dbridge REQUIRED)        # 需要 dbridge 提供 dbridgeConfig.cmake
+target_link_libraries(my_app PRIVATE dbridge::dbridge)
+```
+
+> 当前 MVP 未生成 `dbridgeConfig.cmake`，方式 B 暂不可用。
+
+#### 方式 C：qmake 项目（旧式 .pro 文件）
+
+```pro
+QT += core sql gui
+CONFIG += c++17
+
+INCLUDEPATH += /path/to/dbridge/include /path/to/dbridge/build/include
+LIBS += -L/path/to/dbridge/build -ldbridge
+LIBS += -Wl,-rpath,/path/to/dbridge/build  # 让运行时能找到 .so
+
+SOURCES += main.cpp
+```
+
+记得 `main.cpp` 里 `#include "dbridge/DataBridge.h"`。
+
+### 14.4 公共 API 参考（6 个方法）
+
+整个公开头只有 1 个类 `DataBridge`，6 个方法。**这就是你需要掌握的全部 API**。
+
+```cpp
+class DataBridge {
+public:
+    DataBridge();                                  // ① 构造
+    ~DataBridge();                                 //    析构
+
+    bool open(const ConnectionSpec& spec, QString* err = nullptr);   // ② 打开 SQLite
+    void close();                                                    // ③ 关闭
+
+    bool loadProfile(const QString& jsonPath, QString* err = nullptr);
+    bool loadProfileFromString(const QString& json, QString* err = nullptr);   // ④ 加载 Profile
+
+    QString generateAutoProfileJson(const QString& table, QString* err = nullptr);  // ⑤ 自动生成 Profile
+
+    ImportResult importExcel(const QString& xlsxPath, const ImportOptions& options);   // ⑥ 导入
+    ExportResult exportExcel(const QString& xlsxPath, const ExportOptions& options);   // ⑦ 导出
+};
+```
+
+> 注：①②③ + ④（两个加载方法算一个）+ ⑤ + ⑥ + ⑦ = **核心 6 个对外行为**。
+
+#### ① `open(spec, err) → bool`
+
+**作用**：打开 SQLite 数据库连接，校验版本，配置 PRAGMA，刷新 SchemaCatalog。
+
+**入参**：
+- `spec.sqlitePath`：DB 文件路径（如 `"mydata.db"`；不存在会自动创建空库）
+- `spec.busyTimeoutMs`：SQLite 忙等待毫秒数（默认 5000）
+- `spec.enableWal`：是否开启 WAL 日志（默认 `true`，强烈推荐）
+
+**返回**：
+- `true`：成功，库可以用了
+- `false`：失败，`*err` 里有可读的错误描述（含错误码 `E_OPEN_DB`）
+
+**失败常见原因**：
+- 路径不可写（权限）
+- SQLite 版本 < 3.24
+- 文件不是合法 SQLite 数据库
+
+```cpp
+dbridge::DataBridge bridge;
+dbridge::ConnectionSpec cs;
+cs.sqlitePath = "/data/app.db";
+cs.busyTimeoutMs = 10000;
+cs.enableWal = true;
+
+QString err;
+if (!bridge.open(cs, &err)) {
+    qFatal("打开 DB 失败：%s", qPrintable(err));
+}
+```
+
+#### ② `close()`
+
+**作用**：关闭 DB 连接，从 Qt 全局连接池中移除。
+
+**注意**：析构时会自动调用，一般不需要手动调。
+
+#### ③ `loadProfile(jsonPath, err) / loadProfileFromString(json, err) → bool`
+
+**作用**：把一份 Profile JSON 解析并存到内部 `profiles_` 表（用 `profileName` 当 key）。
+
+**返回**：
+- `true`：解析+校验通过，Profile 可用
+- `false`：`*err` 含错误码 `E_PROFILE_PARSE` / `E_PROFILE_TABLE_NOT_FOUND` 等
+
+```cpp
+QString err;
+bridge.loadProfile("profiles/customer_basic.json", &err);
+// 也可以从字符串加载（适合从配置中心读 / 加密后解密）：
+QString jsonStr = readMyEncryptedProfile();
+bridge.loadProfileFromString(jsonStr, &err);
+```
+
+**多个 Profile？** 多次调用即可。每个 Profile 内必须有不同的 `profileName`，否则后加载的会覆盖前者。
+
+#### ④ `generateAutoProfileJson(table, err) → QString`
+
+**作用**：自动从 SQLite 表结构生成一份 SingleTable Profile JSON 草稿。返回 JSON 字符串。
+
+```cpp
+QString err;
+QString json = bridge.generateAutoProfileJson("customer", &err);
+if (json.isEmpty()) {
+    qWarning() << "生成失败:" << err;
+} else {
+    QFile f("draft.json"); f.open(QIODevice::WriteOnly); f.write(json.toUtf8());
+    // 编辑 draft.json 后再 loadProfile
+}
+```
+
+**典型用法**：你装好了 DB 但还没 Profile，先用 AutoProfile 生成草稿，改 source/validators 后再加载。
+
+#### ⑤ `importExcel(xlsxPath, options) → ImportResult`
+
+**作用**：4 阶段流水线把 Excel 导入 DB。Phase A/B/C 任何错误都不写库，Phase D 单事务写入。
+
+```cpp
+dbridge::ImportOptions opts;
+opts.profileName = "customer_basic";     // 必填：在 loadProfile 之后才能引用
+opts.sheetName = "";                     // 可选：覆盖 Profile 的 sheet 字段
+opts.abortOnError = true;                // MVP 必须 true（all-or-nothing）
+
+auto r = bridge.importExcel("data.xlsx", opts);
+if (!r.ok) {
+    qWarning() << "导入失败 errors=" << r.errors.size();
+    for (const auto& e : r.errors) {
+        qWarning() << e.code << "row=" << e.row << "col=" << e.column << e.message;
+    }
+} else {
+    qInfo() << "导入成功，写入" << r.writtenRows << "行";
+}
+```
+
+#### ⑥ `exportExcel(xlsxPath, options) → ExportResult`
+
+**作用**：根据 Profile 的 `exportSpec`（或 routes 隐含的 LEFT JOIN）从 DB 查询并写入 Excel。
+
+```cpp
+dbridge::ExportOptions eopts;
+eopts.profileName = "orders_full";
+auto er = bridge.exportExcel("orders_export.xlsx", eopts);
+if (!er.ok) {
+    for (const auto& e : er.errors) qWarning() << e.code << e.message;
+}
+```
+
+### 14.5 配置结构体详解
+
+#### `ConnectionSpec`
+
+```cpp
+struct ConnectionSpec {
+    QString sqlitePath;          // 必填：DB 文件路径
+    int busyTimeoutMs = 5000;    // SQLite 锁等待毫秒（默认 5 秒）
+    bool enableWal = true;       // 是否开 WAL 模式（强烈建议 true）
+};
+```
+
+**WAL 是什么？** 默认 `journal_mode=DELETE`，写期间读会被阻塞；`WAL` 模式下读写不互斥，性能高得多。生产环境一律 `true`。
+
+#### `ImportOptions`
+
+```cpp
+struct ImportOptions {
+    QString profileName;         // 必填：要用哪份 Profile
+    QString sheetName;           // 可选：覆盖 Profile 里的 sheet，为空则用 Profile 的
+    bool abortOnError = true;    // MVP 必须 true，false 行为未实现
+};
+```
+
+#### `ExportOptions`
+
+```cpp
+struct ExportOptions {
+    QString profileName;         // 必填
+    QString sheetName;           // 可选
+};
+```
+
+#### `ImportResult` / `ExportResult` / `RowError`
+
+```cpp
+struct ImportResult {
+    bool ok = false;             // 全部成功才 true
+    int readRows = 0;            // 从 Excel 读到的行数
+    int writtenRows = 0;         // 成功写入 DB 的行数；失败时为 0（all-or-nothing）
+    QList<RowError> errors;      // 所有错误（不止一个！）
+};
+
+struct RowError {
+    QString sheet;               // 哪个 sheet
+    int row = 0;                 // Excel 第几行（1-based）；0 表示表级错误
+    QString column;              // 哪个表头列名；空表示行/表级错误
+    QString rawValue;            // 出问题的原始单元格值（便于显示）
+    QString code;                // 错误码（见 Errors.h，如 "E_VALIDATE_TYPE"）
+    QString message;             // 人类可读描述
+};
+```
+
+### 14.6 第一个完整示例：从零到成功导入
+
+我们走一遍**最小完整流程**，从准备数据到运行成功。
+
+#### 步骤 1：准备 SQLite 表
+
+```bash
+sqlite3 demo.db <<'SQL'
+CREATE TABLE customer (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    customer_no TEXT    NOT NULL UNIQUE,
+    name        TEXT    NOT NULL,
+    phone       TEXT,
+    age         INTEGER
+);
+SQL
+```
+
+#### 步骤 2：准备 Excel（`customers.xlsx`）
+
+| CustomerNo | Name | Phone | Age |
+|---|---|---|---|
+| C001 | 张三 | 13800000001 | 28 |
+| C002 | 李四 | 13800000002 | 35 |
+| C003 | 王五 |  | 42 |
+
+#### 步骤 3：写 Profile（`customer_basic.json`）
+
+```json
+{
+  "profileName": "customer_basic",
+  "sheet": "Customers",
+  "headerRow": 1,
+  "mode": "singleTable",
+  "table": "customer",
+  "conflict": { "columns": ["customer_no"] },
+  "columns": {
+    "customer_no": { "source": "CustomerNo", "validators": ["notNull", "len<=32"] },
+    "name":        { "source": "Name",       "validators": ["notNull"] },
+    "phone":       { "source": "Phone",      "validators": ["regex:^1\\d{10}$"] },
+    "age":         { "source": "Age",        "validators": ["int>=0"] }
+  }
+}
+```
+
+**JSON 字段速记**：
+- `profileName`：你给这份 Profile 起的名字，后面 `ImportOptions.profileName` 要填这个
+- `sheet`：Excel 里的 Sheet 标签名（Excel 左下角 tab 名）
+- `headerRow`：哪一行是表头（1-based，通常是 1）
+- `mode`：`singleTable` / `multiTable` / `mixed` 三选一
+- `table`：目标表名（SQLite 里的表）
+- `conflict.columns`：用哪些列做 upsert 的 conflict key（通常是主键/唯一键）
+- `columns`：`数据库列 → { source: Excel 表头, validators: [校验规则] }`
+
+#### 步骤 4：写 C++ 代码
+
+```cpp
+// main.cpp
+#include "dbridge/DataBridge.h"
+#include "dbridge/Errors.h"
+
+#include <QCoreApplication>
+#include <QDebug>
+
+int main(int argc, char* argv[]) {
+    QCoreApplication app(argc, argv);
+
+    dbridge::DataBridge bridge;
+    QString err;
+
+    // 1. 打开数据库
+    dbridge::ConnectionSpec cs;
+    cs.sqlitePath = "demo.db";
+    if (!bridge.open(cs, &err)) {
+        qCritical() << "open failed:" << err;
+        return 1;
+    }
+
+    // 2. 加载 Profile
+    if (!bridge.loadProfile("customer_basic.json", &err)) {
+        qCritical() << "load profile failed:" << err;
+        return 1;
+    }
+
+    // 3. 导入 Excel
+    dbridge::ImportOptions opts;
+    opts.profileName = "customer_basic";
+    auto r = bridge.importExcel("customers.xlsx", opts);
+
+    if (r.ok) {
+        qInfo() << "导入成功，写入" << r.writtenRows << "行";
+    } else {
+        qWarning() << "导入失败，共" << r.errors.size() << "条错误:";
+        for (const auto& e : r.errors) {
+            qWarning().noquote()
+                << QString("  [%1] row=%2 col=%3 raw='%4' msg=%5")
+                       .arg(e.code).arg(e.row).arg(e.column).arg(e.rawValue).arg(e.message);
+        }
+        return 1;
+    }
+
+    return 0;
+}
+```
+
+#### 步骤 5：CMake 链接
+
+```cmake
+add_subdirectory(third_party/dbridge)
+add_executable(demo main.cpp)
+target_link_libraries(demo PRIVATE dbridge Qt5::Core)
+```
+
+#### 步骤 6：编译运行
+
+```bash
+cmake --build build -j$(nproc)
+./build/demo
+# 期望输出：导入成功，写入 3 行
+```
+
+#### 步骤 7：验证结果
+
+```bash
+sqlite3 demo.db 'SELECT * FROM customer;'
+# 1|C001|张三|13800000001|28
+# 2|C002|李四|13800000002|35
+# 3|C003|王五||42
+```
+
+**恭喜，你已经跑通完整流程！** 后面几节是进阶。
+
+### 14.7 编写 Profile JSON
+
+#### Profile 顶层字段（通用）
+
+```jsonc
+{
+  "profileName": "<给这份 Profile 起的名字>",     // 必填，唯一
+  "sheet":       "<Excel Sheet 标签名>",           // 必填
+  "headerRow":   1,                                // 表头在第几行，1-based
+  "mode":        "singleTable | multiTable | mixed", // 必填
+
+  // 根据 mode 不同，下面写不同字段：
+  // — singleTable: table / conflict / columns
+  // — multiTable:  routes
+  // — mixed:       discriminator / classes
+
+  "exportSpec": { ... }                            // 可选：导出专用配置
+}
+```
+
+#### SingleTable mode 字段
+
+```jsonc
+{
+  "mode": "singleTable",
+  "table": "<DB 表名>",
+  "conflict": { "columns": ["<conflict 列1>", "<conflict 列2>"] },
+  "columns": {
+    "<DB 列名>": {
+      "source": "<Excel 表头列名>",     // 也可以为空（用于自动填充 FK 等）
+      "validators": ["notNull", "int>=0", "regex:^\\d+$"]
+    }
+  }
+}
+```
+
+#### MultiTable mode 字段
+
+```jsonc
+{
+  "mode": "multiTable",
+  "routes": [
+    {
+      "table": "orders",
+      "conflict": { "columns": ["order_no"] },
+      "columns": { ... }
+    },
+    {
+      "table": "order_items",
+      "parent": "orders",                                   // 父表名（必须先于本表写）
+      "fkInject": {
+        "from": "orders.order_no",                          // 父表 .业务键列
+        "to":   "order_items.order_no"                      // 子表 .对应列
+      },
+      "conflict": { "columns": ["order_no", "line_no"] },
+      "columns": { ... }
+    }
+  ]
+}
+```
+
+#### Mixed mode 字段
+
+```jsonc
+{
+  "mode": "mixed",
+  "discriminator": "Type",                                  // Excel 用哪一列判断分类
+  "classes": [
+    {
+      "id": "A",                                            // 这类的标识
+      "matchEquals": "TypeA",                               // discriminator 列等于此值 → 走这一类
+      "routes": [
+        { "table": "table_a", "conflict": {...}, "columns": {...} }
+      ]
+    },
+    {
+      "id": "B",
+      "matchEquals": "TypeB",
+      "routes": [...]
+    }
+  ]
+}
+```
+
+#### `exportSpec`（可选）
+
+```jsonc
+{
+  "exportSpec": {
+    "explicitSql": "SELECT ...",         // 用这条 SQL 而非自动 JOIN
+    "headerOrder": ["CustomerNo", "Name", "Phone"],   // 列顺序
+    "orderBy": ["table.col ASC", "..."],              // 排序键
+    "headerAlias": {                                  // DB 列名 → Excel 表头别名
+      "customer_no": "CustomerNo"
+    }
+  }
+}
+```
+
+### 14.8 验证器（Validators）完整清单
+
+`columns[col].validators` 是一个字符串数组，按顺序应用。
+
+| Token | 作用 | 失败错误码 | 例子 |
+|---|---|---|---|
+| `notNull` | 值不能为空（空字符串视为空） | `E_VALIDATE_NULL` | `["notNull"]` |
+| `len<=N` | 字符串长度 ≤ N | `E_VALIDATE_TYPE` | `["len<=32"]` |
+| `len>=N` | 字符串长度 ≥ N | `E_VALIDATE_TYPE` | `["len>=8"]` |
+| `int` | 必须能解析为整数（输出转 int） | `E_VALIDATE_TYPE` | `["int"]` |
+| `int>=N` | 整数且 ≥ N | `E_VALIDATE_TYPE` | `["int>=0"]` |
+| `int<=N` | 整数且 ≤ N | `E_VALIDATE_TYPE` | `["int<=150"]` |
+| `decimal` | 必须能解析为浮点数 | `E_VALIDATE_TYPE` | `["decimal"]` |
+| `date:FORMAT` | 按指定格式解析日期 | `E_VALIDATE_TYPE` | `["date:yyyy-MM-dd"]` |
+| `regex:PATTERN` | 完整匹配正则 | `E_VALIDATE_REGEX` | `["regex:^[A-Z]\\d{4}$"]` |
+| `enum:A\|B\|C` | 必须是枚举值之一 | `E_VALIDATE_TYPE` | `["enum:Active\|Disabled"]` |
+
+**写组合验证**：
+
+```json
+"validators": ["notNull", "regex:^1\\d{10}$"]
+// 先校验非空，再校验正则
+```
+
+**冲突检测**：`int` / `int>=N` / `decimal` / `date:` 这些**类型规范化**的 token 在同一列里**最多只能有一个**（否则输出类型互相冲突）。违规会在 `loadProfile` 阶段直接报 `E_PROFILE_PARSE`。
+
+> 这是为了避免你写 `["int", "decimal"]` 然后两个 token 互相覆盖最终值。
+
+### 14.9 三种导入模式分步教程
+
+#### 14.9.1 SingleTable：一个 Sheet → 一张表
+
+**适用场景**：Excel 一行 = DB 一张表的一行。最常用。
+
+**例子**：见 14.6。
+
+#### 14.9.2 MultiTable：一个 Sheet → 多张父子表
+
+**适用场景**：Excel 一行包含**订单头**和**订单明细**信息，要拆到两张表。
+
+**SQLite 表：**
+```sql
+CREATE TABLE orders (
+    order_no   TEXT PRIMARY KEY,
+    customer   TEXT NOT NULL,
+    total      INTEGER NOT NULL
+);
+CREATE TABLE order_items (
+    order_no   TEXT NOT NULL,
+    line_no    INTEGER NOT NULL,
+    sku        TEXT NOT NULL,
+    qty        INTEGER NOT NULL,
+    PRIMARY KEY (order_no, line_no),
+    FOREIGN KEY (order_no) REFERENCES orders(order_no)
+);
+```
+
+**Excel：**
+
+| OrderNo | Customer | Total | LineNo | Sku | Qty |
+|---|---|---|---|---|---|
+| O001 | 张三 | 200 | 1 | A1 | 2 |
+| O001 | 张三 | 200 | 2 | B2 | 3 |
+| O002 | 李四 | 100 | 1 | A1 | 1 |
+
+注意 `O001` 重复两次（订单头部分相同，明细不同）——这是合法的。
+
+**Profile：**
+
+```json
+{
+  "profileName": "orders_with_items",
+  "sheet": "Orders",
+  "headerRow": 1,
+  "mode": "multiTable",
+  "routes": [
+    {
+      "table": "orders",
+      "conflict": { "columns": ["order_no"] },
+      "columns": {
+        "order_no": { "source": "OrderNo", "validators": ["notNull"] },
+        "customer": { "source": "Customer", "validators": ["notNull"] },
+        "total":    { "source": "Total",    "validators": ["int>=0"] }
+      }
+    },
+    {
+      "table": "order_items",
+      "parent": "orders",
+      "fkInject": { "from": "orders.order_no", "to": "order_items.order_no" },
+      "conflict": { "columns": ["order_no", "line_no"] },
+      "columns": {
+        "line_no": { "source": "LineNo", "validators": ["int>=1"] },
+        "sku":     { "source": "Sku",    "validators": ["notNull"] },
+        "qty":     { "source": "Qty",    "validators": ["int>=1"] }
+      }
+    }
+  ]
+}
+```
+
+**流程**：
+1. Excel 一行 → Mapper 拆成 2 个 RoutePayload（一个写 orders，一个写 order_items）
+2. FK Injection：`orders.order_no` 注入到 `order_items.order_no`（即使 Excel 列名相同也会做这一步，确保一致）
+3. BatchUniqueness：因为 `O001` 重复出现，orders 的两次去重会合并；order_items 因为 `(order_no, line_no)` 不同，不去重
+4. Phase D：先写 orders（拓扑前），再写 order_items
+
+#### 14.9.3 Mixed：一个 Sheet → A/B/C 多类行
+
+**适用场景**：Excel 第一列是 `Type`，根据值不同走不同表组。
+
+**Excel：**
+
+| Type | ColA1 | ColA2 | ColB1 |
+|---|---|---|---|
+| A | a1-1 | a2-1 |  |
+| B |  |  | b1-1 |
+| A | a1-2 | a2-2 |  |
+
+**Profile：**
+
+```json
+{
+  "profileName": "mixed_a_b",
+  "sheet": "Data",
+  "headerRow": 1,
+  "mode": "mixed",
+  "discriminator": "Type",
+  "classes": [
+    {
+      "id": "A",
+      "matchEquals": "A",
+      "routes": [
+        {
+          "table": "table_a",
+          "conflict": { "columns": ["col_a1"] },
+          "columns": {
+            "col_a1": { "source": "ColA1", "validators": ["notNull"] },
+            "col_a2": { "source": "ColA2" }
+          }
+        }
+      ]
+    },
+    {
+      "id": "B",
+      "matchEquals": "B",
+      "routes": [
+        {
+          "table": "table_b",
+          "conflict": { "columns": ["col_b1"] },
+          "columns": {
+            "col_b1": { "source": "ColB1", "validators": ["notNull"] }
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+**注意**：`matchEquals` 在所有 classes 内**必须唯一**——重复会在 Router init 时报错。
+
+### 14.10 导出 Excel 教程
+
+#### 14.10.1 最简：SingleTable 全表导出
+
+```cpp
+dbridge::ExportOptions opts;
+opts.profileName = "customer_basic";
+auto r = bridge.exportExcel("out.xlsx", opts);
+```
+
+会生成 SQL：`SELECT customer_no AS CustomerNo, name AS Name, phone AS Phone, age AS Age FROM customer`，然后写入 xlsx。
+
+#### 14.10.2 自定义列顺序 / 排序
+
+在 Profile 加 `exportSpec`：
+
+```json
+{
+  ...
+  "exportSpec": {
+    "headerOrder": ["Name", "Phone", "CustomerNo", "Age"],
+    "orderBy": ["customer.customer_no ASC"]
+  }
+}
+```
+
+#### 14.10.3 用自定义 SQL（最灵活）
+
+```json
+{
+  "exportSpec": {
+    "explicitSql": "SELECT c.customer_no AS CustomerNo, c.name AS Name, COUNT(o.order_no) AS OrderCount FROM customer c LEFT JOIN orders o ON o.customer = c.name GROUP BY c.customer_no ORDER BY OrderCount DESC"
+  }
+}
+```
+
+此时 columns 字段被忽略，列顺序按 SELECT 的别名顺序。
+
+#### 14.10.4 MultiTable 导出（自动 LEFT JOIN）
+
+`exportSpec.explicitSql` 不填时，库会按 routes 的 `parent` + `fkInject` 自动生成 LEFT JOIN。
+
+```sql
+SELECT o.order_no AS OrderNo, o.customer AS Customer, oi.line_no AS LineNo, oi.sku AS Sku
+FROM orders o
+LEFT JOIN order_items oi ON oi.order_no = o.order_no
+```
+
+#### 14.10.5 Mixed 导出
+
+每个 class 跑一次 SELECT，结果按 `classColumn` 合并到一个表里，按 `orderBy` 多键稳定排序。
+
+### 14.11 自动生成 Profile（AutoProfile）
+
+适用场景：你的表已经在 DB 里了，懒得手写 Profile JSON。
+
+```cpp
+QString err;
+QString draft = bridge.generateAutoProfileJson("customer", &err);
+if (draft.isEmpty()) {
+    qWarning() << "生成失败：" << err;
+    return;
+}
+
+// 写到文件让运维 / DBA 编辑
+QFile f("draft.json");
+f.open(QIODevice::WriteOnly);
+f.write(draft.toUtf8());
+```
+
+**AutoProfile 的默认决策规则**：
+
+| 自动行为 | 触发条件 |
+|---|---|
+| `conflict.columns` 选主键 | 主键不是 AUTOINCREMENT 单列时 |
+| `conflict.columns` 选 UNIQUE 索引 | 没有可用主键时退而求其次 |
+| 跳过 AUTOINCREMENT 列 | 该列既不在 conflict 也不在 columns 里（让 DB 自增） |
+| 跳过 GENERATED 列 | 一律不写 |
+| validators 自动推断 | 类型是 INTEGER → `["int"]`；NOT NULL → 加 `notNull`；TEXT 且有长度 → `len<=N` |
+
+生成后**强烈建议人工 review**：
+- source 列名（库里默认用 `dbColumn` 转 PascalCase，可能不对）
+- 缺失的业务校验（如手机号正则）
+
+### 14.12 错误处理模式
+
+#### 14.12.1 区分表级错误和行级错误
+
+```cpp
+auto r = bridge.importExcel(path, opts);
+for (const auto& e : r.errors) {
+    if (e.row == 0) {
+        // 表级错误：profile/schema 问题，整体不可继续
+        qCritical() << "[TABLE]" << e.code << e.message;
+    } else {
+        // 行级错误：第 e.row 行某列出问题
+        qWarning() << "[ROW]" << e.row << e.column << e.code << e.message;
+    }
+}
+```
+
+#### 14.12.2 把错误回填给用户（UI 高亮）
+
+```cpp
+// 假设 ui.table 是 QTableWidget 已经把 Excel 内容显示出来
+for (const auto& e : r.errors) {
+    if (e.row >= 1 && !e.column.isEmpty()) {
+        int colIdx = findColumnByHeader(ui.table, e.column);
+        if (colIdx >= 0) {
+            auto* item = ui.table->item(e.row - 1, colIdx);  // Excel 1-based → Qt 0-based
+            item->setBackground(QBrush(Qt::red));
+            item->setToolTip(e.code + ": " + e.message);
+        }
+    }
+}
+```
+
+#### 14.12.3 失败重试策略
+
+dbridge 是 **all-or-nothing**：失败时 `writtenRows = 0`，DB 没有任何写入。用户改完 Excel 直接重跑即可，**不需要回滚**。
+
+### 14.13 CLI 工具完整参考
+
+CMake 构建后会生成 `build/examples/cli/dbridge-cli`。
+
+```bash
+dbridge-cli <db_path> <profile_json> <xlsx_path> [import|export]
+```
+
+| 参数 | 含义 | 例子 |
+|---|---|---|
+| `db_path` | SQLite 文件路径，不存在则创建 | `demo.db` |
+| `profile_json` | Profile JSON 文件路径 | `customer_basic.json` |
+| `xlsx_path` | Excel 文件路径 | `customers.xlsx` |
+| `import\|export` | 模式（默认 `import`） | `import` |
+
+**例子**：
+
+```bash
+# 导入
+./build/examples/cli/dbridge-cli demo.db customer_basic.json customers.xlsx import
+
+# 导出
+./build/examples/cli/dbridge-cli demo.db customer_basic.json out.xlsx export
+```
+
+返回值：
+- `0`：成功
+- `1`：失败（stderr 打印错误详情）
+
+### 14.14 性能调优与实用技巧
+
+#### 14.14.1 提速建议（按收益排序）
+
+1. **保持 `enableWal = true`**：默认就开，别关。
+2. **批量大小**：MVP 单批最多 N 行（受内存约束）；如要导入百万行，考虑分批写多个 Excel（每批 5 万-10 万行）。
+3. **预编译查询缓存**：库内部已经对每张表的 upsert SQL 缓存了 `QSqlQuery`，无需手动优化。
+4. **关闭 `foreign_keys`**：如果你**完全信任** Excel 数据的外键完整性，可在 `open()` 后手动 `PRAGMA foreign_keys = OFF`（但 dbridge 默认开启，不建议关）。
+5. **建好索引**：conflict 列必须是主键或 UNIQUE 索引，否则 ON CONFLICT 不工作。
+
+#### 14.14.2 内存控制
+
+QXlsx 全量内存读取，**百万行 Excel 可能爆内存**。当前 MVP 没有流式读，超大数据请：
+- 拆成多个文件分批导
+- 或直接用 `sqlite3 .import csv` 跳过 dbridge
+
+#### 14.14.3 并发模式
+
+`QSqlDatabase` **不能跨线程共享**。如果要在工作线程导入：
+
+```cpp
+// 工作线程内：
+dbridge::DataBridge bridge;          // 这个线程独享
+dbridge::ConnectionSpec cs;
+cs.sqlitePath = "demo.db";
+bridge.open(cs);                     // 这个连接是本线程的
+// ... 后续操作 ...
+```
+
+每个线程一个 `DataBridge` + 一个 SQLite 连接。WAL 模式下多读单写不冲突。
+
+### 14.15 常见坑与排查
+
+| 现象 | 原因 | 解决 |
+|---|---|---|
+| `open()` 返回 `E_OPEN_DB: SQLite version X < 3.24.0` | Qt 自带 SQLite 太旧 | 升级 Qt 到 5.12+ 或重编 Qt5::Sql 链接系统 SQLite |
+| `loadProfile` 返回 `E_PROFILE_TABLE_NOT_FOUND` | Profile 声明的表 DB 里没有 | 先建表 / 修正 Profile 的 `table` 字段 |
+| `loadProfile` 返回 `E_PROFILE_NO_CONFLICT_KEY` | `conflict.columns` 不是主键 / UNIQUE | 给目标列加 UNIQUE 约束 |
+| 导入时所有行都 `E_HEADER_NOT_FOUND` | `headerRow` 写错（如表头在第 2 行但 Profile 写了 `1`） | 修 Profile `headerRow` |
+| 大量 `E_VALIDATE_DUPLICATE` | conflict key 在 Excel 内重复 | 检查 Excel 是否真的有重复，或 conflict 列选错 |
+| Mixed 模式 `E_ROUTE_UNMATCHED` | discriminator 值没有对应 class | 加 class 或检查值 |
+| 导入成功但 `writtenRows == 0` | Phase C 校验全错（不进 Phase D） | 看 `errors` 列表，逐条修 |
+| 中文表头打不开 / 乱码 | Excel 文件不是 UTF-8 | 用 LibreOffice / Excel 另存为 `.xlsx`（而非 .xls） |
+| `query.prepare failed: no such table` | Phase D 写表时 DB 表名错 | 复检 Profile `table` 与实际 DB 表名（区分大小写） |
+| 外键报错 `E_VALIDATE_FK` 但父行明明在 Excel 里 | Mixed/MultiTable 中父表晚于子表声明 | TopoSorter 是按 `parent` 字段排序的——检查父表声明顺序，或父表没填 conflict 列 |
+
+#### 调试技巧
+
+1. **先用 CLI 试**：把代码集成前，用 `dbridge-cli` 验证 Profile + Excel + DB 三者能否跑通。
+2. **看 SQL**：在 `QSqlQuery::exec` 前打开 `QT_DEBUG_PLUGINS=1`，或在 ImportService 临时插 `qDebug() << sql` 看实际生成的 SQL。
+3. **小数据迭代**：先用 3 行 Excel 跑通整个流程，再扩展到真实数据。
+4. **用 `generateAutoProfileJson` 兜底**：手写 Profile 错了，让库帮你生成一份"标准答案"对照。
 
 ---
 

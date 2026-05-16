@@ -538,7 +538,7 @@ graph TB
     M --> RP[RoutePayload<br/>一张表一行数据]
     T --> M
 
-    RP --> FI[FkInjector<br/>父业务键 → 子 payload]
+    RP --> FI[doFkInject（ImportService 内部）<br/>父业务键 → 子 payload]
     FI --> RP2[修正后的 payloads]
     RP2 --> BU[BatchUniqueness<br/>conflict key 去重]
     BU --> Final[确认的 RowContext]
@@ -548,7 +548,12 @@ graph TB
     style Final fill:#bfb,stroke:#333
 ```
 
-**为什么 `FkInjector` 要在 `BatchUniqueness` 之前？**
+> **实现注意**：`FkInjector.cpp` 中的 `inject()` 方法是一个空存根（直接返回 `true`）。
+> 真正的注入逻辑通过 `ImportService.cpp` 内的静态函数 `doFkInject()` 实现，
+> 这样可以直接访问 `RouteSpec` 中的 `fkInject` 字段，无需额外传参。
+> 上图中 `doFkInject` 在逻辑上归属于 ImportService，而非独立模块调用。
+
+**为什么 FK 注入要在 `BatchUniqueness` 之前？**
 - 子表的 conflict key 通常包含父业务键（如 `order_items` 的 `(order_no, line_no)`）。
 - 必须先把父 `order_no` 注入到子 payload，才能算出完整的 conflict key 去查重。
 - 顺序错了 → 子 payload 的 conflict 值有空洞 → 去重失效。
@@ -659,7 +664,7 @@ flowchart TB
     valChain -->|失败| eVal[errors.add, 继续下一列]
     valChain -->|成功| putP[append 到 payload.dbColumns/binds]
 
-    putP --> fk[FkInjector.inject<br/>父 payload 业务键写入子 payload]
+    putP --> fk[doFkInject（ImportService 内部）<br/>父 payload 业务键写入子 payload]
     fk --> uniq[BatchUniqueness.check<br/>同 conflictKey 是否已见过]
     uniq -->|父行重复且 binds 一致| skip[允许 — 一对多场景父去重]
     uniq -->|真重复| eDup[E_VALIDATE_DUPLICATE]
@@ -783,7 +788,6 @@ sequenceDiagram
     participant PV as ProfileValidator
     participant MP as Mapper
     participant VC as ValidatorChain
-    participant FI as FkInjector
     participant BU as BatchUniqueness
     participant FKP as ForeignKeyPreflight
     participant SB as SqlBuilder
@@ -818,7 +822,7 @@ sequenceDiagram
             VC-->>MP: ok 或 errors.add
         end
         MP-->>IS: payloads（每张表一份）
-        IS->>FI: inject 父业务键到子
+        IS->>IS: doFkInject 父业务键到子 (内部静态函数)
         IS->>BU: check 批内重复
     end
 
@@ -830,13 +834,16 @@ sequenceDiagram
 
     Note over IS,SQ: Phase D：单事务落库
     IS->>SQ: db.transaction()
-    loop 每个 RoutePayload
-        IS->>SB: buildUpsert(payload)
-        SB-->>IS: INSERT ... ON CONFLICT DO UPDATE
-        IS->>SQ: query.prepare (缓存)
-        IS->>SQ: addBindValue × N
-        IS->>SQ: exec
-        SQ-->>IS: 失败 → rollback, 返回
+    loop 每个 RowContext（对应一行 Excel）
+        loop 每个 RoutePayload（对应一张目标表）
+            IS->>SB: buildUpsert(payload)
+            SB-->>IS: INSERT ... ON CONFLICT DO UPDATE
+            IS->>SQ: query.prepare (缓存)
+            IS->>SQ: addBindValue × N
+            IS->>SQ: exec
+            SQ-->>IS: 失败 → rollback, 返回
+        end
+        IS->>IS: writtenRows++（每行 Excel 写完才 +1）
     end
     IS->>SQ: db.commit()
     IS-->>DB: ImportResult

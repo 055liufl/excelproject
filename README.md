@@ -724,8 +724,8 @@ flowchart TB
     col --> place[placeholders = ?, ?, ?...]
     place --> upd[updateParts = 非 conflict 列 → col = excluded.col]
     upd --> isEmpty{updateParts 空?}
-    isEmpty -->|是<br/>所有列都是 conflict 列| nothing[ON CONFLICT(...) DO NOTHING]
-    isEmpty -->|否| update[ON CONFLICT(...) DO UPDATE SET ...]
+    isEmpty -->|是<br/>所有列都是 conflict 列| nothing["ON CONFLICT(...) DO NOTHING"]
+    isEmpty -->|否| update["ON CONFLICT(...) DO UPDATE SET ..."]
     nothing --> sql["INSERT INTO t (cols)<br/>VALUES (?,?,...)<br/>ON CONFLICT(key) DO ..."]
     update --> sql
     sql --> done([返回 UpsertSql])

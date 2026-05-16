@@ -165,7 +165,7 @@ SELECT COUNT(*) FROM order_items WHERE order_no IS NULL;   -- I-V3：期望 0
   export
 ```
 
-对账：
+对账（`tools/xlsx2csv.py` 是纯 stdlib 实现，默认 dump 第一个 sheet；如需指定 sheet 加 `--sheet Orders`）：
 
 ```bash
 python3 tools/xlsx2csv.py tests/data/xlsx/Orders.xlsx  > /tmp/in_I.csv
@@ -463,7 +463,7 @@ SELECT COUNT(*) FROM invoice_lines   WHERE invoice_no  NOT IN (SELECT invoice_no
 - A 行 / B 行 / C 行各自占据相应的列分组，其他列为空 —— 与输入对称。
 - 行总数 = `order_items` 2 + `shipment_legs` 2 + `invoice_lines` 2 = 6，恰好等于输入 6 行。
 
-对账：
+对账（参见 §I-4.3 关于 `tools/xlsx2csv.py` 的说明）：
 
 ```bash
 python3 tools/xlsx2csv.py tests/data/xlsx/Mixed.xlsx  > /tmp/in_II.csv
@@ -512,13 +512,13 @@ SELECT (SELECT COUNT(*) FROM orders)
 |---|---|---|
 | `tests/data/sql/02_orders.sql` | ✅ | 场景 I schema |
 | `tests/data/profiles/order_m_set.json` | ✅ | 场景 I Profile |
-| `tests/data/xlsx/Orders.xlsx` | ❌ 待补 | 场景 I 输入 Excel（按 §I-3.2 构造） |
-| `tests/data/sql/04_mixed_multitable.sql` | ❌ 建议新增 | 场景 II schema |
-| `tests/data/profiles/mixed_abc_multitable.json` | ❌ 建议新增 | 场景 II Profile |
-| `tests/data/xlsx/Mixed.xlsx` | ❌ 待补 | 场景 II 输入 Excel（按 §II-3.2 构造） |
-| `tools/xlsx2csv.py` | ❌ 由验证者准备 | 对账辅助脚本（与本工程独立） |
+| `tests/data/xlsx/Orders.xlsx` | ❌ 待补 | 场景 I 输入 Excel（按 §I-3.2 构造，xlsx 二进制不签入仓库） |
+| `tests/data/sql/04_mixed_multitable.sql` | ✅ | 场景 II schema |
+| `tests/data/profiles/mixed_abc_multitable.json` | ✅ | 场景 II Profile |
+| `tests/data/xlsx/Mixed.xlsx` | ❌ 待补 | 场景 II 输入 Excel（按 §II-3.2 构造，xlsx 二进制不签入仓库） |
+| `tools/xlsx2csv.py` | ✅ | 对账辅助脚本（纯 Python 标准库实现，无外部依赖） |
 
-建议把上面所有"❌ 建议新增 / 待补"项作为后续 PR 沉淀为 `tests/integration/tst_row_to_multitable.cpp` 的夹具，与 `tests/integration/tst_import_single.cpp` 共存。
+`Orders.xlsx` 与 `Mixed.xlsx` 是二进制文件，按惯例不直接签入仓库——由验证执行者依照 §I-3.2 / §II-3.2 的表格内容用 Excel / LibreOffice / `openpyxl` 构造即可。后续若要把这两份 xlsx 也沉淀为可重复夹具，建议增加 `tools/build_fixtures.py` 从 JSON 描述用 QXlsx/openpyxl 重新生成。
 
 ---
 

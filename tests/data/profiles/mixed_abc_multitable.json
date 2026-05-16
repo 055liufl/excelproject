@@ -1,0 +1,92 @@
+{
+    "profileName": "mixed_abc_multitable",
+    "sheet": "Mixed",
+    "headerRow": 1,
+    "mode": "mixed",
+    "discriminator": {
+        "source": "Type"
+    },
+    "classes": [
+        {
+            "id": "A",
+            "match": {"equals": "A"},
+            "routes": [
+                {
+                    "table": "orders",
+                    "conflict": {"columns": ["order_no"]},
+                    "columns": {
+                        "order_no": {"source": "OrderNo", "validators": ["notNull"]},
+                        "customer": {"source": "Customer", "validators": ["notNull"]},
+                        "amount": {"source": "Amount", "validators": ["decimal"]}
+                    }
+                },
+                {
+                    "table": "order_items",
+                    "parent": "orders",
+                    "fkInject": {"from": "orders.order_no", "to": "order_items.order_no"},
+                    "conflict": {"columns": ["order_no", "line_no"]},
+                    "columns": {
+                        "line_no": {"source": "LineNo", "validators": ["int>=1"]},
+                        "sku": {"source": "Sku", "validators": ["notNull"]},
+                        "qty": {"source": "Qty", "validators": ["int>=1"]}
+                    }
+                }
+            ]
+        },
+        {
+            "id": "B",
+            "match": {"equals": "B"},
+            "routes": [
+                {
+                    "table": "shipments",
+                    "conflict": {"columns": ["shipment_no"]},
+                    "columns": {
+                        "shipment_no": {"source": "ShipmentNo", "validators": ["notNull"]},
+                        "carrier": {"source": "Carrier", "validators": ["notNull"]},
+                        "eta": {"source": "ETA", "validators": ["date:yyyy-MM-dd"]}
+                    }
+                },
+                {
+                    "table": "shipment_legs",
+                    "parent": "shipments",
+                    "fkInject": {"from": "shipments.shipment_no", "to": "shipment_legs.shipment_no"},
+                    "conflict": {"columns": ["shipment_no", "leg_no"]},
+                    "columns": {
+                        "leg_no": {"source": "LegNo", "validators": ["int>=1"]},
+                        "origin": {"source": "Origin", "validators": ["notNull"]},
+                        "dest": {"source": "Dest", "validators": ["notNull"]}
+                    }
+                }
+            ]
+        },
+        {
+            "id": "C",
+            "match": {"equals": "C"},
+            "routes": [
+                {
+                    "table": "invoices",
+                    "conflict": {"columns": ["invoice_no"]},
+                    "columns": {
+                        "invoice_no": {"source": "InvoiceNo", "validators": ["notNull"]},
+                        "bill_to": {"source": "BillTo", "validators": ["notNull"]},
+                        "total": {"source": "Total", "validators": ["decimal"]}
+                    }
+                },
+                {
+                    "table": "invoice_lines",
+                    "parent": "invoices",
+                    "fkInject": {"from": "invoices.invoice_no", "to": "invoice_lines.invoice_no"},
+                    "conflict": {"columns": ["invoice_no", "line_no"]},
+                    "columns": {
+                        "line_no": {"source": "InvLineNo", "validators": ["int>=1"]},
+                        "item": {"source": "Item", "validators": ["notNull"]},
+                        "price": {"source": "Price", "validators": ["decimal"]}
+                    }
+                }
+            ]
+        }
+    ],
+    "export": {
+        "classColumn": "Type"
+    }
+}

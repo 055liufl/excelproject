@@ -58,3 +58,8 @@ target_compile_options(
 if(BUILD_TESTING)
   add_subdirectory(tests)
 endif()
+
+option(DBRIDGE_BUILD_EXAMPLES "Build dbridge example programs" ON)
+if(DBRIDGE_BUILD_EXAMPLES)
+  add_subdirectory(examples)
+endif()

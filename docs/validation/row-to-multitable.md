@@ -10,10 +10,10 @@
 
 本文按"两个并列场景"组织，分别覆盖 MVP 设计 §1 中关于「行 ↔ 表集合」映射的两个硬目标：
 
-| 场景 | 一句话 | 对应 MVP 目标 | 与现有仓库夹具的关系 |
+| 场景 | 一句话 | 对应 MVP 目标 | 仓库夹具 |
 |---|---|---|---|
-| **场景 I**：单类行 → 多表集合 | 同一个 Sheet 的**每一行**同时进入父表+子表（m 集合） | §1.4 | 复用 `tests/data/profiles/order_m_set.json` + `tests/data/sql/02_orders.sql` |
-| **场景 II**：多类行 → 各自的不同表集合 | 同一个 Sheet 中**多行 A/B/C**，每一类各自落入不同的多表集合（m / n / o） | §1.5 | 现有 `tests/data/profiles/mixed_abc.json` 是**单表精简版**（m1/n1/o1）；本场景将每个 class 加强为多表父子集合，给出建议夹具路径 |
+| **场景 I**：单类行 → 多表集合 | 同一个 Sheet 的**每一行**同时进入父表+子表（m 集合） | §1.4 | ✅ `tests/data/profiles/order_m_set.json` + `tests/data/sql/02_orders.sql`（Orders.xlsx 本地构造） |
+| **场景 II**：多类行 → 各自的不同表集合 | 同一个 Sheet 中**多行 A/B/C**，每一类各自落入不同的多表集合（m / n / o） | §1.5 | ✅ `tests/data/profiles/mixed_abc_multitable.json` + `tests/data/sql/04_mixed_multitable.sql`（Mixed.xlsx 本地构造）；另有 `tests/data/profiles/mixed_abc.json` 作为单表精简版（m1/n1/o1）保留，与本场景互不替代 |
 
 两个场景互补：
 - 场景 I 证明"**一行**可以同时进**多张表**"。
@@ -88,7 +88,7 @@ sqlite3 /tmp/scenarioI.db < tests/data/sql/02_orders.sql
 sqlite3 /tmp/scenarioI.db "PRAGMA foreign_keys = ON; SELECT sqlite_version();"   # ≥ 3.24.0
 ```
 
-### I-3.2 Excel 输入（建议路径 `tests/data/xlsx/Orders.xlsx`）
+### I-3.2 Excel 输入（本地构造，约定路径 `tests/data/xlsx/Orders.xlsx`）
 
 单 Sheet 名 `Orders`，第 1 行为表头，**共 4 行业务数据**：
 
@@ -189,7 +189,9 @@ sort /tmp/out_I.csv | sha256sum   # 应与 in_I 完全一致
 
 # 场景 II：多类行 → 各自的不同表集合（m / n / o）
 
-> **现状提示**：仓库中已存在的 `tests/data/profiles/mixed_abc.json` + `tests/data/sql/03_mixed.sql` 只把每个 class 路由到**单张**目标表（m1 / n1 / o1），用以最小化覆盖 §1.5 鉴别逻辑。本场景把每个 class 加强为**多表父子集合**，以真正验证 "不同行对应不同表**集合**"（而不仅是不同表）。建议把下面的 schema / profile / 数据签入到 `tests/data/sql/04_mixed_multitable.sql`、`tests/data/profiles/mixed_abc_multitable.json`、`tests/data/xlsx/Mixed.xlsx`。
+> **夹具状态**：本场景的 schema / Profile 已签入仓库（路径见 §II-3.1 / §II-3.3）。`Mixed.xlsx` 是 xlsx 二进制不签入仓库，按 §II-3.2 表格在本地构造即可。本场景已在 master HEAD 通过端到端验证：6 张表行数、FK 完整性、A/B/C 集合互不污染、日期字段 ISO 形态均符合预期；mixed 模式下的 FK 预校验路径由 `tst_fk_preflight` 单元测试守护，避免历史误报 `E_VALIDATE_FK` 的回归。
+>
+> 仓库中另有 `tests/data/profiles/mixed_abc.json` + `tests/data/sql/03_mixed.sql`，把每个 class 路由到**单张**目标表（m1 / n1 / o1），用以最小化覆盖 §1.5 鉴别逻辑——与本场景并存，互不替代。
 
 ## II-1 验证目标
 
@@ -227,7 +229,9 @@ SQLite: scenarioII.db
 
 ## II-3 数据准备
 
-### II-3.1 Schema（建议路径 `tests/data/sql/04_mixed_multitable.sql`）
+### II-3.1 Schema（路径 `tests/data/sql/04_mixed_multitable.sql`）
+
+> 以下为可读形态；签入版本使用 `CREATE TABLE IF NOT EXISTS`，便于重复初始化。`PRAGMA foreign_keys = ON;` 由宿主在 `DataBridge::open` 后自行开启，签入文件不重复写。
 
 ```sql
 PRAGMA foreign_keys = ON;
@@ -278,7 +282,7 @@ CREATE TABLE invoice_lines (
 );
 ```
 
-### II-3.2 Excel 输入（建议路径 `tests/data/xlsx/Mixed.xlsx`）
+### II-3.2 Excel 输入（本地构造，约定路径 `tests/data/xlsx/Mixed.xlsx`）
 
 单 Sheet 名 `Mixed`，第 1 行表头是 **A/B/C 三类列的并集 + `Type` 鉴别列**。每一行只填写自己 class 需要的列，其他单元格留空。**共 6 行业务数据**：
 
@@ -306,7 +310,7 @@ CREATE TABLE invoice_lines (
 - 每一类内部都至少 2 张表 + 父子 FK 注入 = 验证 II-V5；这是"集合"二字的物质化体现。
 - A 行的 `SO-001` 在 2 行中重复 → 复用 §6.4 父行去重逻辑。
 
-### II-3.3 Profile（建议路径 `tests/data/profiles/mixed_abc_multitable.json`）
+### II-3.3 Profile（路径 `tests/data/profiles/mixed_abc_multitable.json`）
 
 ```json
 {
@@ -480,6 +484,7 @@ sort /tmp/out_II.csv | sha256sum   # 应一致
 | 跨集合污染尝试 | 把 C 行 `Type` 误填为 `A`，但 `OrderNo` 列为空 | `E_VALIDATE_NULL`（A class 的 `OrderNo`） | 6 张表全部 0 |
 | n 集合 FK 缺失 | B 行 `ShipmentNo` 清空 | `E_VALIDATE_NULL` | 6 张表全部 0 |
 | 子行业务键越界 | C 行 `InvLineNo` 改成 0 | `E_VALIDATE_INT`（`int>=1`） | 6 张表全部 0 |
+| FK 父行批/库均缺失 | 子行 FK 值在批内与 DB 中都查不到 | `E_VALIDATE_FK` —— 单元回归用例 `tst_fk_preflight::testParentMissing` 覆盖 | 6 张表全部 0 |
 
 每个用例运行后均执行：
 
@@ -590,11 +595,12 @@ sort /tmp/out.csv | sha256sum
 |---|---|---|
 | `tests/data/sql/02_orders.sql` | ✅ | 场景 I schema |
 | `tests/data/profiles/order_m_set.json` | ✅ | 场景 I Profile |
-| `tests/data/xlsx/Orders.xlsx` | ❌ 待补 | 场景 I 输入 Excel（按 §I-3.2 构造，xlsx 二进制不签入仓库） |
+| `tests/data/xlsx/Orders.xlsx` | ❌ 本地构造 | 场景 I 输入 Excel（按 §I-3.2 构造，xlsx 二进制不签入仓库） |
 | `tests/data/sql/04_mixed_multitable.sql` | ✅ | 场景 II schema |
 | `tests/data/profiles/mixed_abc_multitable.json` | ✅ | 场景 II Profile |
-| `tests/data/xlsx/Mixed.xlsx` | ❌ 待补 | 场景 II 输入 Excel（按 §II-3.2 构造，xlsx 二进制不签入仓库） |
+| `tests/data/xlsx/Mixed.xlsx` | ❌ 本地构造 | 场景 II 输入 Excel（按 §II-3.2 构造，xlsx 二进制不签入仓库） |
 | `tools/xlsx2csv.py` | ✅ | 对账辅助脚本（纯 Python 标准库实现，无外部依赖） |
+| `tests/unit/tst_fk_preflight.cpp` | ✅ | mixed 模式 FK 预校验回归测试（4 用例，含 `testMixedParentInBatch` / `testParentMissing`） |
 
 `Orders.xlsx` 与 `Mixed.xlsx` 是二进制文件，按惯例不直接签入仓库——由验证执行者依照 §I-3.2 / §II-3.2 的表格内容用 Excel / LibreOffice / `openpyxl` 构造即可。后续若要把这两份 xlsx 也沉淀为可重复夹具，建议增加 `tools/build_fixtures.py` 从 JSON 描述用 QXlsx/openpyxl 重新生成。
 
@@ -603,6 +609,8 @@ sort /tmp/out.csv | sha256sum
 ## 相关文档
 
 - 项目主 [`README.md`](../../README.md) — dbridge 用法、API、构建（§14 完整使用指南）
+  - [§14.13.2 `tools/xlsx2csv.py` 简介](../../README.md#14132-toolsxlsx2csvpy验证对账脚本)
+  - [§14.16 端到端验证流程入口](../../README.md#1416-端到端验证流程)
 - `specs/MVP-Qt-SQLite-Excel-批量导入导出-实现设计.md` — MVP 行为契约（§1.4 单类多表 / §1.5 混编 / §5 Profile 设计）
 - `specs/Qt-SQLite-Excel-批量导入导出-实现文档.md` — 模块/算法/SQL 模板（§6.3 拓扑 / §6.6 FK 注入 / §6.7 Discriminator）
 - `specs/Qt-SQLite-Excel-批量导入导出-设计文档.md` — 完整方案与长期取舍

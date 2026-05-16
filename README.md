@@ -157,8 +157,22 @@ dbridge/
 │       └── ExportService.*             ← 导出主流程
 │
 ├── 3rdparty/QXlsx/                     ← QXlsx 第三方库（vendored）
-├── tests/                              ← 单元 + 集成测试
-└── examples/cli/                       ← 命令行示例程序
+│
+├── tests/                              ← 单元 + 集成测试（9 套，CMake 列在 tests/CMakeLists.txt）
+│   ├── unit/                           ← 模块级单元测试（Profile/Schema/Validators/SqlBuilder/Mapper/Router/TopoSorter/FkPreflight ...）
+│   ├── integration/                    ← DataBridge 端到端集成
+│   └── data/                           ← 测试夹具
+│       ├── sql/                        ← schema 初始化 SQL（01_customer / 02_orders / 03_mixed / 04_mixed_multitable）
+│       └── profiles/                   ← Profile JSON 夹具（customer_basic / order_m_set / mixed_abc / mixed_abc_multitable）
+│
+├── examples/cli/                       ← 命令行示例程序（dbridge-cli）
+│
+├── tools/                              ← 配套脚本（独立于库本体）
+│   └── xlsx2csv.py                     ← 纯 Python stdlib，xlsx → CSV，用于导出对账（详见 §14.13.2）
+│
+└── docs/
+    └── validation/
+        └── row-to-multitable.md        ← 端到端验证流程（场景 I / II，详见 §14.16）
 ```
 
 **新手提示**：看代码先看 `service/`，那里是主流程；看主流程时遇到不懂的模块（比如 `Mapper`），
@@ -1218,10 +1232,12 @@ cmake --build build -j$(nproc)
 
 ```bash
 cd build
-ctest --output-on-failure          # 全部测试
+ctest --output-on-failure          # 全部 9 个测试套件
 ctest --output-on-failure -V       # 详细日志
-ctest -R profile_loader_test       # 只跑某个测试
+ctest -R tst_profile_loader        # 只跑某个测试（套件名见 tests/CMakeLists.txt）
 ```
+
+完整套件清单见 `tests/CMakeLists.txt`；其中 `tst_fk_preflight` 锁定 mixed 模式 FK 预校验回归（详见 §14.16 端到端验证流程）。
 
 #### 14.2.5 安装（可选）
 
@@ -1983,7 +1999,11 @@ for (const auto& e : r.errors) {
 
 dbridge 是 **all-or-nothing**：失败时 `writtenRows = 0`，DB 没有任何写入。用户改完 Excel 直接重跑即可，**不需要回滚**。
 
-### 14.13 CLI 工具完整参考
+### 14.13 CLI 与辅助工具完整参考
+
+仓库提供两个命令行工具：`examples/cli/dbridge-cli`（库自带的最小示例）与 `tools/xlsx2csv.py`（验证流程配套对账脚本）。
+
+#### 14.13.1 `dbridge-cli`（库示例）
 
 CMake 构建后会生成 `build/examples/cli/dbridge-cli`。
 
@@ -2011,6 +2031,19 @@ dbridge-cli <db_path> <profile_json> <xlsx_path> [import|export]
 返回值：
 - `0`：成功
 - `1`：失败（stderr 打印错误详情）
+
+#### 14.13.2 `tools/xlsx2csv.py`（验证对账脚本）
+
+xlsx → CSV 转储器，**纯 Python 标准库**实现（`zipfile` + `xml.etree`），不需要 `pip install`。
+读 `xl/styles.xml` 识别日期/时间样式，把序列号还原为 ISO 字符串。
+
+```bash
+python3 tools/xlsx2csv.py <path.xlsx> [--sheet <name>]
+```
+
+主要用途：在导入 + 导出之后把两份 xlsx 拉平成 CSV，`sort | sha256sum` 做对账（用例见 §14.16）。
+
+**详细解析能力、日期换算、局限、对账配方**见 `docs/validation/row-to-multitable.md` 的 [§工具：`tools/xlsx2csv.py`](docs/validation/row-to-multitable.md#工具toolsxlsx2csvpy)（这里不重复）。
 
 ### 14.14 性能调优与实用技巧
 
@@ -2064,6 +2097,27 @@ bridge.open(cs);                     // 这个连接是本线程的
 2. **看 SQL**：在 `QSqlQuery::exec` 前打开 `QT_DEBUG_PLUGINS=1`，或在 ImportService 临时插 `qDebug() << sql` 看实际生成的 SQL。
 3. **小数据迭代**：先用 3 行 Excel 跑通整个流程，再扩展到真实数据。
 4. **用 `generateAutoProfileJson` 兜底**：手写 Profile 错了，让库帮你生成一份"标准答案"对照。
+
+### 14.16 端到端验证流程
+
+dbridge 在仓库内提供两个独立可复跑的端到端验证场景，对应 MVP 的两个硬需求：
+
+- **场景 I**：单类行 → 多表集合（一行 Excel 同时进 `orders` + `order_items`）
+- **场景 II**：多类行 → 各自不同的表集合（A/B/C 三类行分别落入 m / n / o 集合）
+
+完整步骤、数据准备、SQL 断言、负向用例与对账配方见 `docs/validation/row-to-multitable.md`。
+
+仓库已签入的夹具（可直接使用）：
+
+| 文件 | 用途 |
+|---|---|
+| `tests/data/sql/02_orders.sql` | 场景 I schema |
+| `tests/data/profiles/order_m_set.json` | 场景 I Profile（multiTable） |
+| `tests/data/sql/04_mixed_multitable.sql` | 场景 II schema（6 张表，3 个集合） |
+| `tests/data/profiles/mixed_abc_multitable.json` | 场景 II Profile（mixed + 每个 class 父子 routes） |
+| `tools/xlsx2csv.py` | 导出对账脚本 |
+
+`Orders.xlsx` 与 `Mixed.xlsx`（输入 Excel）按惯例不签入仓库；按验证文档 §I-3.2 / §II-3.2 的表格内容在本地构造即可。回归点 `tst_fk_preflight` 单元测试已锁住 mixed 模式 FK 预校验路径，避免历史 bug 复发。
 
 ---
 

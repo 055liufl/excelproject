@@ -2,6 +2,7 @@
 
 #include "dbridge/Errors.h"
 
+#include <QSet>
 #include <QSqlError>
 #include <QSqlQuery>
 
@@ -12,58 +13,460 @@
 #include "mapping/Router.h"
 #include "mapping/TopoSorter.h"
 #include "profile/ProfileValidator.h"
+#include "schema/SchemaCatalog.h"
 #include "sql/SqlBuilder.h"
 #include "validation/ForeignKeyPreflight.h"
+#include <functional>
 
 namespace dbridge::detail {
 
-// Inject FK values from parent payloads into child payloads.
-static void doFkInject(QVector<RoutePayload>& payloads, const QVector<RouteSpec>& routes) {
-    QHash<QString, int> tableToPayloadIdx;
-    for (int i = 0; i < payloads.size(); ++i) {
-        tableToPayloadIdx[payloads[i].table] = i;
+namespace {
+
+// ---- Lookup helpers --------------------------------------------------------
+
+// Build a stable identity key for a LookupSpec: (from, match-pairs, select-pairs).
+// Two lookups sharing the same identity key can reuse one prefetch result.
+QString buildIdentityKey(const LookupSpec& lk) {
+    QStringList matchParts, selectParts;
+    for (const auto& p : lk.match)
+        matchParts.append(p.first + QLatin1Char('=') + p.second);
+    for (const auto& p : lk.select)
+        selectParts.append(p.first + QStringLiteral("->") + p.second);
+    return lk.fromTable + QStringLiteral("::") + matchParts.join(QLatin1Char(',')) +
+           QStringLiteral("::") + selectParts.join(QLatin1Char(','));
+}
+
+// Cast a raw QVariant to the affinity of a G-table column.
+// Returns an invalid QVariant on type-mismatch (cast failure).
+// Numeric zero is a valid (non-empty) value.
+QVariant castToAffinity(const QVariant& raw, const ColumnInfo& gCol) {
+    QString type = gCol.declaredType.trimmed().toUpper();
+    if (type.contains(QStringLiteral("INT"))) {
+        bool ok;
+        qlonglong iv = raw.toLongLong(&ok);
+        if (!ok)
+            return QVariant();  // cast failed
+        return QVariant(iv);
     }
+    if (type.contains(QStringLiteral("REAL")) || type.contains(QStringLiteral("FLOA")) ||
+        type.contains(QStringLiteral("DOUB"))) {
+        bool ok;
+        double dv = raw.toDouble(&ok);
+        if (!ok)
+            return QVariant();
+        return QVariant(dv);
+    }
+    return QVariant(raw.toString());  // TEXT / BLOB / NONE: string affinity
+}
+
+// Serialize a match-key tuple to a stable string for use as QHash key.
+// Uses ASCII unit separator (0x1F) as field delimiter.
+QString makeTupleKey(const QVector<QVariant>& values) {
+    QStringList parts;
+    for (const auto& v : values)
+        parts.append(v.isNull() ? QString() : v.toString());
+    return parts.join(QLatin1Char('\x1F'));
+}
+
+struct LookupHit {
+    QVector<QVariant> values;  // select column values in lk.select order
+    int hitCount = 0;
+};
+
+// identityKey -> (tupleKey -> hit)
+using LookupCache = QHash<QString, QHash<QString, LookupHit>>;
+
+}  // anonymous namespace
+
+// ---- FK injection ----------------------------------------------------------
+
+// §6.6 NULL strict: if a parent bind is NULL, report E_VALIDATE_FK and mark child failed.
+// §6.7 Cascade suppression: if an ancestor route failed, drop the child payload silently.
+// Returns the set of route-indices that failed this row (used to suppress further children).
+static QSet<int> doFkInject(QVector<RoutePayload>& payloads, const QVector<RouteSpec>& routes,
+                            int excelRow, const QString& sheet, ErrorCollector* errors,
+                            QSet<int> initialFailed = {}) {
+    QHash<QString, int> tableToPayloadIdx;
+    for (int i = 0; i < payloads.size(); ++i)
+        tableToPayloadIdx[payloads[i].table] = i;
+
+    // Build parent-chain map: routeIdx → parentRouteIdx (-1 if no parent)
+    QHash<int, int> parentIdx;
+    for (int i = 0; i < routes.size(); ++i) {
+        const QString& parentTable = routes[i].parent;
+        if (!parentTable.isEmpty() && tableToPayloadIdx.contains(parentTable))
+            parentIdx[i] = tableToPayloadIdx[parentTable];
+        else
+            parentIdx[i] = -1;
+    }
+
+    QSet<int> failedIdxs = std::move(initialFailed);
 
     for (int i = 0; i < routes.size(); ++i) {
         const RouteSpec& route = routes[i];
-        if (!route.fkInject.has_value())
-            continue;
-        const FkInjectSpec& fk = route.fkInject.value();
-
-        // Find parent payload
-        auto parentIt = tableToPayloadIdx.find(fk.fromTable);
-        if (parentIt == tableToPayloadIdx.end())
+        if (route.fkInject.isEmpty())
             continue;
 
-        const RoutePayload& parentPayload = payloads[parentIt.value()];
-        int fromIdx = parentPayload.indexOf(fk.fromColumn);
-        if (fromIdx < 0)
-            continue;
-        QVariant fkVal = parentPayload.binds[fromIdx];
-
-        // Inject into child payload
-        RoutePayload& childPayload = payloads[i];
-        int toIdx = childPayload.indexOf(fk.toColumn);
-        if (toIdx >= 0) {
-            childPayload.binds[toIdx] = fkVal;  // overwrite
-        } else {
-            childPayload.dbColumns.append(fk.toColumn);
-            childPayload.binds.append(fkVal);
-            toIdx = childPayload.dbColumns.size() - 1;
+        // §6.7: check ancestor chain for failures (initialFailed pre-seeds lookup failures)
+        bool ancestorFailed = false;
+        int ancestor = parentIdx.value(i, -1);
+        while (ancestor >= 0) {
+            if (failedIdxs.contains(ancestor)) {
+                ancestorFailed = true;
+                break;
+            }
+            ancestor = parentIdx.value(ancestor, -1);
         }
+        if (ancestorFailed)
+            continue;  // silently drop, no duplicate error
 
-        // Update conflictVals if the FK column is a conflict column
-        for (int ci = 0; ci < childPayload.conflictKey.size(); ++ci) {
-            if (childPayload.conflictKey[ci] == fk.toColumn) {
-                if (ci < childPayload.conflictVals.size()) {
-                    childPayload.conflictVals[ci] = fkVal;
+        RoutePayload& childPayload = payloads[i];
+        bool rowFailed = false;
+
+        for (const FkInjectSpec& fk : route.fkInject) {
+            auto parentIt = tableToPayloadIdx.find(fk.fromTable);
+            if (parentIt == tableToPayloadIdx.end())
+                continue;
+
+            const RoutePayload& parentPayload = payloads[parentIt.value()];
+
+            for (const auto& pair : fk.pairs) {
+                const QString& parentCol = pair.first;
+                const QString& childCol = pair.second;
+
+                int fromIdx = parentPayload.indexOf(parentCol);
+                if (fromIdx < 0)
+                    continue;
+                QVariant fkVal = parentPayload.binds[fromIdx];
+
+                // §6.6 NULL strict: refuse to inject NULL
+                if (fkVal.isNull()) {
+                    errors->add(sheet, excelRow, childCol, QString(),
+                                QString::fromLatin1(err::E_VALIDATE_FK),
+                                QStringLiteral("fkInject from '") + fk.fromTable +
+                                    QStringLiteral("': parent column '") + parentCol +
+                                    QStringLiteral("' is NULL; cannot inject into '") + childCol +
+                                    '\'');
+                    rowFailed = true;
+                    continue;
+                }
+
+                int toIdx = childPayload.indexOf(childCol);
+                if (toIdx >= 0) {
+                    childPayload.binds[toIdx] = fkVal;
+                } else {
+                    childPayload.dbColumns.append(childCol);
+                    childPayload.binds.append(fkVal);
+                    toIdx = childPayload.dbColumns.size() - 1;
+                }
+
+                // Update conflictVals by column name — design D5
+                for (int ci = 0; ci < childPayload.conflictKey.size(); ++ci) {
+                    if (childPayload.conflictKey[ci] == childCol &&
+                        ci < childPayload.conflictVals.size()) {
+                        childPayload.conflictVals[ci] = fkVal;
+                    }
                 }
             }
         }
+
+        if (rowFailed)
+            failedIdxs.insert(i);
     }
+
+    return failedIdxs;
 }
 
-// Determine if a route has children in the routes list
+// ---- Lookup application (Phase B) -----------------------------------------
+
+// Returns the set of route indices where any lookup failed (used to seed cascade suppression).
+static QSet<int> applyLookups(QVector<RoutePayload>& payloads, const QVector<RouteSpec>& routes,
+                              const LookupCache& cache, const SchemaCatalog& catalog,
+                              const ExcelReader& reader, int row, const QString& sheet,
+                              ErrorCollector* errors) {
+    QSet<int> failedRoutes;
+    for (int i = 0; i < routes.size(); ++i) {
+        const RouteSpec& route = routes[i];
+        if (route.lookups.isEmpty())
+            continue;
+
+        RoutePayload& payload = payloads[i];
+        bool routeFailed = false;  // true if any lookup on this route erred this row
+
+        for (const LookupSpec& lk : route.lookups) {
+            const TableInfo* gTable = catalog.table(lk.fromTable);
+            QString identityKey = buildIdentityKey(lk);
+
+            // Build match key with affinity cast
+            QVector<QVariant> matchVals;
+            bool hasError = false;
+            QStringList matchHeaders;
+
+            for (const auto& mp : lk.match) {
+                matchHeaders.append(mp.second);
+                QVariant raw = reader.cellBySource(row, mp.second);
+
+                // §5.2 empty: null or trimmed-empty; numeric zero is NOT empty
+                bool isEmpty = raw.isNull();
+                if (!isEmpty && raw.toString().trimmed().isEmpty())
+                    isEmpty = true;
+
+                if (isEmpty) {
+                    errors->add(sheet, row, mp.second, raw.toString(),
+                                QString::fromLatin1(err::E_LOOKUP_KEY_EMPTY),
+                                QStringLiteral("route '") + route.table +
+                                    QStringLiteral("' lookup '") + lk.name +
+                                    QStringLiteral("': match key '") + mp.second +
+                                    QStringLiteral("' is empty"));
+                    hasError = true;
+                    break;
+                }
+
+                // §5.3 cast to G column affinity
+                const ColumnInfo* gCol = gTable ? gTable->column(mp.first) : nullptr;
+                QVariant casted = gCol ? castToAffinity(raw, *gCol) : QVariant(raw.toString());
+                if (!casted.isValid()) {
+                    errors->add(sheet, row, mp.second, raw.toString(),
+                                QString::fromLatin1(err::E_LOOKUP_KEY_INVALID),
+                                QStringLiteral("route '") + route.table +
+                                    QStringLiteral("' lookup '") + lk.name +
+                                    QStringLiteral("': match key '") + mp.second +
+                                    QStringLiteral("' type cast failed (expected ") +
+                                    (gCol ? gCol->declaredType : QStringLiteral("?")) +
+                                    QStringLiteral(")"));
+                    hasError = true;
+                    break;
+                }
+                matchVals.append(casted);
+            }
+
+            if (hasError) {
+                routeFailed = true;
+                continue;
+            }
+
+            // §5.4 look up in prefetch cache
+            QString tkey = makeTupleKey(matchVals);
+            const auto& idCache = cache.value(identityKey);
+            auto it = idCache.find(tkey);
+
+            if (it == idCache.end()) {
+                QStringList keyParts;
+                for (int ki = 0; ki < lk.match.size() && ki < matchVals.size(); ++ki)
+                    keyParts.append(lk.match[ki].second + QLatin1Char('=') +
+                                    matchVals[ki].toString());
+                errors->add(sheet, row, matchHeaders.join(QLatin1Char(',')), tkey,
+                            QString::fromLatin1(err::E_LOOKUP_NOT_FOUND),
+                            QStringLiteral("route '") + route.table + QStringLiteral("' lookup '") +
+                                lk.name + QStringLiteral("': no match for (") +
+                                keyParts.join(QStringLiteral(", ")) + QStringLiteral(") in ") +
+                                lk.fromTable);
+                routeFailed = true;
+                continue;
+            }
+
+            const LookupHit& hit = it.value();
+
+            // §5.5 ambiguous
+            if (hit.hitCount > 1) {
+                errors->add(sheet, row, matchHeaders.join(QLatin1Char(',')), tkey,
+                            QString::fromLatin1(err::E_LOOKUP_AMBIGUOUS),
+                            QStringLiteral("route '") + route.table + QStringLiteral("' lookup '") +
+                                lk.name + QStringLiteral("': found ") +
+                                QString::number(hit.hitCount) + QStringLiteral(" rows in ") +
+                                lk.fromTable + QStringLiteral("; consider deduplicating ") +
+                                lk.fromTable + QStringLiteral(" on match columns"));
+                routeFailed = true;
+                continue;
+            }
+
+            // §5.6 append select results (NULL transparent)
+            for (int si = 0; si < lk.select.size(); ++si) {
+                const QString& targetCol = lk.select[si].second;
+                const QVariant& val = hit.values[si];
+
+                int existingIdx = payload.indexOf(targetCol);
+                if (existingIdx >= 0) {
+                    payload.binds[existingIdx] = val;
+                } else {
+                    payload.dbColumns.append(targetCol);
+                    payload.binds.append(val);
+                }
+
+                // Update conflictVals if this target is a conflict column
+                for (int ci = 0; ci < payload.conflictKey.size(); ++ci) {
+                    if (payload.conflictKey[ci] == targetCol && ci < payload.conflictVals.size()) {
+                        payload.conflictVals[ci] = val;
+                    }
+                }
+            }
+        }
+
+        // §D11: any lookup failure on this route → seed cascade suppression
+        if (routeFailed)
+            failedRoutes.insert(i);
+    }
+    return failedRoutes;
+}
+
+// ---- Lookup prefetch (Phase A.5) ------------------------------------------
+
+// §4.11 Prefetch query counter hook — called once per actual SELECT executed.
+// Nullptr → noop (production). Inject a counting lambda in tests.
+static bool buildLookupCache(const ProfileSpec& profile, const SchemaCatalog& catalog,
+                             const ExcelReader& reader, QSqlDatabase& db, const QString& sheetName,
+                             ErrorCollector* errors, LookupCache* cache,
+                             const std::function<void(const QString&)>& onPrefetch = nullptr) {
+    // Collect all unique lookup identities across all routes (and all classes for Mixed mode)
+    QHash<QString, LookupSpec> identitySpecs;  // identityKey -> representative LookupSpec
+
+    auto collectLookups = [&](const QVector<RouteSpec>& routes) {
+        for (const RouteSpec& route : routes) {
+            for (const LookupSpec& lk : route.lookups) {
+                QString ikey = buildIdentityKey(lk);
+                if (!identitySpecs.contains(ikey))
+                    identitySpecs[ikey] = lk;
+            }
+        }
+    };
+
+    if (profile.mode == ProfileMode::Mixed) {
+        for (const auto& cls : profile.classes)
+            collectLookups(cls.routes);
+    } else {
+        collectLookups(profile.routes);
+    }
+
+    // For each identity: pre-scan Excel, batch SELECT, populate cache
+    for (auto it = identitySpecs.begin(); it != identitySpecs.end(); ++it) {
+        const QString& ikey = it.key();
+        const LookupSpec& lk = it.value();
+
+        const TableInfo* gTable = catalog.table(lk.fromTable);
+
+        // Pre-scan: collect distinct match key tuples (skip empty/invalid at row-time)
+        QHash<QString, QVector<QVariant>> keyMap;  // tupleKey -> casted values
+
+        for (int r = reader.firstDataRow(); r <= reader.lastRow(); ++r) {
+            QVector<QVariant> matchVals;
+            bool skip = false;
+            for (const auto& mp : lk.match) {
+                QVariant raw = reader.cellBySource(r, mp.second);
+                if (raw.isNull() || raw.toString().trimmed().isEmpty()) {
+                    skip = true;
+                    break;
+                }
+                const ColumnInfo* gCol = gTable ? gTable->column(mp.first) : nullptr;
+                QVariant casted = gCol ? castToAffinity(raw, *gCol) : QVariant(raw.toString());
+                if (!casted.isValid()) {
+                    skip = true;
+                    break;
+                }
+                matchVals.append(casted);
+            }
+            if (skip)
+                continue;
+
+            QString tkey = makeTupleKey(matchVals);
+            if (!keyMap.contains(tkey))
+                keyMap[tkey] = matchVals;
+        }
+
+        // §4.5 K == 0: skip SELECT entirely
+        if (keyMap.isEmpty()) {
+            (*cache)[ikey] = {};
+            continue;
+        }
+
+        // Build batch SELECT: SELECT <match cols>, <select cols> FROM G WHERE ...
+        QStringList selectColNames;
+        for (const auto& mp : lk.match)
+            selectColNames.append(mp.first);
+        for (const auto& sp : lk.select)
+            selectColNames.append(sp.first);
+
+        int numMatchCols = lk.match.size();
+        int numSelectCols = lk.select.size();
+
+        // §4.8 chunk by SQLITE_MAX_VARIABLE_NUMBER = 999
+        const int maxVars = 999;
+        int chunkSize = qMax(1, maxVars / numMatchCols);
+
+        QHash<QString, LookupHit> idCache;
+        QVector<QString> keyList = keyMap.keys().toVector();
+
+        for (int start = 0; start < keyList.size(); start += chunkSize) {
+            int end = qMin(start + chunkSize, keyList.size());
+            int batchSize = end - start;
+
+            // §4.6/4.7 Single column: use IN; multi-column: OR-join AND-clauses
+            QString sql = QStringLiteral("SELECT ") + selectColNames.join(QStringLiteral(", ")) +
+                          QStringLiteral(" FROM ") + lk.fromTable + QStringLiteral(" WHERE ");
+
+            if (numMatchCols == 1) {
+                QStringList placeholders;
+                for (int i = 0; i < batchSize; ++i)
+                    placeholders.append(QStringLiteral("?"));
+                sql += lk.match[0].first + QStringLiteral(" IN (") +
+                       placeholders.join(QStringLiteral(", ")) + QStringLiteral(")");
+            } else {
+                QStringList orClauses;
+                for (int i = 0; i < batchSize; ++i) {
+                    QStringList andClauses;
+                    for (const auto& mp : lk.match)
+                        andClauses.append(mp.first + QStringLiteral(" = ?"));
+                    orClauses.append(QStringLiteral("(") +
+                                     andClauses.join(QStringLiteral(" AND ")) +
+                                     QStringLiteral(")"));
+                }
+                sql += orClauses.join(QStringLiteral(" OR "));
+            }
+
+            if (onPrefetch)
+                onPrefetch(ikey);
+
+            QSqlQuery q(db);
+            q.prepare(sql);
+            for (int i = start; i < end; ++i) {
+                const QVector<QVariant>& vals = keyMap[keyList[i]];
+                for (const auto& v : vals)
+                    q.addBindValue(v);
+            }
+
+            if (!q.exec()) {
+                errors->addTable(sheetName, QString::fromLatin1(err::E_LOOKUP_QUERY_FAILED),
+                                 QStringLiteral("Lookup prefetch failed for '") + lk.fromTable +
+                                     QStringLiteral("': ") + q.lastError().text());
+                return false;  // §4.10 fatal
+            }
+
+            while (q.next()) {
+                // Re-build match key from result row
+                QVector<QVariant> resultMatchVals;
+                for (int i = 0; i < numMatchCols; ++i)
+                    resultMatchVals.append(q.value(i));
+                QString tkey = makeTupleKey(resultMatchVals);
+
+                // Select values follow match columns in the result
+                QVector<QVariant> selectVals;
+                for (int i = numMatchCols; i < numMatchCols + numSelectCols; ++i)
+                    selectVals.append(q.value(i));
+
+                auto& hit = idCache[tkey];
+                if (hit.hitCount == 0)
+                    hit.values = selectVals;
+                hit.hitCount++;
+            }
+        }
+
+        (*cache)[ikey] = idCache;
+    }
+
+    return true;
+}
+
+// ---- routeHasChildren ------------------------------------------------------
+
 static bool routeHasChildren(const QString& table, const QVector<RouteSpec>& routes) {
     for (const auto& r : routes) {
         if (r.parent == table)
@@ -71,6 +474,8 @@ static bool routeHasChildren(const QString& table, const QVector<RouteSpec>& rou
     }
     return false;
 }
+
+// ---- ImportService::run ----------------------------------------------------
 
 ImportResult ImportService::run(const ProfileSpec& profile, const SchemaCatalog& catalog,
                                 const QString& xlsxPath, const ImportOptions& options,
@@ -112,7 +517,6 @@ ImportResult ImportService::run(const ProfileSpec& profile, const SchemaCatalog&
     Mapper mapper;
     Router router;
 
-    // For Mixed mode, initialize router
     if (profile.mode == ProfileMode::Mixed) {
         QString routerErr;
         if (!router.init(profile, &routerErr)) {
@@ -122,7 +526,6 @@ ImportResult ImportService::run(const ProfileSpec& profile, const SchemaCatalog&
         }
     }
 
-    // Compile validators: for non-mixed, all routes; for mixed, each class
     ValidatorMap validatorMap;
     if (profile.mode == ProfileMode::Mixed) {
         for (const auto& cls : profile.classes) {
@@ -142,8 +545,7 @@ ImportResult ImportService::run(const ProfileSpec& profile, const SchemaCatalog&
         }
     }
 
-    // Topo-sort all route sets
-    QHash<QString, QVector<RouteSpec>> topoRoutes;  // classId -> sorted routes
+    QHash<QString, QVector<RouteSpec>> topoRoutes;
     if (profile.mode == ProfileMode::Mixed) {
         for (const auto& cls : profile.classes) {
             QVector<RouteSpec> sorted;
@@ -166,6 +568,14 @@ ImportResult ImportService::run(const ProfileSpec& profile, const SchemaCatalog&
             return result;
         }
         topoRoutes[QString()] = sorted;
+    }
+
+    // --- Phase A.5: Lookup prefetch ---
+    LookupCache lookupCache;
+    if (!buildLookupCache(profile, catalog, reader, db, sheetName, &errors, &lookupCache,
+                          onPrefetch)) {
+        result.errors = errors.list();
+        return result;
     }
 
     // --- Phase C: Row mapping + validation ---
@@ -195,11 +605,15 @@ ImportResult ImportService::run(const ProfileSpec& profile, const SchemaCatalog&
             routesPtr = &topoRoutes[QString()];
         }
 
-        // Map row to payloads
+        // Map Excel columns to payloads
         ctx.payloads = mapper.map(*routesPtr, r, ctx.classId, reader, validatorMap, &errors);
 
-        // FK injection
-        doFkInject(ctx.payloads, *routesPtr);
+        // Apply lookups (Phase A.5 cache → row payload); failures seed cascade suppression (§D11)
+        QSet<int> lookupFailed = applyLookups(ctx.payloads, *routesPtr, lookupCache, catalog,
+                                              reader, r, sheetName, &errors);
+
+        // FK injection (§6.6 NULL strict, §6.7 cascade suppression)
+        doFkInject(ctx.payloads, *routesPtr, r, sheetName, &errors, std::move(lookupFailed));
 
         // Batch uniqueness check
         for (int pi = 0; pi < ctx.payloads.size(); ++pi) {
@@ -216,7 +630,6 @@ ImportResult ImportService::run(const ProfileSpec& profile, const SchemaCatalog&
         ForeignKeyPreflight fkPreflight;
         fkPreflight.check(contexts, topoRoutes.value(QString()), db, sheetName, &errors);
     } else {
-        // For mixed, check each class separately
         for (const auto& cls : profile.classes) {
             QVector<RowContext> clsContexts;
             for (const auto& ctx : contexts) {
@@ -228,7 +641,14 @@ ImportResult ImportService::run(const ProfileSpec& profile, const SchemaCatalog&
         }
     }
 
-    // If any errors, do NOT write
+    // §8.4 dryRun: skip write, populate dryRunPayloads
+    if (options.dryRun) {
+        result.dryRunPayloads = contexts;
+        result.errors = errors.list();
+        return result;
+    }
+
+    // If errors, do NOT write
     if (!errors.empty()) {
         result.errors = errors.list();
         return result;
@@ -243,7 +663,7 @@ ImportResult ImportService::run(const ProfileSpec& profile, const SchemaCatalog&
     }
 
     SqlBuilder sqlBuilder;
-    QHash<QString, QSqlQuery> preparedQueries;  // sql -> prepared query
+    QHash<QString, QSqlQuery> preparedQueries;
 
     bool writeOk = true;
     for (const auto& ctx : contexts) {
@@ -273,10 +693,8 @@ ImportResult ImportService::run(const ProfileSpec& profile, const SchemaCatalog&
                 qptr = &it.value();
             }
 
-            // Bind values
-            for (int bi = 0; bi < payload.binds.size(); ++bi) {
-                qptr->addBindValue(payload.binds[bi]);
-            }
+            for (const auto& v : payload.binds)
+                qptr->addBindValue(v);
 
             if (!qptr->exec()) {
                 errors.add(sheetName, ctx.excelRow, QString(), QString(),

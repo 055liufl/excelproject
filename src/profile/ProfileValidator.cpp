@@ -14,7 +14,6 @@ bool ProfileValidator::isConflictValid(const ConflictSpec& conflict, const Table
 
     QSet<QString> conflictSet = QSet<QString>::fromList(conflict.columns);
 
-    // Check if columns form a primary key set
     QStringList pkList;
     for (const auto& c : table.columns) {
         if (c.primaryKey)
@@ -24,7 +23,6 @@ bool ProfileValidator::isConflictValid(const ConflictSpec& conflict, const Table
     if (!pkCols.isEmpty() && pkCols == conflictSet)
         return true;
 
-    // Check if columns match a unique index
     for (const auto& idx : table.indexes) {
         if (!idx.unique)
             continue;
@@ -36,28 +34,25 @@ bool ProfileValidator::isConflictValid(const ConflictSpec& conflict, const Table
     return false;
 }
 
-bool ProfileValidator::validateRoute(const RouteSpec& route, const SchemaCatalog& catalog,
-                                     const QStringList& excelHeaders, const QString& sheet,
-                                     ErrorCollector* errors) {
+bool ProfileValidator::validateRoute(const RouteSpec& route, const QVector<RouteSpec>& allRoutes,
+                                     const SchemaCatalog& catalog, const QStringList& excelHeaders,
+                                     const QString& sheet, ErrorCollector* errors) {
     bool ok = true;
 
-    // Check table exists
     if (!catalog.hasTable(route.table)) {
         errors->addTable(sheet, QString::fromLatin1(err::E_PROFILE_TABLE_NOT_FOUND),
                          QStringLiteral("Table '") + route.table + QStringLiteral("' not found"));
-        return false;  // can't validate columns without table
+        return false;
     }
-
     const TableInfo& tableInfo = *catalog.table(route.table);
 
-    // Check conflict columns
+    // Conflict columns
     if (route.conflict.columns.isEmpty()) {
         errors->addTable(
             sheet, QString::fromLatin1(err::E_PROFILE_NO_CONFLICT_KEY),
             QStringLiteral("Route '") + route.table + QStringLiteral("' has no conflict columns"));
         ok = false;
     } else {
-        // Check each conflict column exists in table
         for (const auto& cc : route.conflict.columns) {
             if (!tableInfo.column(cc)) {
                 errors->addTable(sheet, QString::fromLatin1(err::E_PROFILE_NO_CONFLICT_KEY),
@@ -66,7 +61,6 @@ bool ProfileValidator::validateRoute(const RouteSpec& route, const SchemaCatalog
                 ok = false;
             }
         }
-        // Check conflict matches PK or unique index
         if (ok && !isConflictValid(route.conflict, tableInfo)) {
             errors->addTable(sheet, QString::fromLatin1(err::E_PROFILE_NO_CONFLICT_KEY),
                              QStringLiteral("Conflict columns in '") + route.table +
@@ -75,7 +69,11 @@ bool ProfileValidator::validateRoute(const RouteSpec& route, const SchemaCatalog
         }
     }
 
-    // Check each mapped column
+    // §3.8 Build dbColumn source map for three-source uniqueness (§3.2, §3.11)
+    // source string: "excel", "lookup:<name>", "fkInject:<from>"
+    QHash<QString, QString> dbColSource;
+
+    // Excel columns (§3.11 source 1)
     for (const auto& col : route.columns) {
         if (!tableInfo.column(col.dbColumn)) {
             errors->addTable(sheet, QString::fromLatin1(err::E_PROFILE_COLUMN_NOT_FOUND),
@@ -83,45 +81,220 @@ bool ProfileValidator::validateRoute(const RouteSpec& route, const SchemaCatalog
                                  QStringLiteral("' not found in table '") + route.table + '\'');
             ok = false;
         }
-        // Check source header exists in Excel
         if (!excelHeaders.contains(col.source)) {
             errors->addTable(
                 sheet, QString::fromLatin1(err::E_HEADER_NOT_FOUND),
                 QStringLiteral("Excel header '") + col.source + QStringLiteral("' not found"));
             ok = false;
         }
-    }
-
-    // Validate fkInject if present
-    if (route.fkInject.has_value()) {
-        const FkInjectSpec& fk = route.fkInject.value();
-        // fromTable must match route.parent (spec §5.4)
-        if (!route.parent.isEmpty() && fk.fromTable != route.parent) {
-            errors->addTable(sheet, QString::fromLatin1(err::E_PROFILE_PARSE),
-                             QStringLiteral("fkInject.from table '") + fk.fromTable +
-                                 QStringLiteral("' must match route parent '") + route.parent +
-                                 '\'');
-            ok = false;
-        }
-        if (!catalog.hasTable(fk.fromTable)) {
-            errors->addTable(sheet, QString::fromLatin1(err::E_PROFILE_TABLE_NOT_FOUND),
-                             QStringLiteral("fkInject.from table '") + fk.fromTable +
-                                 QStringLiteral("' not found"));
+        if (dbColSource.contains(col.dbColumn)) {
+            errors->addTable(sheet, QString::fromLatin1(err::E_PROFILE_COLUMN_NOT_FOUND),
+                             QStringLiteral("route '") + route.table +
+                                 QStringLiteral("': duplicate dbColumn '") + col.dbColumn + '\'');
             ok = false;
         } else {
-            const TableInfo& fromTable = *catalog.table(fk.fromTable);
-            if (!fromTable.column(fk.fromColumn)) {
+            dbColSource[col.dbColumn] = QStringLiteral("excel");
+        }
+    }
+
+    // Build route index for fkInject cross-route checks
+    QHash<QString, const RouteSpec*> routeByTable;
+    for (const auto& r : allRoutes)
+        routeByTable[r.table] = &r;
+
+    // §3.1, §3.2, §3.4, §3.9, §3.10 — Lookup validation
+    QSet<QString> lookupNames;
+    QSet<QString>
+        allLookupTargets;  // all select.second across all lookups (for §3.4 cascade check)
+
+    for (const LookupSpec& lk : route.lookups) {
+        // §3.9 name unique within route
+        if (lookupNames.contains(lk.name)) {
+            errors->addTable(sheet, QString::fromLatin1(err::E_PROFILE_PARSE),
+                             QStringLiteral("route '") + route.table +
+                                 QStringLiteral("': duplicate lookup name '") + lk.name + '\'');
+            ok = false;
+            continue;
+        }
+        lookupNames.insert(lk.name);
+
+        // §3.1 fromTable in catalog
+        if (!catalog.hasTable(lk.fromTable)) {
+            errors->addTable(sheet, QString::fromLatin1(err::E_PROFILE_TABLE_NOT_FOUND),
+                             QStringLiteral("route '") + route.table +
+                                 QStringLiteral("': lookup '") + lk.name +
+                                 QStringLiteral("' from table '") + lk.fromTable +
+                                 QStringLiteral("' not found in schema"));
+            ok = false;
+            continue;
+        }
+        const TableInfo& gTable = *catalog.table(lk.fromTable);
+
+        // §3.1 match.first must be G column; match.second must be Excel header
+        for (const auto& mp : lk.match) {
+            if (!gTable.column(mp.first)) {
                 errors->addTable(sheet, QString::fromLatin1(err::E_PROFILE_COLUMN_NOT_FOUND),
-                                 QStringLiteral("fkInject.from column '") + fk.fromColumn +
-                                     QStringLiteral("' not found in '") + fk.fromTable + '\'');
+                                 QStringLiteral("route '") + route.table +
+                                     QStringLiteral("': lookup '") + lk.name +
+                                     QStringLiteral("' match column '") + mp.first +
+                                     QStringLiteral("' not found in '") + lk.fromTable + '\'');
+                ok = false;
+            }
+            if (!excelHeaders.contains(mp.second)) {
+                errors->addTable(sheet, QString::fromLatin1(err::E_HEADER_NOT_FOUND),
+                                 QStringLiteral("route '") + route.table +
+                                     QStringLiteral("': lookup '") + lk.name +
+                                     QStringLiteral("' match excel header '") + mp.second +
+                                     QStringLiteral("' not found"));
                 ok = false;
             }
         }
-        if (!tableInfo.column(fk.toColumn)) {
-            errors->addTable(sheet, QString::fromLatin1(err::E_PROFILE_COLUMN_NOT_FOUND),
-                             QStringLiteral("fkInject.to column '") + fk.toColumn +
-                                 QStringLiteral("' not found in '") + route.table + '\'');
+
+        // §3.1 select.first must be G column; §3.10 select targets unique within this lookup
+        QSet<QString> selectTargetsThisLookup;
+        for (const auto& sp : lk.select) {
+            if (!gTable.column(sp.first)) {
+                errors->addTable(sheet, QString::fromLatin1(err::E_PROFILE_COLUMN_NOT_FOUND),
+                                 QStringLiteral("route '") + route.table +
+                                     QStringLiteral("': lookup '") + lk.name +
+                                     QStringLiteral("' select column '") + sp.first +
+                                     QStringLiteral("' not found in '") + lk.fromTable + '\'');
+                ok = false;
+            }
+            // §3.10 internal uniqueness
+            if (selectTargetsThisLookup.contains(sp.second)) {
+                errors->addTable(sheet, QString::fromLatin1(err::E_PROFILE_PARSE),
+                                 QStringLiteral("route '") + route.table +
+                                     QStringLiteral("': lookup '") + lk.name +
+                                     QStringLiteral("' has duplicate select target '") + sp.second +
+                                     '\'');
+                ok = false;
+            } else {
+                selectTargetsThisLookup.insert(sp.second);
+            }
+            // §3.2+§3.11 cross-source uniqueness
+            if (dbColSource.contains(sp.second)) {
+                errors->addTable(sheet, QString::fromLatin1(err::E_PROFILE_COLUMN_NOT_FOUND),
+                                 QStringLiteral("route '") + route.table +
+                                     QStringLiteral("': lookup '") + lk.name +
+                                     QStringLiteral("' select target '") + sp.second +
+                                     QStringLiteral("' conflicts with ") + dbColSource[sp.second] +
+                                     QStringLiteral(" source"));
+                ok = false;
+            } else {
+                dbColSource[sp.second] = QStringLiteral("lookup:") + lk.name;
+                allLookupTargets.insert(sp.second);
+            }
+        }
+    }
+
+    // §3.4 No lookup cascading: match.second must not be a lookup output target
+    for (const LookupSpec& lk : route.lookups) {
+        for (const auto& mp : lk.match) {
+            if (allLookupTargets.contains(mp.second)) {
+                errors->addTable(
+                    sheet, QString::fromLatin1(err::E_PROFILE_PARSE),
+                    QStringLiteral("route '") + route.table + QStringLiteral("': lookup '") +
+                        lk.name + QStringLiteral("' match header '") + mp.second +
+                        QStringLiteral("' is a lookup output — cascading not allowed"));
+                ok = false;
+            }
+        }
+    }
+
+    // §3.3, §3.5, §3.6, §3.11 — fkInject validation
+    QSet<QString> fkChildCols;
+    for (const FkInjectSpec& fk : route.fkInject) {
+        // §3.3 from must be a declared route in this profile
+        if (!routeByTable.contains(fk.fromTable)) {
+            QString msg = QStringLiteral("route '") + route.table +
+                          QStringLiteral("': fkInject from '") + fk.fromTable + '\'';
+            if (catalog.hasTable(fk.fromTable)) {
+                msg += QStringLiteral(
+                    " exists in schema but is not a route in this profile; use lookups instead");
+            } else {
+                msg += QStringLiteral(" not found");
+            }
+            errors->addTable(sheet, QString::fromLatin1(err::E_PROFILE_TABLE_NOT_FOUND), msg);
             ok = false;
+            continue;
+        }
+        const RouteSpec* parentRoute = routeByTable[fk.fromTable];
+
+        // Build parent route's declared column sets (Excel + lookup outputs)
+        QSet<QString> parentExcelCols;
+        for (const auto& col : parentRoute->columns)
+            parentExcelCols.insert(col.dbColumn);
+        QSet<QString> parentLookupTargets;
+        for (const LookupSpec& lk : parentRoute->lookups) {
+            for (const auto& sp : lk.select)
+                parentLookupTargets.insert(sp.second);
+        }
+
+        // §3.5 All pairs must be either all lookup-derived or all Excel-derived
+        bool groupIsLookup = false;
+        bool firstPair = true;
+        bool mixedGroup = false;
+        for (const auto& pair : fk.pairs) {
+            bool pairIsLookup = parentLookupTargets.contains(pair.first);
+            if (firstPair) {
+                groupIsLookup = pairIsLookup;
+                firstPair = false;
+            } else if (pairIsLookup != groupIsLookup) {
+                mixedGroup = true;
+                break;
+            }
+        }
+        if (mixedGroup) {
+            errors->addTable(
+                sheet, QString::fromLatin1(err::E_PROFILE_PARSE),
+                QStringLiteral("route '") + route.table + QStringLiteral("': fkInject from='") +
+                    fk.fromTable +
+                    QStringLiteral("' mixes lookup-derived and Excel-derived parent_columns; "
+                                   "split into two separate groups"));
+            ok = false;
+        }
+
+        for (const auto& pair : fk.pairs) {
+            // §3.3 pair.first in parent route's Excel columns or lookup outputs
+            if (!parentExcelCols.contains(pair.first) &&
+                !parentLookupTargets.contains(pair.first)) {
+                errors->addTable(
+                    sheet, QString::fromLatin1(err::E_PROFILE_COLUMN_NOT_FOUND),
+                    QStringLiteral("route '") + route.table + QStringLiteral("': fkInject from='") +
+                        fk.fromTable + QStringLiteral("' parent_column '") + pair.first +
+                        QStringLiteral("' not found in parent route columns or lookup outputs"));
+                ok = false;
+            }
+            // §3.3 pair.second in target table
+            if (!tableInfo.column(pair.second)) {
+                errors->addTable(sheet, QString::fromLatin1(err::E_PROFILE_COLUMN_NOT_FOUND),
+                                 QStringLiteral("route '") + route.table +
+                                     QStringLiteral("': fkInject child_column '") + pair.second +
+                                     QStringLiteral("' not found in table '") + route.table + '\'');
+                ok = false;
+            }
+            // §3.6 child_column unique across all fkInject groups on this route
+            if (fkChildCols.contains(pair.second)) {
+                errors->addTable(sheet, QString::fromLatin1(err::E_PROFILE_PARSE),
+                                 QStringLiteral("route '") + route.table +
+                                     QStringLiteral("': fkInject child_column '") + pair.second +
+                                     QStringLiteral("' appears in multiple injection groups"));
+                ok = false;
+            } else {
+                fkChildCols.insert(pair.second);
+                // §3.11 cross-source uniqueness
+                if (dbColSource.contains(pair.second)) {
+                    errors->addTable(sheet, QString::fromLatin1(err::E_PROFILE_COLUMN_NOT_FOUND),
+                                     QStringLiteral("route '") + route.table +
+                                         QStringLiteral("': fkInject child_column '") +
+                                         pair.second + QStringLiteral("' conflicts with ") +
+                                         dbColSource[pair.second] + QStringLiteral(" source"));
+                    ok = false;
+                } else {
+                    dbColSource[pair.second] = QStringLiteral("fkInject:") + fk.fromTable;
+                }
+            }
         }
     }
 
@@ -133,11 +306,11 @@ bool ProfileValidator::validateRoutes(const QVector<RouteSpec>& routes,
                                       const QString& sheet, ErrorCollector* errors) {
     bool ok = true;
     for (const auto& route : routes) {
-        if (!validateRoute(route, catalog, excelHeaders, sheet, errors))
+        if (!validateRoute(route, routes, catalog, excelHeaders, sheet, errors))
             ok = false;
     }
 
-    // Validate parent references
+    // Parent references
     QStringList tableNameList;
     for (const auto& r : routes)
         tableNameList.append(r.table);
@@ -180,7 +353,6 @@ bool ProfileValidator::validate(const ProfileSpec& profile, const SchemaCatalog&
                              QStringLiteral("mixed mode requires discriminator.source"));
             ok = false;
         }
-        // Check discriminator source in headers
         if (!profile.discriminatorSource.isEmpty() &&
             !excelHeaders.contains(profile.discriminatorSource)) {
             errors->addTable(profile.sheet, QString::fromLatin1(err::E_HEADER_NOT_FOUND),
@@ -190,14 +362,12 @@ bool ProfileValidator::validate(const ProfileSpec& profile, const SchemaCatalog&
             ok = false;
         }
         for (const auto& cls : profile.classes) {
-            if (!validateRoutes(cls.routes, catalog, excelHeaders, profile.sheet, errors)) {
+            if (!validateRoutes(cls.routes, catalog, excelHeaders, profile.sheet, errors))
                 ok = false;
-            }
         }
     } else {
-        if (!validateRoutes(profile.routes, catalog, excelHeaders, profile.sheet, errors)) {
+        if (!validateRoutes(profile.routes, catalog, excelHeaders, profile.sheet, errors))
             ok = false;
-        }
     }
 
     return ok;

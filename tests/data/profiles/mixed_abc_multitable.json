@@ -23,7 +23,7 @@
                 {
                     "table": "order_items",
                     "parent": "orders",
-                    "fkInject": {"from": "orders.order_no", "to": "order_items.order_no"},
+                    "fkInject": [{ "from": "orders", "pairs": [["order_no","order_no"]] }],
                     "conflict": {"columns": ["order_no", "line_no"]},
                     "columns": {
                         "line_no": {"source": "LineNo", "validators": ["int>=1"]},
@@ -49,7 +49,7 @@
                 {
                     "table": "shipment_legs",
                     "parent": "shipments",
-                    "fkInject": {"from": "shipments.shipment_no", "to": "shipment_legs.shipment_no"},
+                    "fkInject": [{ "from": "shipments", "pairs": [["shipment_no","shipment_no"]] }],
                     "conflict": {"columns": ["shipment_no", "leg_no"]},
                     "columns": {
                         "leg_no": {"source": "LegNo", "validators": ["int>=1"]},
@@ -75,7 +75,7 @@
                 {
                     "table": "invoice_lines",
                     "parent": "invoices",
-                    "fkInject": {"from": "invoices.invoice_no", "to": "invoice_lines.invoice_no"},
+                    "fkInject": [{ "from": "invoices", "pairs": [["invoice_no","invoice_no"]] }],
                     "conflict": {"columns": ["invoice_no", "line_no"]},
                     "columns": {
                         "line_no": {"source": "InvLineNo", "validators": ["int>=1"]},

@@ -116,7 +116,7 @@ sqlite3 /tmp/scenarioI.db "PRAGMA foreign_keys = ON; SELECT sqlite_version();"  
     {
       "table": "order_items",
       "parent": "orders",
-      "fkInject": { "from": "orders.order_no", "to": "order_items.order_no" },
+      "fkInject": [{ "from": "orders", "pairs": [["order_no","order_no"]] }],
       "conflict": {"columns": ["order_no", "line_no"]},
       "columns": { "line_no": {}, "sku": {}, "qty": {} }
     }
@@ -126,6 +126,36 @@ sqlite3 /tmp/scenarioI.db "PRAGMA foreign_keys = ON; SELECT sqlite_version();"  
 ```
 
 Profile 故意**不**显式映射 `OrderNo → order_items.order_no`，强制由 `fkInject` 注入，用以验证 I-V3。
+
+> **fkInject 格式说明**：自本 change 起，`fkInject` 由单列对象改为数组形式。每个元素 `{ "from": "<父表>", "pairs": [["父列","子列"], ...] }` 支持多父表 / 多列注入；旧的 `{ "from": "t.col", "to": "t.col" }` 单列写法已**删除**。
+
+### lookup 用法扩展（场景 I+）
+
+若需在导入时从同库参考表拉取字段合并到当前行，可在 route 里加 `lookups`：
+
+```jsonc
+{
+  "table": "orders",
+  "conflict": { "columns": ["order_no"] },
+  "lookups": [
+    {
+      "name": "cust",
+      "from": "ref_customers",
+      "match":  [["c_no", "CustNo"]],
+      "select": [["c_name", "customer_name"], ["c_tier", "tier"]]
+    }
+  ],
+  "columns": {
+    "order_no":  { "source": "OrderNo" }
+    // customer_name / tier 由 lookup 填入，无需在 columns 里声明
+  }
+}
+```
+
+- `match`：`[[参考表列, Excel 表头], ...]`，用 Excel 当前行的 `CustNo` 值到 `ref_customers.c_no` 查找。
+- `select`：`[[参考表列, 目标 DB 列], ...]`，命中后把 `c_name` / `c_tier` 合并写入本 route 的 payload。
+- 所有 key 均在 Phase A.5（导入前）批量预取（`SELECT ... WHERE c_no IN (...)`），Phase B 按行命中，无逐行 SQL。
+- 命中 0 行 → `E_LOOKUP_NOT_FOUND`；命中多行 → `E_LOOKUP_AMBIGUOUS`；key 为空 → `E_LOOKUP_KEY_EMPTY`；key 类型不兼容参考表列 → `E_LOOKUP_KEY_INVALID`（均为 row-level 错误，不中断整批）。
 
 ## I-4 执行步骤
 
@@ -336,7 +366,7 @@ CREATE TABLE invoice_lines (
         {
           "table": "order_items",
           "parent": "orders",
-          "fkInject": { "from": "orders.order_no", "to": "order_items.order_no" },
+          "fkInject": [{ "from": "orders", "pairs": [["order_no","order_no"]] }],
           "conflict": { "columns": ["order_no", "line_no"] },
           "columns": {
             "line_no": { "source": "LineNo", "validators": ["int>=1"] },
@@ -362,7 +392,7 @@ CREATE TABLE invoice_lines (
         {
           "table": "shipment_legs",
           "parent": "shipments",
-          "fkInject": { "from": "shipments.shipment_no", "to": "shipment_legs.shipment_no" },
+          "fkInject": [{ "from": "shipments", "pairs": [["shipment_no","shipment_no"]] }],
           "conflict": { "columns": ["shipment_no", "leg_no"] },
           "columns": {
             "leg_no": { "source": "LegNo",  "validators": ["int>=1"] },
@@ -388,7 +418,7 @@ CREATE TABLE invoice_lines (
         {
           "table": "invoice_lines",
           "parent": "invoices",
-          "fkInject": { "from": "invoices.invoice_no", "to": "invoice_lines.invoice_no" },
+          "fkInject": [{ "from": "invoices", "pairs": [["invoice_no","invoice_no"]] }],
           "conflict": { "columns": ["invoice_no", "line_no"] },
           "columns": {
             "line_no": { "source": "InvLineNo", "validators": ["int>=1"] },
@@ -600,7 +630,7 @@ sort /tmp/out.csv | sha256sum
 | `tests/data/profiles/mixed_abc_multitable.json` | ✅ | 场景 II Profile |
 | `tests/data/xlsx/Mixed.xlsx` | ❌ 本地构造 | 场景 II 输入 Excel（按 §II-3.2 构造，xlsx 二进制不签入仓库） |
 | `tools/xlsx2csv.py` | ✅ | 对账辅助脚本（纯 Python 标准库实现，无外部依赖） |
-| `tests/unit/tst_fk_preflight.cpp` | ✅ | mixed 模式 FK 预校验回归测试（4 用例，含 `testMixedParentInBatch` / `testParentMissing`） |
+| `tests/unit/tst_fk_preflight.cpp` | ✅ | FK 预校验回归测试（7 用例，含 `testMixedParentInBatch` / `testParentMissing` / `testLookupDerivedGroupSkipsProbe`） |
 
 `Orders.xlsx` 与 `Mixed.xlsx` 是二进制文件，按惯例不直接签入仓库——由验证执行者依照 §I-3.2 / §II-3.2 的表格内容用 Excel / LibreOffice / `openpyxl` 构造即可。后续若要把这两份 xlsx 也沉淀为可重复夹具，建议增加 `tools/build_fixtures.py` 从 JSON 描述用 QXlsx/openpyxl 重新生成。
 

@@ -2,6 +2,7 @@
 
 #include <QJsonArray>
 #include <QRegularExpression>
+#include <QSet>
 
 namespace dbridge::detail {
 
@@ -91,34 +92,181 @@ bool ProfileLoader::readRoute(const QJsonObject& o, RouteSpec* out, QString* err
         out->conflict.columns.append(col);
     }
 
-    // fkInject
-    QJsonObject fkObj = o.value(QStringLiteral("fkInject")).toObject();
-    if (!fkObj.isEmpty()) {
-        FkInjectSpec fk;
-        QString fromStr = fkObj.value(QStringLiteral("from")).toString();
-        QString toStr = fkObj.value(QStringLiteral("to")).toString();
-        // format: "table.column"
-        auto splitDot = [](const QString& s, QString* tbl, QString* col, QString* errMsg) -> bool {
-            int dot = s.indexOf('.');
-            if (dot < 0) {
-                if (errMsg)
-                    *errMsg = QStringLiteral("fkInject requires 'table.column' format: ") + s;
+    // fkInject — absent/null/[] are all no-op; object form is rejected
+    {
+        QJsonValue fkVal = o.value(QStringLiteral("fkInject"));
+        if (!fkVal.isUndefined() && !fkVal.isNull()) {
+            if (fkVal.isObject()) {
+                if (err)
+                    *err =
+                        QStringLiteral("route '") + out->table +
+                        QStringLiteral(
+                            "': fkInject must be an array [{from,pairs:[[p_col,c_col],...]},...]; "
+                            "old {\"from\":\"t.c\",\"to\":\"t.c\"} object form is removed");
                 return false;
             }
-            *tbl = s.left(dot);
-            *col = s.mid(dot + 1);
-            return true;
-        };
-        if (!splitDot(fromStr, &fk.fromTable, &fk.fromColumn, err))
-            return false;
-        if (!splitDot(toStr, &fk.toTable, &fk.toColumn, err))
-            return false;
-        if (fk.toTable != out->table) {
-            if (err)
-                *err = QStringLiteral("fkInject.to table must match route table: ") + fk.toTable;
-            return false;
+            if (!fkVal.isArray()) {
+                if (err)
+                    *err = QStringLiteral("route '") + out->table +
+                           QStringLiteral("': fkInject must be an array");
+                return false;
+            }
+            for (const auto& fkElem : fkVal.toArray()) {
+                QJsonObject fkObj = fkElem.toObject();
+                FkInjectSpec fk;
+                fk.fromTable = fkObj.value(QStringLiteral("from")).toString();
+                if (fk.fromTable.isEmpty()) {
+                    if (err)
+                        *err = QStringLiteral("route '") + out->table +
+                               QStringLiteral("': fkInject group missing 'from'");
+                    return false;
+                }
+                if (!isSimpleIdentifier(fk.fromTable)) {
+                    if (err)
+                        *err = QStringLiteral("route '") + out->table +
+                               QStringLiteral("': fkInject 'from' is not a valid identifier: ") +
+                               fk.fromTable;
+                    return false;
+                }
+                QJsonValue pairsVal = fkObj.value(QStringLiteral("pairs"));
+                if (!pairsVal.isArray()) {
+                    if (err)
+                        *err = QStringLiteral("route '") + out->table +
+                               QStringLiteral("': fkInject group from='") + fk.fromTable +
+                               QStringLiteral("' missing 'pairs' array");
+                    return false;
+                }
+                QJsonArray pairsArr = pairsVal.toArray();
+                if (pairsArr.isEmpty()) {
+                    if (err)
+                        *err = QStringLiteral("route '") + out->table +
+                               QStringLiteral("': fkInject group from='") + fk.fromTable +
+                               QStringLiteral("' has empty 'pairs'");
+                    return false;
+                }
+                for (const auto& pairElem : pairsArr) {
+                    QJsonArray pair = pairElem.toArray();
+                    if (pair.size() != 2) {
+                        if (err)
+                            *err =
+                                QStringLiteral("route '") + out->table +
+                                QStringLiteral("': fkInject pair must be [parent_col, child_col]");
+                        return false;
+                    }
+                    QString parentCol = pair[0].toString();
+                    QString childCol = pair[1].toString();
+                    if (!isSimpleIdentifier(parentCol) || !isSimpleIdentifier(childCol)) {
+                        if (err)
+                            *err = QStringLiteral("route '") + out->table +
+                                   QStringLiteral("': fkInject pair contains invalid identifier");
+                        return false;
+                    }
+                    fk.pairs.append({parentCol, childCol});
+                }
+                out->fkInject.append(fk);
+            }
         }
-        out->fkInject = fk;
+    }
+
+    // lookups — absent/null are no-op; must be array if present
+    {
+        QJsonValue lookupsVal = o.value(QStringLiteral("lookups"));
+        if (!lookupsVal.isUndefined() && !lookupsVal.isNull()) {
+            if (!lookupsVal.isArray()) {
+                if (err)
+                    *err = QStringLiteral("route '") + out->table +
+                           QStringLiteral("': 'lookups' must be an array");
+                return false;
+            }
+            QSet<QString> seenLookupNames;
+            for (const auto& lv : lookupsVal.toArray()) {
+                QJsonObject lo = lv.toObject();
+                LookupSpec lk;
+                lk.name = lo.value(QStringLiteral("name")).toString().trimmed();
+                if (lk.name.isEmpty()) {
+                    if (err)
+                        *err = QStringLiteral("route '") + out->table +
+                               QStringLiteral("': lookup missing non-empty 'name'");
+                    return false;
+                }
+                if (seenLookupNames.contains(lk.name)) {
+                    if (err)
+                        *err = QStringLiteral("route '") + out->table +
+                               QStringLiteral("': duplicate lookup name '") + lk.name + '\'';
+                    return false;
+                }
+                lk.fromTable = lo.value(QStringLiteral("from")).toString();
+                if (lk.fromTable.isEmpty()) {
+                    if (err)
+                        *err = QStringLiteral("route '") + out->table +
+                               QStringLiteral("': lookup '") + lk.name +
+                               QStringLiteral("' missing 'from'");
+                    return false;
+                }
+
+                // match — must be [[G_col, excel_header],...] array, not object
+                QJsonValue matchVal = lo.value(QStringLiteral("match"));
+                if (matchVal.isObject()) {
+                    if (err)
+                        *err = QStringLiteral("route '") + out->table +
+                               QStringLiteral("': lookup '") + lk.name +
+                               QStringLiteral(
+                                   "' match must be [[G_col,excel_header],...], not object");
+                    return false;
+                }
+                if (!matchVal.isArray() || matchVal.toArray().isEmpty()) {
+                    if (err)
+                        *err = QStringLiteral("route '") + out->table +
+                               QStringLiteral("': lookup '") + lk.name +
+                               QStringLiteral("' missing non-empty 'match' array");
+                    return false;
+                }
+                for (const auto& mv : matchVal.toArray()) {
+                    QJsonArray pair = mv.toArray();
+                    if (pair.size() != 2) {
+                        if (err)
+                            *err = QStringLiteral("route '") + out->table +
+                                   QStringLiteral("': lookup '") + lk.name +
+                                   QStringLiteral("' match entry must be [G_column, excel_header]");
+                        return false;
+                    }
+                    lk.match.append({pair[0].toString(), pair[1].toString()});
+                }
+
+                // select — must be [[G_col, target_dbColumn],...] array, not object
+                QJsonValue selectVal = lo.value(QStringLiteral("select"));
+                if (selectVal.isObject()) {
+                    if (err)
+                        *err = QStringLiteral("route '") + out->table +
+                               QStringLiteral("': lookup '") + lk.name +
+                               QStringLiteral(
+                                   "' select must be [[G_col,target_dbColumn],...], not object");
+                    return false;
+                }
+                if (!selectVal.isArray() || selectVal.toArray().isEmpty()) {
+                    if (err)
+                        *err = QStringLiteral("route '") + out->table +
+                               QStringLiteral("': lookup '") + lk.name +
+                               QStringLiteral("' missing non-empty 'select' array");
+                    return false;
+                }
+                for (const auto& sv : selectVal.toArray()) {
+                    QJsonArray pair = sv.toArray();
+                    if (pair.size() != 2) {
+                        if (err)
+                            *err = QStringLiteral("route '") + out->table +
+                                   QStringLiteral("': lookup '") + lk.name +
+                                   QStringLiteral(
+                                       "' select entry must be [G_column, target_dbColumn]");
+                        return false;
+                    }
+                    lk.select.append({pair[0].toString(), pair[1].toString()});
+                }
+
+                seenLookupNames.insert(lk.name);
+                out->lookups.append(lk);
+            }
+        }
     }
 
     // columns
@@ -136,40 +284,18 @@ bool ProfileLoader::readRoute(const QJsonObject& o, RouteSpec* out, QString* err
 bool ProfileLoader::readSingleTable(const QJsonObject& o, ProfileSpec* out, QString* err) {
     out->mode = ProfileMode::SingleTable;
 
-    RouteSpec route;
-    route.table = o.value(QStringLiteral("table")).toString();
-    if (route.table.isEmpty()) {
+    // Validate required fields before delegating
+    QString table = o.value(QStringLiteral("table")).toString();
+    if (table.isEmpty()) {
         if (err)
             *err = QStringLiteral("singleTable profile missing 'table'");
         return false;
     }
-    if (!isSimpleIdentifier(route.table)) {
-        if (err)
-            *err = QStringLiteral("table is not a valid identifier");
+
+    // Delegate to readRoute so lookups/fkInject are also parsed
+    RouteSpec route;
+    if (!readRoute(o, &route, err))
         return false;
-    }
-
-    // conflict
-    QJsonObject conflictObj = o.value(QStringLiteral("conflict")).toObject();
-    QJsonArray conflictCols = conflictObj.value(QStringLiteral("columns")).toArray();
-    for (const auto& c : conflictCols) {
-        QString col = c.toString();
-        if (!isSimpleIdentifier(col)) {
-            if (err)
-                *err = QStringLiteral("conflict column is not a valid identifier: ") + col;
-            return false;
-        }
-        route.conflict.columns.append(col);
-    }
-
-    // columns
-    QJsonObject colsObj = o.value(QStringLiteral("columns")).toObject();
-    for (auto it = colsObj.begin(); it != colsObj.end(); ++it) {
-        ColumnSpec col;
-        if (!readColumn(it.key(), it.value().toObject(), &col, err))
-            return false;
-        route.columns.append(col);
-    }
 
     out->routes.append(route);
     return true;

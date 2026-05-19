@@ -2,6 +2,7 @@
 
 #include "dbridge/Errors.h"
 
+#include <QSet>
 #include <QSqlError>
 #include <QSqlQuery>
 
@@ -12,20 +13,13 @@ namespace dbridge::detail {
 bool ForeignKeyPreflight::check(const QVector<RowContext>& contexts,
                                 const QVector<RouteSpec>& allRoutes, QSqlDatabase& db,
                                 const QString& sheet, ErrorCollector* errors) {
-    // Build a map of table -> conflict key values present in this batch.
-    // Caller (ImportService) filters contexts per class in mixed mode, so all
-    // payloads here belong to a single class; using payload.table matches the
-    // lookup side below (fk.fromTable is a bare table name).
-    QHash<QString, QVector<QVariant>> batchParentKeys;
+    QHash<QString, QVector<RoutePayload>> batchParentPayloads;
     for (const auto& ctx : contexts) {
         for (const auto& payload : ctx.payloads) {
-            if (!payload.conflictVals.isEmpty() && !payload.conflictVals[0].isNull()) {
-                batchParentKeys[payload.table].append(payload.conflictVals[0]);
-            }
+            batchParentPayloads[payload.table].append(payload);
         }
     }
 
-    // Build route lookup
     QHash<QString, const RouteSpec*> routeByTable;
     for (const auto& r : allRoutes)
         routeByTable[r.table] = &r;
@@ -34,9 +28,10 @@ bool ForeignKeyPreflight::check(const QVector<RowContext>& contexts,
     for (const auto& ctx : contexts) {
         for (const auto& payload : ctx.payloads) {
             const RouteSpec* rs = routeByTable.value(payload.table, nullptr);
-            if (!rs || !rs->fkInject.has_value())
+            if (!rs || rs->fkInject.isEmpty())
                 continue;
-            if (!checkPayload(payload, *rs, batchParentKeys, db, sheet, ctx.excelRow, errors)) {
+            if (!checkPayload(payload, *rs, batchParentPayloads, routeByTable, db, sheet,
+                              ctx.excelRow, errors)) {
                 allOk = false;
             }
         }
@@ -44,46 +39,120 @@ bool ForeignKeyPreflight::check(const QVector<RowContext>& contexts,
     return allOk;
 }
 
-bool ForeignKeyPreflight::checkPayload(const RoutePayload& payload, const RouteSpec& routeSpec,
-                                       const QHash<QString, QVector<QVariant>>& batchParentKeys,
-                                       QSqlDatabase& db, const QString& sheet, int excelRow,
-                                       ErrorCollector* errors) {
-    const FkInjectSpec& fk = routeSpec.fkInject.value();
+bool ForeignKeyPreflight::checkPayload(
+    const RoutePayload& payload, const RouteSpec& routeSpec,
+    const QHash<QString, QVector<RoutePayload>>& batchParentPayloads,
+    const QHash<QString, const RouteSpec*>& routeByTable, QSqlDatabase& db, const QString& sheet,
+    int excelRow, ErrorCollector* errors) {
+    bool ok = true;
 
-    // Find the FK value in payload
-    int fkColIdx = payload.indexOf(fk.toColumn);
-    if (fkColIdx < 0)
-        return true;  // not yet injected, skip
-    QVariant fkVal = payload.binds[fkColIdx];
-    if (fkVal.isNull())
-        return true;
+    for (const FkInjectSpec& fk : routeSpec.fkInject) {
+        // §7.5 Group-level skip for lookup-derived groups.
+        // If every pair.first in this group is a lookup select target of the parent route,
+        // the parent values were validated at prefetch time — skip the DB probe entirely.
+        const RouteSpec* parentSpec = routeByTable.value(fk.fromTable, nullptr);
+        if (parentSpec && !parentSpec->lookups.isEmpty()) {
+            QSet<QString> parentLookupTargets;
+            for (const LookupSpec& lk : parentSpec->lookups) {
+                for (const auto& sp : lk.select)
+                    parentLookupTargets.insert(sp.second);
+            }
+            bool allLookupDerived = true;
+            for (const auto& pair : fk.pairs) {
+                if (!parentLookupTargets.contains(pair.first)) {
+                    allLookupDerived = false;
+                    break;
+                }
+            }
+            if (allLookupDerived)
+                continue;  // validated at prefetch; no SQL probe needed
+        }
 
-    // Check if parent row exists in this batch
-    const auto& batchKeys = batchParentKeys.value(fk.fromTable);
-    for (const auto& bk : batchKeys) {
-        if (bk == fkVal)
-            return true;  // found in batch
+        // Build the child-side tuple and the SQL column list from pair.second (child cols).
+        QVector<QVariant> childTuple;
+        QStringList childCols;
+        QStringList parentCols;
+        bool anyMissing = false;
+        bool anyNull = false;
+
+        for (const auto& pair : fk.pairs) {
+            int idx = payload.indexOf(pair.second);
+            if (idx < 0) {
+                anyMissing = true;
+                break;
+            }
+            QVariant v = payload.binds[idx];
+            if (v.isNull()) {
+                anyNull = true;
+                break;
+            }
+            childTuple.append(v);
+            childCols.append(pair.second);
+            parentCols.append(pair.first);
+        }
+
+        if (anyMissing || anyNull)
+            continue;  // not yet injected or null — upstream reports the error
+
+        // Check in-batch: compare tuple against parent payload binds by parent column name
+        const auto& batchPayloads = batchParentPayloads.value(fk.fromTable);
+        bool foundInBatch = false;
+        for (const RoutePayload& parentPayload : batchPayloads) {
+            bool match = true;
+            for (int i = 0; i < fk.pairs.size(); ++i) {
+                int pIdx = parentPayload.indexOf(fk.pairs[i].first);
+                if (pIdx < 0 || parentPayload.binds[pIdx] != childTuple[i]) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) {
+                foundInBatch = true;
+                break;
+            }
+        }
+        if (foundInBatch)
+            continue;
+
+        // Not in batch — probe the DB with a composite WHERE clause
+        if (onProbe)
+            onProbe(fk.fromTable);
+
+        QStringList conditions;
+        for (const auto& pc : parentCols)
+            conditions.append(pc + QStringLiteral(" = ?"));
+        QString sql = QStringLiteral("SELECT 1 FROM ") + fk.fromTable + QStringLiteral(" WHERE ") +
+                      conditions.join(QStringLiteral(" AND ")) + QStringLiteral(" LIMIT 1");
+
+        QSqlQuery q(db);
+        q.prepare(sql);
+        for (const auto& v : childTuple)
+            q.addBindValue(v);
+
+        if (!q.exec()) {
+            errors->add(sheet, excelRow, childCols.join(QLatin1Char(',')), childTuple[0].toString(),
+                        QString::fromLatin1(err::E_VALIDATE_FK),
+                        QStringLiteral("FK check query failed: ") + q.lastError().text());
+            ok = false;
+            continue;
+        }
+
+        if (!q.next()) {
+            QStringList tupleParts;
+            QStringList tupleVals;
+            for (int i = 0; i < parentCols.size(); ++i) {
+                tupleParts.append(parentCols[i] + QLatin1Char('=') + childTuple[i].toString());
+                tupleVals.append(childTuple[i].toString());
+            }
+            errors->add(sheet, excelRow, childCols.join(QLatin1Char(',')),
+                        tupleVals.join(QLatin1Char(',')), QString::fromLatin1(err::E_VALIDATE_FK),
+                        QStringLiteral("Foreign key (") + tupleParts.join(QStringLiteral(", ")) +
+                            QStringLiteral(") not found in ") + fk.fromTable);
+            ok = false;
+        }
     }
 
-    // Check in DB
-    QSqlQuery q(db);
-    q.prepare(QStringLiteral("SELECT 1 FROM ") + fk.fromTable + QStringLiteral(" WHERE ") +
-              fk.fromColumn + QStringLiteral(" = ? LIMIT 1"));
-    q.addBindValue(fkVal);
-    if (!q.exec()) {
-        errors->add(sheet, excelRow, fk.toColumn, fkVal.toString(),
-                    QString::fromLatin1(err::E_VALIDATE_FK),
-                    QStringLiteral("FK check query failed: ") + q.lastError().text());
-        return false;
-    }
-    if (!q.next()) {
-        errors->add(sheet, excelRow, fk.toColumn, fkVal.toString(),
-                    QString::fromLatin1(err::E_VALIDATE_FK),
-                    QStringLiteral("Foreign key '") + fkVal.toString() +
-                        QStringLiteral("' not found in ") + fk.fromTable + '.' + fk.fromColumn);
-        return false;
-    }
-    return true;
+    return ok;
 }
 
 }  // namespace dbridge::detail

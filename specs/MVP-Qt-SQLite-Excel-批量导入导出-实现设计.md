@@ -238,10 +238,7 @@ public:
     {
       "table": "order_items",
       "parent": "orders",
-      "fkInject": {
-        "from": "orders.order_no",
-        "to": "order_items.order_no"
-      },
+      "fkInject": [{ "from": "orders", "pairs": [["order_no","order_no"]] }],
       "conflict": { "columns": ["order_no", "line_no"] },
       "columns": {
         "line_no": { "source": "LineNo", "validators": ["int>=1"] },
@@ -275,7 +272,7 @@ public:
       "match": { "equals": "A" },
       "routes": [
         { "table": "m1", "conflict": { "columns": ["m_no"] }, "columns": {} },
-        { "table": "m2", "parent": "m1", "fkInject": { "from": "m1.m_no", "to": "m2.m_no" }, "conflict": { "columns": ["m_no", "line_no"] }, "columns": {} }
+        { "table": "m2", "parent": "m1", "fkInject": [{ "from": "m1", "pairs": [["m_no","m_no"]] }], "conflict": { "columns": ["m_no", "line_no"] }, "columns": {} }
       ]
     },
     {

@@ -112,10 +112,11 @@ if (!result.ok) {
 
 ```text
 dbridge/
-├── include/dbridge/                    ← 公开头（只有这 3 个文件对外）
+├── include/dbridge/                    ← 公开头（只有这 4 个文件对外）
 │   ├── DataBridge.h                    ← 门面类，宿主只 #include 这个
-│   ├── Types.h                         ← ConnectionSpec/ImportOptions/RowError 等结构体
-│   └── Errors.h                        ← E_OPEN_DB / E_VALIDATE_NULL ... 错误码常量
+│   ├── Types.h                         ← ConnectionSpec/ImportOptions/RowError/ImportResult 等结构体
+│   ├── RowPayload.h                    ← RowContext/RoutePayload（dryRunPayloads 类型；由 Types.h 引入）
+│   └── Errors.h                        ← E_OPEN_DB / E_VALIDATE_NULL / E_LOOKUP_* ... 错误码常量
 │
 ├── src/                                ← 实现细节（宿主看不到）
 │   ├── DataBridge.cpp                  ← PImpl 外壳，把请求转给具体 Service
@@ -158,8 +159,8 @@ dbridge/
 │
 ├── 3rdparty/QXlsx/                     ← QXlsx 第三方库（vendored）
 │
-├── tests/                              ← 单元 + 集成测试（9 套，CMake 列在 tests/CMakeLists.txt）
-│   ├── unit/                           ← 模块级单元测试（Profile/Schema/Validators/SqlBuilder/Mapper/Router/TopoSorter/FkPreflight ...）
+├── tests/                              ← 单元 + 集成测试（12 套，CMake 列在 tests/CMakeLists.txt）
+│   ├── unit/                           ← 模块级单元测试（ProfileLoader/ProfileValidator/Schema/Validators/SqlBuilder/Mapper/Router/TopoSorter/FkPreflight/LookupPrefetch/LookupSemantics）
 │   ├── integration/                    ← DataBridge 端到端集成
 │   └── data/                           ← 测试夹具
 │       ├── sql/                        ← schema 初始化 SQL（01_customer / 02_orders / 03_mixed / 04_mixed_multitable）
@@ -1026,6 +1027,31 @@ std::stable_sort(allRows.begin(), allRows.end(),
 
 ---
 
+## ⚠️ BREAKING：fkInject 格式变更
+
+旧的单列对象写法 `"fkInject": { "from": "table.col", "to": "table.col" }` 已**删除**，不再向后兼容。
+
+**迁移对照**：
+
+```jsonc
+// 旧（已删除，会报 parse error）
+"fkInject": { "from": "orders.order_no", "to": "order_items.order_no" }
+
+// 新（单列）
+"fkInject": [{ "from": "orders", "pairs": [["order_no","order_no"]] }]
+
+// 新（多列复合键）
+"fkInject": [
+  { "from": "orders", "pairs": [["order_no","order_no"],["tenant_id","tenant_id"]] }
+]
+
+// 新（多父表）
+"fkInject": [
+  { "from": "orders",      "pairs": [["order_no","order_no"]] },
+  { "from": "ref_tenants", "pairs": [["tenant_id","tenant_id"]] }
+]
+```
+
 ## 12. 三种 Profile 模式对比
 
 | 维度 | SingleTable | MultiTable | Mixed |
@@ -1072,7 +1098,7 @@ std::stable_sort(allRows.begin(), allRows.end(),
     {
       "table": "order_items",
       "parent": "orders",
-      "fkInject": { "from": "orders.order_no", "to": "order_items.order_no" },
+      "fkInject": [{ "from": "orders", "pairs": [["order_no","order_no"]] }],
       "conflict": { "columns": ["order_no", "line_no"] },
       "columns": { "line_no": { "source": "LineNo" }, "sku": { "source": "Sku" } }
     }
@@ -1127,6 +1153,11 @@ graph LR
         e13[E_VALIDATE_REGEX<br/>正则不匹配]
         e14[E_VALIDATE_DUPLICATE<br/>批内 conflict key 重复]
         e15[E_VALIDATE_FK<br/>父行不存在]
+        e18[E_LOOKUP_KEY_EMPTY<br/>lookup key 为空]
+        e19[E_LOOKUP_KEY_INVALID<br/>lookup key 类型转换失败]
+        e20[E_LOOKUP_NOT_FOUND<br/>参考表无命中]
+        e21[E_LOOKUP_AMBIGUOUS<br/>参考表命中多行]
+        e22[E_LOOKUP_QUERY_FAILED<br/>lookup SELECT 失败]
     end
 
     subgraph Run["运行期错误"]
@@ -1232,12 +1263,12 @@ cmake --build build -j$(nproc)
 
 ```bash
 cd build
-ctest --output-on-failure          # 全部 9 个测试套件
+ctest --output-on-failure          # 全部 12 个测试套件
 ctest --output-on-failure -V       # 详细日志
 ctest -R tst_profile_loader        # 只跑某个测试（套件名见 tests/CMakeLists.txt）
 ```
 
-完整套件清单见 `tests/CMakeLists.txt`；其中 `tst_fk_preflight` 锁定 mixed 模式 FK 预校验回归（详见 §14.16 端到端验证流程）。
+完整套件清单见 `tests/CMakeLists.txt`；其中 `tst_fk_preflight` 锁定 mixed 模式 FK 预校验回归，`tst_profile_validator` 覆盖 Profile × DB × Excel 三方校验，`tst_lookup_prefetch` / `tst_lookup_semantics` 覆盖 lookup 预取与行级语义（详见 §14.16 端到端验证流程）。
 
 #### 14.2.5 安装（可选）
 
@@ -1454,6 +1485,7 @@ struct ImportOptions {
     QString profileName;         // 必填：要用哪份 Profile
     QString sheetName;           // 可选：覆盖 Profile 里的 sheet，为空则用 Profile 的
     bool abortOnError = true;    // MVP 必须 true，false 行为未实现
+    bool dryRun = false;         // true = 跳过 UPSERT，仅校验和预取；不建议用于生产
 };
 ```
 
@@ -1470,10 +1502,11 @@ struct ExportOptions {
 
 ```cpp
 struct ImportResult {
-    bool ok = false;             // 全部成功才 true
-    int readRows = 0;            // 从 Excel 读到的行数
-    int writtenRows = 0;         // 成功写入 DB 的行数；失败时为 0（all-or-nothing）
-    QList<RowError> errors;      // 所有错误（不止一个！）
+    bool ok = false;                          // 全部成功才 true
+    int readRows = 0;                         // 从 Excel 读到的行数
+    int writtenRows = 0;                      // 成功写入 DB 的行数；失败时为 0（all-or-nothing）
+    QList<RowError> errors;                   // 所有错误（不止一个！）
+    QVector<RowContext> dryRunPayloads;        // dryRun=true 时暴露构造好的 payload 列表
 };
 
 struct RowError {
@@ -1668,15 +1701,59 @@ sqlite3 demo.db 'SELECT * FROM customer;'
     {
       "table": "order_items",
       "parent": "orders",                                   // 父表名（必须先于本表写）
-      "fkInject": {
-        "from": "orders.order_no",                          // 父表 .业务键列
-        "to":   "order_items.order_no"                      // 子表 .对应列
-      },
+      "fkInject": [{ "from": "orders", "pairs": [["order_no","order_no"]] }],
+      "lookups": [                                          // 可选：从同库参考表预取字段
+        {
+          "name": "cust",                                   // route 内唯一的标识名
+          "from": "ref_customers",                          // 参考表名（同一 SQLite 连接）
+          "match": [["c_no", "CustNo"]],                    // [[参考表列, Excel 表头], ...]
+          "select": [["c_name", "customer_name"]]           // [[参考表列, 目标 DB 列], ...]
+        }
+      ],
       "conflict": { "columns": ["order_no", "line_no"] },
       "columns": { ... }
     }
   ]
 }
+```
+
+**lookups 字段说明**
+
+每个 lookup 元素从同一 SQLite 连接的参考表 `from` 中批量预取字段，行级别命中后合并到当前 route 的写入列集合：
+
+| 子字段 | 必填 | 说明 |
+|--------|------|------|
+| `name` | ✓ | Route 内唯一标识，不影响 DB 写入 |
+| `from` | ✓ | 参考表名（必须在同一 SQLite 连接中存在） |
+| `match` | ✓ | `[[参考表列, Excel 表头], ...]`：用 Excel 行的表头值查参考表键 |
+| `select` | ✓ | `[[参考表列, 目标 DB 列], ...]`：命中后写入当前 route 的哪些列 |
+
+**错误码**：
+
+| 错误码 | 含义 |
+|--------|------|
+| `E_LOOKUP_KEY_EMPTY` | Excel match key 为空（null / 纯空白） |
+| `E_LOOKUP_KEY_INVALID` | match key 值无法转换为参考表列的类型亲和（如字母值对应 INTEGER 列） |
+| `E_LOOKUP_NOT_FOUND` | 参考表中找不到该 key |
+| `E_LOOKUP_AMBIGUOUS` | 参考表中命中多行（需保证 match key 唯一） |
+| `E_LOOKUP_QUERY_FAILED` | SELECT 执行失败（SQL 错误） |
+
+> 所有 lookup 错误均为 **row-level error**（记录到该行，不中断整批导入）。
+
+**fkInject 字段说明**
+
+| 子字段 | 必填 | 说明 |
+|--------|------|------|
+| `from` | ✓ | 父 route 的 `table` 名 |
+| `pairs` | ✓ | `[[父列, 子列], ...]`：从父行的哪些列注入到子行 |
+
+多父表注入示例：
+
+```jsonc
+"fkInject": [
+  { "from": "orders",      "pairs": [["order_no","order_no"],["tenant_id","tenant_id"]] },
+  { "from": "ref_tenants", "pairs": [["region_code","region"]] }
+]
 ```
 
 #### Mixed mode 字段
@@ -1805,7 +1882,7 @@ CREATE TABLE order_items (
     {
       "table": "order_items",
       "parent": "orders",
-      "fkInject": { "from": "orders.order_no", "to": "order_items.order_no" },
+      "fkInject": [{ "from": "orders", "pairs": [["order_no","order_no"]] }],
       "conflict": { "columns": ["order_no", "line_no"] },
       "columns": {
         "line_no": { "source": "LineNo", "validators": ["int>=1"] },
@@ -2214,7 +2291,7 @@ A：本项目里"字段类型"不是单独字段，而是通过列上的 `valida
         {
             "table": "order_items",
             "parent": "orders",
-            "fkInject": { "from": "orders.order_no", "to": "order_items.order_no" },
+            "fkInject": [{ "from": "orders", "pairs": [["order_no","order_no"]] }],
             "conflict": { "columns": ["order_no", "line_no"] },
             "columns": {
                 "line_no": { "source": "LineNo", "validators": ["int>=1"] },
@@ -2235,6 +2312,59 @@ A：本项目里"字段类型"不是单独字段，而是通过列上的 `valida
 - **日期**列建议必挂 `date:fmt`：即便 QXlsx 已识别为 `QDate` 也会原样直通；若返回的是字符串 / serial 会被强制归一化，下游对账才不会因格式差异错配。
 - **conflict.columns / FK 列**尤其要显式声明类型，避免一边 INTEGER 一边 TEXT 导致 UPSERT / 外键比对失效（参见 Q7 第 5 条）。
 - 目前 profile 里**没有** `type: "integer"` 这样的字段；若想往"声明式类型"路线扩展，需要在 `ProfileSpec::ColumnSpec` 上加 `dbType` 字段，并在 `Validators::compileToken` 或 `Mapper` 里据此派生默认 validator。属于功能扩展，不是当前已支持的能力。
+
+**Q9：如何在导入时从同库另一张参考表拉取字段（lookup）？**
+
+A：在 route 的 `lookups` 数组里声明即可。dbridge 会在导入前（Phase A.5）批量预取，行级别命中后合并到当前 route 的写入列集合——**不产生逐行 SQL**。
+
+```jsonc
+{
+  "table": "orders",
+  "conflict": { "columns": ["order_no"] },
+  "lookups": [
+    {
+      "name": "cust",
+      "from": "ref_customers",
+      "match":  [["c_no",  "CustNo"]],
+      "select": [["c_name","customer_name"],
+                 ["c_tier","tier"]]
+    }
+  ],
+  "columns": { "order_no": { "source": "OrderNo" } }
+}
+```
+
+**关键约束**：
+
+- 参考表 `from` 必须在同一 SQLite 连接中（不支持 `ATTACH` 跨文件）。
+- `match` 的 Excel 表头必须出现在当前 sheet 的 header row 里。
+- `select` 的目标 DB 列在 route 内必须唯一（不能与 `columns` 里的 `dbColumn` 重名）。
+- 命中 0 行 → `E_LOOKUP_NOT_FOUND`；命中多行 → `E_LOOKUP_AMBIGUOUS`；key 为空 → `E_LOOKUP_KEY_EMPTY`；key 类型不兼容参考表列 → `E_LOOKUP_KEY_INVALID`（均为 row-level 错误）。
+- lookup 输出列可被本 route 的 `fkInject` 作为注入源（即"两跳"传播到子表），但不支持 lookup 级联（lookupA 的输出不能做 lookupB 的 match key）。
+
+**Q10：fkInject 如何注入多列 / 多个父表？**
+
+A：`fkInject` 是一个数组，每个元素对应一个父表，`pairs` 列出父→子的列对：
+
+```jsonc
+"fkInject": [
+  {
+    "from": "orders",
+    "pairs": [
+      ["order_no",  "order_no"],
+      ["tenant_id", "tenant_id"]
+    ]
+  },
+  {
+    "from": "ref_tenants",
+    "pairs": [
+      ["region_code", "region"]
+    ]
+  }
+]
+```
+
+> **注意**：旧的单列对象写法 `{ "from": "t.col", "to": "t.col" }` 已**完全移除**，不兼容。迁移方法见 §⚠️ BREAKING 章节。
 
 ---
 

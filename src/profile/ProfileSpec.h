@@ -1,8 +1,8 @@
 #pragma once
+#include <QPair>
+#include <QString>
 #include <QStringList>
 #include <QVector>
-
-#include <optional>
 
 namespace dbridge::detail {
 
@@ -18,18 +18,31 @@ struct ConflictSpec {
     QStringList columns;  // must match PRIMARY KEY or UNIQUE
 };
 
+// Multi-column / multi-parent foreign-key injection.
+// A route's fkInject is a QVector<FkInjectSpec>; each entry names one parent
+// table and one or more (parent_column, child_column) pairs to copy at import
+// time. Legacy single-object {from:"t.c", to:"t.c"} form is no longer accepted.
 struct FkInjectSpec {
-    QString fromTable;   // "orders"
-    QString fromColumn;  // "order_no"
-    QString toTable;     // "order_items"
-    QString toColumn;    // "order_no"
+    QString fromTable;                       // parent table (must be a route in this profile)
+    QVector<QPair<QString, QString>> pairs;  // (parent_column, child_column)
+};
+
+// Route-level lookup: pull a set of columns from a reference table G in the
+// same SQLite database, by equality on Excel-header values. The looked-up
+// columns become route-local dbColumns on this route's payload.
+struct LookupSpec {
+    QString name;                             // non-empty, unique within route
+    QString fromTable;                        // G
+    QVector<QPair<QString, QString>> match;   // (G_column, Excel header)
+    QVector<QPair<QString, QString>> select;  // (G_column, route-local dbColumn)
 };
 
 struct RouteSpec {
     QString table;
     QString parent;  // empty = root
     ConflictSpec conflict;
-    std::optional<FkInjectSpec> fkInject;
+    QVector<FkInjectSpec> fkInject;  // array; may be empty
+    QVector<LookupSpec> lookups;     // array; may be empty
     QVector<ColumnSpec> columns;
 };
 

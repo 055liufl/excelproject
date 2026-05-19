@@ -32,10 +32,8 @@ RouteSpec makeOrderItemsRoute() {
     r.conflict.columns << QStringLiteral("order_no") << QStringLiteral("line_no");
     FkInjectSpec fk;
     fk.fromTable = QStringLiteral("orders");
-    fk.fromColumn = QStringLiteral("order_no");
-    fk.toTable = QStringLiteral("order_items");
-    fk.toColumn = QStringLiteral("order_no");
-    r.fkInject = fk;
+    fk.pairs.append({QStringLiteral("order_no"), QStringLiteral("order_no")});
+    r.fkInject.append(fk);
     ColumnSpec lineNo;
     lineNo.dbColumn = QStringLiteral("line_no");
     lineNo.source = QStringLiteral("LineNo");
@@ -169,6 +167,87 @@ class TstFkPreflight : public QObject {
         QCOMPARE(errors.list().first().row, 4);
         QCOMPARE(errors.list().first().column, QStringLiteral("order_no"));
         QCOMPARE(errors.list().first().rawValue, QStringLiteral("SO-MISSING"));
+    }
+
+    // §7.7 onProbe counter: parent found in-batch → NO SQL probe issued
+    void testInBatchHitNoProbe() {
+        QSqlDatabase db = openMemoryDb();
+
+        RowContext ctx;
+        ctx.excelRow = 2;
+        ctx.classId = QString();
+        ctx.payloads << makeParentPayload(QString(), QStringLiteral("SO-001"))
+                     << makeChildPayload(QString(), QStringLiteral("SO-001"), 1);
+
+        QVector<RouteSpec> routes;
+        routes << makeOrdersRoute() << makeOrderItemsRoute();
+
+        int probeCount = 0;
+        ErrorCollector errors;
+        ForeignKeyPreflight fk;
+        fk.onProbe = [&](const QString&) { ++probeCount; };
+        QVERIFY(fk.check({ctx}, routes, db, QStringLiteral("Orders"), &errors));
+        QCOMPARE(probeCount, 0);  // in-batch → no DB probe
+    }
+
+    // §7.7 onProbe counter: parent not in batch → SQL probe issued
+    void testMissParentTriggersProbe() {
+        QSqlDatabase db = openMemoryDb();
+        QSqlQuery q(db);
+        QVERIFY(q.exec(QStringLiteral("INSERT INTO orders(order_no) VALUES('SO-999')")));
+
+        RowContext ctx;
+        ctx.excelRow = 3;
+        ctx.classId = QString();
+        ctx.payloads << makeChildPayload(QString(), QStringLiteral("SO-999"), 1);
+
+        QVector<RouteSpec> routes;
+        routes << makeOrdersRoute() << makeOrderItemsRoute();
+
+        int probeCount = 0;
+        ErrorCollector errors;
+        ForeignKeyPreflight fk;
+        fk.onProbe = [&](const QString&) { ++probeCount; };
+        QVERIFY(fk.check({ctx}, routes, db, QStringLiteral("Orders"), &errors));
+        QCOMPARE(probeCount, 1);  // not in batch → 1 DB probe
+        QVERIFY(errors.empty());
+    }
+
+    // §7.5 group-level skip: lookup-derived group → no probe even if parent not in batch
+    void testLookupDerivedGroupSkipsProbe() {
+        QSqlDatabase db = openMemoryDb();
+        // Do NOT insert SO-999 — if probe fires, it would return false
+
+        // Simulate a parent route that has a lookup output "order_no"
+        RouteSpec ordersWithLookup;
+        ordersWithLookup.table = QStringLiteral("orders");
+        ordersWithLookup.conflict.columns << QStringLiteral("order_no");
+        LookupSpec lk;
+        lk.name = QStringLiteral("ref");
+        lk.fromTable = QStringLiteral("ref_table");
+        lk.select.append(
+            {QStringLiteral("ref_col"), QStringLiteral("order_no")});  // ← produces order_no
+        ordersWithLookup.lookups << lk;
+
+        RouteSpec items = makeOrderItemsRoute();
+        // fkInject pair.first = "order_no" → lookup-derived → group should be skipped
+
+        RowContext ctx;
+        ctx.excelRow = 5;
+        ctx.classId = QString();
+        ctx.payloads << makeChildPayload(QString(), QStringLiteral("SO-999"), 1);
+
+        QVector<RouteSpec> routes;
+        routes << ordersWithLookup << items;
+
+        int probeCount = 0;
+        ErrorCollector errors;
+        ForeignKeyPreflight fk;
+        fk.onProbe = [&](const QString&) { ++probeCount; };
+        // Result: group is lookup-derived → skip → check returns true, no error
+        QVERIFY(fk.check({ctx}, routes, db, QStringLiteral("Orders"), &errors));
+        QCOMPARE(probeCount, 0);  // §7.5: lookup-derived skip
+        QVERIFY(errors.empty());
     }
 };
 

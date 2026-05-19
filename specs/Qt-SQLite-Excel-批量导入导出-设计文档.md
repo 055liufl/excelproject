@@ -422,10 +422,7 @@ DBRIDGE_API void registerDriver(DbKind kind,
           "table": "m2",
           "parent": "m1",
           "cardinality": "oneToMany",                 // 见 §5.4
-          "fkInject": {
-            "from": { "table": "m1", "column": "order_no" },  // 优先用业务键，而非代理主键
-            "to":   { "column": "order_no" }
-          },
+          "fkInject": [{ "from": "m1", "pairs": [["order_no","order_no"]] }],
           "conflict": { "constraintName": "pk_m2", "columns": ["order_no","line_no"] },
           "columns": {
             "line_no":   { "source": { "kind": "header", "name": "LineNo" } },

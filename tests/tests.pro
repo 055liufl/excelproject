@@ -16,6 +16,9 @@ SUBDIRS = \
     tst_router \
     tst_auto_profile_builder \
     tst_fk_preflight \
+    tst_profile_validator \
+    tst_lookup_prefetch \
+    tst_lookup_semantics \
     tst_import_single
 
 tst_profile_loader.file       = unit/tst_profile_loader.pro
@@ -26,6 +29,9 @@ tst_topo_sorter.file          = unit/tst_topo_sorter.pro
 tst_router.file               = unit/tst_router.pro
 tst_auto_profile_builder.file = unit/tst_auto_profile_builder.pro
 tst_fk_preflight.file         = unit/tst_fk_preflight.pro
+tst_profile_validator.file    = unit/tst_profile_validator.pro
+tst_lookup_prefetch.file      = unit/tst_lookup_prefetch.pro
+tst_lookup_semantics.file     = unit/tst_lookup_semantics.pro
 tst_import_single.file        = integration/tst_import_single.pro
 
 OTHER_FILES += test-common.pri

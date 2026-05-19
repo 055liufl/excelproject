@@ -1,6 +1,9 @@
 #pragma once
+#include "dbridge/RowPayload.h"
+
 #include <QList>
 #include <QString>
+#include <QVector>
 
 namespace dbridge {
 
@@ -14,6 +17,7 @@ struct ImportOptions {
     QString profileName;
     QString sheetName;         // empty = use Profile's sheet
     bool abortOnError = true;  // MVP must be true
+    bool dryRun = false;       // skip UPSERT; populate ImportResult::dryRunPayloads
 };
 
 struct ExportOptions {
@@ -35,6 +39,9 @@ struct ImportResult {
     int readRows = 0;
     int writtenRows = 0;
     QList<RowError> errors;
+    // Populated only when ImportOptions::dryRun == true.
+    // Contains the fully-constructed RowContexts (after lookup + fkInject, before UPSERT).
+    QVector<dbridge::detail::RowContext> dryRunPayloads;
 };
 
 struct ExportResult {

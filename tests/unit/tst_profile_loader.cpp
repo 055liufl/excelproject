@@ -98,7 +98,7 @@ class TstProfileLoader : public QObject {
                 {
                     "table": "order_items",
                     "parent": "orders",
-                    "fkInject": { "from": "orders.order_no", "to": "order_items.order_no" },
+                    "fkInject": [{ "from": "orders", "pairs": [["order_no","order_no"]] }],
                     "conflict": { "columns": ["order_no", "line_no"] },
                     "columns": {
                         "line_no": { "source": "LineNo", "validators": ["int>=1"] },
@@ -114,9 +114,11 @@ class TstProfileLoader : public QObject {
         QCOMPARE(spec.mode, ProfileMode::MultiTable);
         QCOMPARE(spec.routes.size(), 2);
         QCOMPARE(spec.routes[1].parent, QStringLiteral("orders"));
-        QVERIFY(spec.routes[1].fkInject.has_value());
-        QCOMPARE(spec.routes[1].fkInject->fromTable, QStringLiteral("orders"));
-        QCOMPARE(spec.routes[1].fkInject->toColumn, QStringLiteral("order_no"));
+        QCOMPARE(spec.routes[1].fkInject.size(), 1);
+        QCOMPARE(spec.routes[1].fkInject[0].fromTable, QStringLiteral("orders"));
+        QCOMPARE(spec.routes[1].fkInject[0].pairs.size(), 1);
+        QCOMPARE(spec.routes[1].fkInject[0].pairs[0].first, QStringLiteral("order_no"));
+        QCOMPARE(spec.routes[1].fkInject[0].pairs[0].second, QStringLiteral("order_no"));
     }
 
     void testMultiTableEmptyRoutes() {
@@ -203,6 +205,192 @@ class TstProfileLoader : public QObject {
         QString err;
         QVERIFY(!loader.load(QJsonDocument::fromJson(json.toUtf8()), &spec, &err));
         QVERIFY(err.contains("Unknown validator token"));
+    }
+
+    // §10.3 — fkInject new array format
+    void testFkInjectArrayMultiPair() {
+        QString json = R"({
+            "profileName": "test",
+            "sheet": "S",
+            "mode": "multiTable",
+            "routes": [
+                { "table": "orders", "conflict": { "columns": ["order_no"] }, "columns": {} },
+                {
+                    "table": "items",
+                    "parent": "orders",
+                    "conflict": { "columns": ["order_no","line_no"] },
+                    "fkInject": [
+                        { "from": "orders", "pairs": [["order_no","order_no"],["tenant_id","tenant_id"]] }
+                    ],
+                    "columns": {}
+                }
+            ]
+        })";
+        ProfileLoader loader;
+        ProfileSpec spec;
+        QString err;
+        QVERIFY2(loader.load(QJsonDocument::fromJson(json.toUtf8()), &spec, &err), err.toUtf8());
+        QCOMPARE(spec.routes[1].fkInject.size(), 1);
+        QCOMPARE(spec.routes[1].fkInject[0].fromTable, QStringLiteral("orders"));
+        QCOMPARE(spec.routes[1].fkInject[0].pairs.size(), 2);
+        QCOMPARE(spec.routes[1].fkInject[0].pairs[0].first, QStringLiteral("order_no"));
+        QCOMPARE(spec.routes[1].fkInject[0].pairs[1].first, QStringLiteral("tenant_id"));
+        QCOMPARE(spec.routes[1].fkInject[0].pairs[1].second, QStringLiteral("tenant_id"));
+    }
+
+    void testFkInjectOldObjectFormRejected() {
+        QString json = R"({
+            "profileName": "test",
+            "sheet": "S",
+            "mode": "multiTable",
+            "routes": [
+                { "table": "orders", "conflict": { "columns": ["id"] }, "columns": {} },
+                {
+                    "table": "items",
+                    "parent": "orders",
+                    "conflict": { "columns": ["id"] },
+                    "fkInject": { "from": "orders.order_no", "to": "items.order_no" },
+                    "columns": {}
+                }
+            ]
+        })";
+        ProfileLoader loader;
+        ProfileSpec spec;
+        QString err;
+        QVERIFY(!loader.load(QJsonDocument::fromJson(json.toUtf8()), &spec, &err));
+        QVERIFY2(err.contains("array") || err.contains("object") || err.contains("fkInject"),
+                 err.toUtf8());
+    }
+
+    // §10.3 — lookup parsing
+    void testLookupsValidParsing() {
+        QString json = R"({
+            "profileName": "test",
+            "sheet": "S",
+            "mode": "singleTable",
+            "table": "orders",
+            "conflict": { "columns": ["order_no"] },
+            "lookups": [
+                {
+                    "name": "cust",
+                    "from": "ref_customers",
+                    "match": [["c_no","客户编号"]],
+                    "select": [["c_name","customer_name"],["c_tier","tier"]]
+                }
+            ],
+            "columns": {}
+        })";
+        ProfileLoader loader;
+        ProfileSpec spec;
+        QString err;
+        QVERIFY2(loader.load(QJsonDocument::fromJson(json.toUtf8()), &spec, &err), err.toUtf8());
+        QCOMPARE(spec.routes[0].lookups.size(), 1);
+        const LookupSpec& lk = spec.routes[0].lookups[0];
+        QCOMPARE(lk.name, QStringLiteral("cust"));
+        QCOMPARE(lk.fromTable, QStringLiteral("ref_customers"));
+        QCOMPARE(lk.match.size(), 1);
+        QCOMPARE(lk.match[0].first, QStringLiteral("c_no"));
+        QCOMPARE(lk.match[0].second, QStringLiteral("客户编号"));
+        QCOMPARE(lk.select.size(), 2);
+        QCOMPARE(lk.select[0].second, QStringLiteral("customer_name"));
+        QCOMPARE(lk.select[1].second, QStringLiteral("tier"));
+    }
+
+    void testLookupMatchObjectFormRejected() {
+        QString json = R"({
+            "profileName": "test",
+            "sheet": "S",
+            "mode": "singleTable",
+            "table": "orders",
+            "conflict": { "columns": ["id"] },
+            "lookups": [
+                {
+                    "name": "cust",
+                    "from": "ref_customers",
+                    "match": { "c_no": "客户编号" },
+                    "select": [["c_name","customer_name"]]
+                }
+            ],
+            "columns": {}
+        })";
+        ProfileLoader loader;
+        ProfileSpec spec;
+        QString err;
+        QVERIFY(!loader.load(QJsonDocument::fromJson(json.toUtf8()), &spec, &err));
+    }
+
+    void testLookupSelectObjectFormRejected() {
+        QString json = R"({
+            "profileName": "test",
+            "sheet": "S",
+            "mode": "singleTable",
+            "table": "orders",
+            "conflict": { "columns": ["id"] },
+            "lookups": [
+                {
+                    "name": "cust",
+                    "from": "ref_customers",
+                    "match": [["c_no","客户编号"]],
+                    "select": { "c_name": "customer_name" }
+                }
+            ],
+            "columns": {}
+        })";
+        ProfileLoader loader;
+        ProfileSpec spec;
+        QString err;
+        QVERIFY(!loader.load(QJsonDocument::fromJson(json.toUtf8()), &spec, &err));
+    }
+
+    void testLookupNameRequired() {
+        QString json = R"({
+            "profileName": "test",
+            "sheet": "S",
+            "mode": "singleTable",
+            "table": "orders",
+            "conflict": { "columns": ["id"] },
+            "lookups": [
+                {
+                    "from": "ref_customers",
+                    "match": [["c_no","客户编号"]],
+                    "select": [["c_name","customer_name"]]
+                }
+            ],
+            "columns": {}
+        })";
+        ProfileLoader loader;
+        ProfileSpec spec;
+        QString err;
+        QVERIFY(!loader.load(QJsonDocument::fromJson(json.toUtf8()), &spec, &err));
+    }
+
+    void testLookupNameUniqueWithinRoute() {
+        QString json = R"({
+            "profileName": "test",
+            "sheet": "S",
+            "mode": "singleTable",
+            "table": "orders",
+            "conflict": { "columns": ["id"] },
+            "lookups": [
+                {
+                    "name": "cust",
+                    "from": "ref_customers",
+                    "match": [["c_no","客户编号"]],
+                    "select": [["c_name","customer_name"]]
+                },
+                {
+                    "name": "cust",
+                    "from": "ref_other",
+                    "match": [["x","y"]],
+                    "select": [["a","b"]]
+                }
+            ],
+            "columns": {}
+        })";
+        ProfileLoader loader;
+        ProfileSpec spec;
+        QString err;
+        QVERIFY(!loader.load(QJsonDocument::fromJson(json.toUtf8()), &spec, &err));
     }
 };
 

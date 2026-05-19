@@ -61,17 +61,20 @@ QString SqlBuilder::buildAutoJoinSelect(const QVector<RouteSpec>& routes,
                               QStringLiteral(" AS ") + col.source);
         }
 
-        if (&route != &routes[0]) {
-            // Build JOIN condition from fkInject (spec §6.2)
-            if (route.fkInject.has_value()) {
-                const FkInjectSpec& fk = route.fkInject.value();
-                joinClauses.append(QStringLiteral("LEFT JOIN ") + route.table +
-                                   QStringLiteral(" ON ") + fk.toTable + QStringLiteral(".") +
-                                   fk.toColumn + QStringLiteral(" = ") + fk.fromTable +
-                                   QStringLiteral(".") + fk.fromColumn);
+        if (&route != &routes[0] && !route.fkInject.isEmpty()) {
+            // Use the first fkInject group to determine the JOIN condition for export.
+            // For composite keys, AND-join all pairs in the group.
+            const FkInjectSpec& fk = route.fkInject[0];
+            QStringList onParts;
+            for (const auto& pair : fk.pairs) {
+                onParts.append(route.table + QLatin1Char('.') + pair.second +
+                               QStringLiteral(" = ") + fk.fromTable + QLatin1Char('.') +
+                               pair.first);
             }
-            // Routes without fkInject but with a parent should always have fkInject defined;
-            // ProfileValidator enforces this, so no fallback is needed here.
+            if (!onParts.isEmpty()) {
+                joinClauses.append(QStringLiteral("LEFT JOIN ") + route.table +
+                                   QStringLiteral(" ON ") + onParts.join(QStringLiteral(" AND ")));
+            }
         }
     }
 

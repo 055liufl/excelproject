@@ -16,10 +16,7 @@
         {
             "table": "order_items",
             "parent": "orders",
-            "fkInject": {
-                "from": "orders.order_no",
-                "to": "order_items.order_no"
-            },
+            "fkInject": [{ "from": "orders", "pairs": [["order_no","order_no"]] }],
             "conflict": {"columns": ["order_no", "line_no"]},
             "columns": {
                 "line_no": {"source": "LineNo", "validators": ["int>=1"]},

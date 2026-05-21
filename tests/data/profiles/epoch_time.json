@@ -1,0 +1,16 @@
+{
+    "profileName": "epoch_time",
+    "sheet": "EpochEvents",
+    "headerRow": 1,
+    "mode": "singleTable",
+    "table": "epoch_event",
+    "conflict": { "columns": ["event_id"] },
+    "datetimeFormat": {
+        "excel": { "type": "string", "format": "yyyy-MM-dd HH:mm:ss" },
+        "db":    { "type": "epochSec" }
+    },
+    "columns": {
+        "event_id": { "source": "EventID", "validators": ["notNull", "int"] },
+        "happen_at": { "source": "HappenAt" }
+    }
+}

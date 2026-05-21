@@ -6,6 +6,295 @@
 
 namespace dbridge::detail {
 
+namespace {
+
+// add-time-format-profile: per-slot token validation.
+// Date slots reject time tokens; time slots reject date tokens; datetime is unconstrained.
+// Tokens listed verbatim from spec "Format token validation per slot type".
+bool slotFormatTokensOk(TemporalSlotKind kind, const QString& fmt, QString* offendingToken) {
+    if (fmt.isEmpty())
+        return true;
+    QStringList banned;
+    if (kind == TemporalSlotKind::Date) {
+        // Time-related tokens forbidden on a Date slot.
+        banned << QStringLiteral("HH") << QStringLiteral("H") << QStringLiteral("hh")
+               << QStringLiteral("h") << QStringLiteral("mm") << QStringLiteral("m")
+               << QStringLiteral("ss") << QStringLiteral("s") << QStringLiteral("zzz")
+               << QStringLiteral("z") << QStringLiteral("AP") << QStringLiteral("ap")
+               << QStringLiteral("A") << QStringLiteral("a") << QStringLiteral("t");
+    } else if (kind == TemporalSlotKind::Time) {
+        // Date tokens forbidden on a Time slot.
+        banned << QStringLiteral("yyyy") << QStringLiteral("yy") << QStringLiteral("y")
+               << QStringLiteral("MMMM") << QStringLiteral("MMM") << QStringLiteral("MM")
+               << QStringLiteral("M") << QStringLiteral("dddd") << QStringLiteral("ddd")
+               << QStringLiteral("dd") << QStringLiteral("d");
+    } else {
+        return true;  // DateTime / None — unconstrained
+    }
+    // Longest-first so multi-char tokens are matched before their substrings.
+    std::sort(banned.begin(), banned.end(),
+              [](const QString& a, const QString& b) { return a.length() > b.length(); });
+    // Walk the format and skip quoted segments ('text' is literal in Qt date format).
+    bool inQuote = false;
+    for (int i = 0; i < fmt.size(); ++i) {
+        QChar c = fmt[i];
+        if (c == QLatin1Char('\'')) {
+            inQuote = !inQuote;
+            continue;
+        }
+        if (inQuote)
+            continue;
+        for (const QString& tk : banned) {
+            if (fmt.midRef(i, tk.size()) == tk) {
+                if (offendingToken)
+                    *offendingToken = tk;
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+const char* slotKindName(TemporalSlotKind kind) {
+    switch (kind) {
+        case TemporalSlotKind::Date:
+            return "dateFormat";
+        case TemporalSlotKind::DateTime:
+            return "datetimeFormat";
+        case TemporalSlotKind::Time:
+            return "timeFormat";
+        case TemporalSlotKind::None:
+        default:
+            return "(none)";
+    }
+}
+
+// Parse a single side sub-object { type?, format?, fallback? } into TemporalSideSpec.
+// null value → E_PROFILE_PARSE. absent/undefined → undeclared (returns true, out unchanged).
+bool parseTemporalSide(const QJsonValue& v, TemporalSlotKind kind, const QString& ownerLabel,
+                       const QString& sideName, TemporalSideSpec* out, QString* err) {
+    if (v.isUndefined())
+        return true;
+    if (v.isNull()) {
+        if (err)
+            *err = ownerLabel + QStringLiteral(": ") + sideName +
+                   QStringLiteral(" must be an object, not null");
+        return false;
+    }
+    if (!v.isObject()) {
+        if (err)
+            *err = ownerLabel + QStringLiteral(": ") + sideName +
+                   QStringLiteral(" must be a JSON object");
+        return false;
+    }
+    QJsonObject o = v.toObject();
+    out->declared = true;
+
+    // type: absent/"" → "string"
+    QJsonValue typeVal = o.value(QStringLiteral("type"));
+    QString typeStr = QStringLiteral("string");
+    if (!typeVal.isUndefined() && !typeVal.isNull()) {
+        typeStr = typeVal.toString();
+    } else if (typeVal.isNull()) {
+        if (err)
+            *err = ownerLabel + QStringLiteral(": ") + sideName +
+                   QStringLiteral(".type must not be null");
+        return false;
+    }
+    auto physType = temporalPhysTypeFromString(typeStr);
+    if (!physType.has_value()) {
+        if (err)
+            *err = ownerLabel + QStringLiteral(": ") + sideName + QStringLiteral(".type='") +
+                   typeStr +
+                   QStringLiteral("' is not recognized; allowed: \"string\", \"epochSec\"");
+        return false;
+    }
+    out->type = physType.value();
+
+    // format: null → error; absent/"" → empty (valid for epochSec)
+    QJsonValue fmtVal = o.value(QStringLiteral("format"));
+    if (fmtVal.isNull()) {
+        if (err)
+            *err = ownerLabel + QStringLiteral(": ") + sideName +
+                   QStringLiteral(".format must not be null");
+        return false;
+    }
+    out->format = fmtVal.toString();  // absent → empty string
+
+    // fallback: null → error; absent/[] → empty list
+    QJsonValue fbVal = o.value(QStringLiteral("fallback"));
+    if (fbVal.isNull()) {
+        if (err)
+            *err = ownerLabel + QStringLiteral(": ") + sideName +
+                   QStringLiteral(".fallback must not be null");
+        return false;
+    }
+    if (!fbVal.isUndefined()) {
+        if (!fbVal.isArray()) {
+            if (err)
+                *err = ownerLabel + QStringLiteral(": ") + sideName +
+                       QStringLiteral(".fallback must be a JSON array of format strings");
+            return false;
+        }
+        for (const auto& fv : fbVal.toArray()) {
+            QString s = fv.toString();
+            if (s.isEmpty()) {
+                if (err)
+                    *err = ownerLabel + QStringLiteral(": ") + sideName +
+                           QStringLiteral(".fallback contains empty string");
+                return false;
+            }
+            out->fallback.append(s);
+        }
+    }
+
+    // Qt token validation (only for type=string)
+    if (out->type == TemporalPhysType::String) {
+        QString offending;
+        if (!slotFormatTokensOk(kind, out->format, &offending)) {
+            if (err)
+                *err = ownerLabel + QStringLiteral(": ") + sideName +
+                       QStringLiteral(".format contains forbidden token '") + offending +
+                       QStringLiteral("' for this slot type");
+            return false;
+        }
+        for (const QString& s : qAsConst(out->fallback)) {
+            if (!slotFormatTokensOk(kind, s, &offending)) {
+                if (err)
+                    *err = ownerLabel + QStringLiteral(": ") + sideName +
+                           QStringLiteral(".fallback entry '") + s +
+                           QStringLiteral("' contains forbidden token '") + offending + '\'';
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+// Parse a single temporal slot object. Supports:
+//   Legacy form: { excelFormat, dbFormat?, excelFormatFallback? }
+//   New form:    { excel?: {type,format,fallback}, db?: {type,format,fallback} }
+// Mixed (both forms in same object) → E_PROFILE_PARSE.
+bool readTemporalSlot(const QJsonValue& v, TemporalSlotKind kind, const QString& ownerLabel,
+                      TemporalFormatSpec* out, QString* err) {
+    if (v.isUndefined() || v.isNull())
+        return true;
+    if (!v.isObject()) {
+        if (err)
+            *err = ownerLabel + QStringLiteral(": ") + QLatin1String(slotKindName(kind)) +
+                   QStringLiteral(" must be a JSON object");
+        return false;
+    }
+    QJsonObject o = v.toObject();
+    out->declared = true;
+
+    bool hasLegacy = o.contains(QStringLiteral("excelFormat")) ||
+                     o.contains(QStringLiteral("dbFormat")) ||
+                     o.contains(QStringLiteral("excelFormatFallback"));
+    bool hasNew = o.contains(QStringLiteral("excel")) || o.contains(QStringLiteral("db"));
+
+    if (hasLegacy && hasNew) {
+        if (err)
+            *err = ownerLabel + QStringLiteral(": ") + QLatin1String(slotKindName(kind)) +
+                   QStringLiteral(
+                       ": cannot mix legacy fields (excelFormat/dbFormat/excelFormatFallback)"
+                       " with new sub-objects (excel/db) in the same slot object");
+        return false;
+    }
+
+    if (hasLegacy) {
+        // Normalize legacy form → new form (type=string).
+        // A side is declared only if the corresponding legacy key is explicitly present.
+        // This preserves the original behavior: absent excelFormat/dbFormat inherits from profile.
+        bool hasExcelFormat = o.contains(QStringLiteral("excelFormat"));
+        bool hasDbFormat = o.contains(QStringLiteral("dbFormat"));
+        bool hasFallback = o.contains(QStringLiteral("excelFormatFallback"));
+
+        if (hasExcelFormat || hasFallback) {
+            TemporalSideSpec excelSide;
+            excelSide.declared = true;
+            excelSide.type = TemporalPhysType::String;
+            excelSide.format = o.value(QStringLiteral("excelFormat")).toString();
+
+            QJsonValue fbVal = o.value(QStringLiteral("excelFormatFallback"));
+            if (!fbVal.isUndefined() && !fbVal.isNull()) {
+                if (!fbVal.isArray()) {
+                    if (err)
+                        *err = ownerLabel + QStringLiteral(": ") +
+                               QLatin1String(slotKindName(kind)) +
+                               QStringLiteral(".excelFormatFallback must be a JSON array");
+                    return false;
+                }
+                for (const auto& fv : fbVal.toArray()) {
+                    QString s = fv.toString();
+                    if (s.isEmpty()) {
+                        if (err)
+                            *err = ownerLabel + QStringLiteral(": ") +
+                                   QLatin1String(slotKindName(kind)) +
+                                   QStringLiteral(".excelFormatFallback contains empty string");
+                        return false;
+                    }
+                    QString offending;
+                    if (!slotFormatTokensOk(kind, s, &offending)) {
+                        if (err)
+                            *err = ownerLabel + QStringLiteral(": ") +
+                                   QLatin1String(slotKindName(kind)) +
+                                   QStringLiteral(".excelFormatFallback entry '") + s +
+                                   QStringLiteral("' contains forbidden token '") + offending +
+                                   '\'';
+                        return false;
+                    }
+                    excelSide.fallback.append(s);
+                }
+            }
+
+            QString offending;
+            if (!slotFormatTokensOk(kind, excelSide.format, &offending)) {
+                if (err)
+                    *err = ownerLabel + QStringLiteral(": ") + QLatin1String(slotKindName(kind)) +
+                           QStringLiteral(".excelFormat contains forbidden token '") + offending +
+                           QStringLiteral("' for this slot type");
+                return false;
+            }
+            out->excel = excelSide;
+        }
+
+        if (hasDbFormat) {
+            TemporalSideSpec dbSide;
+            dbSide.declared = true;
+            dbSide.type = TemporalPhysType::String;
+            dbSide.format = o.value(QStringLiteral("dbFormat")).toString();
+
+            QString offending;
+            if (!slotFormatTokensOk(kind, dbSide.format, &offending)) {
+                if (err)
+                    *err = ownerLabel + QStringLiteral(": ") + QLatin1String(slotKindName(kind)) +
+                           QStringLiteral(".dbFormat contains forbidden token '") + offending +
+                           QStringLiteral("' for this slot type");
+                return false;
+            }
+            out->db = dbSide;
+        }
+    } else {
+        // New form: parse excel/db sub-objects (either may be absent → undeclared)
+        if (!parseTemporalSide(
+                o.value(QStringLiteral("excel")), kind,
+                ownerLabel + QStringLiteral(": ") + QLatin1String(slotKindName(kind)),
+                QStringLiteral("excel"), &out->excel, err))
+            return false;
+        if (!parseTemporalSide(
+                o.value(QStringLiteral("db")), kind,
+                ownerLabel + QStringLiteral(": ") + QLatin1String(slotKindName(kind)),
+                QStringLiteral("db"), &out->db, err))
+            return false;
+    }
+
+    return true;
+}
+
+}  // namespace
+
 static bool isSimpleIdentifier(const QString& s) {
     static QRegularExpression re(QStringLiteral("^[A-Za-z_][A-Za-z0-9_]*$"));
     return re.match(s).hasMatch();
@@ -61,10 +350,25 @@ bool ProfileLoader::readColumn(const QString& dbCol, const QJsonObject& o, Colum
             return false;
         out->validatorTokens.append(token);
     }
+
+    // add-time-format-profile: per-column temporal slots (override profile defaults
+    // field-by-field).
+    QString colLabel = QStringLiteral("column '") + dbCol + '\'';
+    if (!readTemporalSlot(o.value(QStringLiteral("dateFormat")), TemporalSlotKind::Date, colLabel,
+                          &out->dateFormat, err))
+        return false;
+    if (!readTemporalSlot(o.value(QStringLiteral("datetimeFormat")), TemporalSlotKind::DateTime,
+                          colLabel, &out->datetimeFormat, err))
+        return false;
+    if (!readTemporalSlot(o.value(QStringLiteral("timeFormat")), TemporalSlotKind::Time, colLabel,
+                          &out->timeFormat, err))
+        return false;
+
     return true;
 }
 
-bool ProfileLoader::readRoute(const QJsonObject& o, RouteSpec* out, QString* err) {
+bool ProfileLoader::readRoute(const QJsonObject& o, RouteSpec* out, QString* err,
+                              QStringList* warnings) {
     out->table = o.value(QStringLiteral("table")).toString();
     if (out->table.isEmpty()) {
         if (err)
@@ -263,6 +567,48 @@ bool ProfileLoader::readRoute(const QJsonObject& o, RouteSpec* out, QString* err
                     lk.select.append({pair[0].toString(), pair[1].toString()});
                 }
 
+                // add-export-reverse-lookup: exportRoundtrip (default true)
+                QJsonValue ertVal = lo.value(QStringLiteral("exportRoundtrip"));
+                if (!ertVal.isUndefined() && !ertVal.isNull()) {
+                    if (!ertVal.isBool()) {
+                        if (err)
+                            *err = QStringLiteral("route '") + out->table +
+                                   QStringLiteral("': lookup '") + lk.name +
+                                   QStringLiteral("': exportRoundtrip must be a boolean");
+                        return false;
+                    }
+                    lk.exportRoundtrip = ertVal.toBool();
+                }
+
+                // exportOnMissing (default "error")
+                bool exportOnMissingExplicit = false;
+                QJsonValue eomVal = lo.value(QStringLiteral("exportOnMissing"));
+                if (!eomVal.isUndefined() && !eomVal.isNull()) {
+                    QString eom = eomVal.toString();
+                    if (!ExportOnMissing::isValid(eom)) {
+                        if (err)
+                            *err = QStringLiteral("route '") + out->table +
+                                   QStringLiteral("': lookup '") + lk.name +
+                                   QStringLiteral("': exportOnMissing value '") + eom +
+                                   QStringLiteral("' is not allowed; use one of ") +
+                                   ExportOnMissing::allowedList();
+                        return false;
+                    }
+                    lk.exportOnMissing = eom;
+                    exportOnMissingExplicit = true;
+                } else {
+                    lk.exportOnMissing = QString::fromLatin1(ExportOnMissing::kError);
+                }
+
+                // 2.4: exportRoundtrip=false + explicit exportOnMissing → info diagnostic
+                if (!lk.exportRoundtrip && exportOnMissingExplicit && warnings) {
+                    warnings->append(
+                        QStringLiteral("route '") + out->table + QStringLiteral("': lookup '") +
+                        lk.name +
+                        QStringLiteral("': exportOnMissing has no effect when exportRoundtrip is "
+                                       "false"));
+                }
+
                 seenLookupNames.insert(lk.name);
                 out->lookups.append(lk);
             }
@@ -294,7 +640,7 @@ bool ProfileLoader::readSingleTable(const QJsonObject& o, ProfileSpec* out, QStr
 
     // Delegate to readRoute so lookups/fkInject are also parsed
     RouteSpec route;
-    if (!readRoute(o, &route, err))
+    if (!readRoute(o, &route, err, &out->loadWarnings))
         return false;
 
     out->routes.append(route);
@@ -312,7 +658,7 @@ bool ProfileLoader::readMultiTable(const QJsonObject& o, ProfileSpec* out, QStri
     }
     for (const auto& rv : routesArr) {
         RouteSpec route;
-        if (!readRoute(rv.toObject(), &route, err))
+        if (!readRoute(rv.toObject(), &route, err, &out->loadWarnings))
             return false;
         out->routes.append(route);
     }
@@ -357,7 +703,7 @@ bool ProfileLoader::readMixed(const QJsonObject& o, ProfileSpec* out, QString* e
         }
         for (const auto& rv : routesArr) {
             RouteSpec route;
-            if (!readRoute(rv.toObject(), &route, err))
+            if (!readRoute(rv.toObject(), &route, err, &out->loadWarnings))
                 return false;
             cls.routes.append(route);
         }
@@ -449,6 +795,178 @@ bool ProfileLoader::load(const QJsonDocument& doc, ProfileSpec* out, QString* er
     }
     out->exportSpec.explicitSql = expObj.value(QStringLiteral("sql")).toString();
     out->exportSpec.classColumn = expObj.value(QStringLiteral("classColumn")).toString();
+
+    // add-export-column-order: parse optional columnOrder array.
+    QJsonValue colOrderVal = expObj.value(QStringLiteral("columnOrder"));
+    if (!colOrderVal.isUndefined() && !colOrderVal.isNull()) {
+        if (!colOrderVal.isArray()) {
+            if (err)
+                *err = QStringLiteral("export.columnOrder must be an array of strings");
+            return false;
+        }
+        QJsonArray colOrderArr = colOrderVal.toArray();
+        for (int i = 0; i < colOrderArr.size(); ++i) {
+            QString s = colOrderArr[i].toString();
+            if (s.isEmpty()) {
+                if (err)
+                    *err = QStringLiteral("export.columnOrder[") + QString::number(i) +
+                           QStringLiteral("] must be a non-empty string");
+                return false;
+            }
+            out->exportSpec.columnOrder.append(s);
+        }
+    }
+
+    // add-export-reverse-lookup: 2.5 — reject illegal exportSpec.reverseLookups / exportLookups
+    if (expObj.contains(QStringLiteral("reverseLookups")) ||
+        expObj.contains(QStringLiteral("exportLookups"))) {
+        if (err)
+            *err = QStringLiteral(
+                "export.reverseLookups / export.exportLookups are not supported; "
+                "use the route-level lookups[] array with exportRoundtrip / exportOnMissing");
+        return false;
+    }
+
+    // add-time-format-profile: profile-level temporal slots (defaults inherited by columns).
+    if (!readTemporalSlot(o.value(QStringLiteral("dateFormat")), TemporalSlotKind::Date,
+                          QStringLiteral("profile"), &out->dateFormat, err))
+        return false;
+    if (!readTemporalSlot(o.value(QStringLiteral("datetimeFormat")), TemporalSlotKind::DateTime,
+                          QStringLiteral("profile"), &out->datetimeFormat, err))
+        return false;
+    if (!readTemporalSlot(o.value(QStringLiteral("timeFormat")), TemporalSlotKind::Time,
+                          QStringLiteral("profile"), &out->timeFormat, err))
+        return false;
+
+    // Info-level diagnostic: column declares dateFormat AND a date:fmt validator.
+    // Per spec "Compatibility with `date:fmt` validator", dateFormat wins; validator becomes
+    // pass-through.
+    auto walkRoutes = [&out](const QVector<RouteSpec>& routes, const QString& classCtx) {
+        for (const RouteSpec& r : routes) {
+            for (const ColumnSpec& c : r.columns) {
+                if (!c.dateFormat.declared)
+                    continue;
+                for (const QString& t : c.validatorTokens) {
+                    if (t.startsWith(QStringLiteral("date:"))) {
+                        QString ctx = classCtx.isEmpty()
+                                          ? QStringLiteral("route '") + r.table + '\''
+                                          : QStringLiteral("class '") + classCtx +
+                                                QStringLiteral("' route '") + r.table + '\'';
+                        out->loadWarnings.append(
+                            ctx + QStringLiteral(" column '") + c.dbColumn +
+                            QStringLiteral("': dateFormat overrides validator '") + t +
+                            QStringLiteral("'; validator becomes pass-through"));
+                        break;
+                    }
+                }
+            }
+        }
+    };
+    if (out->mode == ProfileMode::Mixed) {
+        for (const auto& cls : out->classes)
+            walkRoutes(cls.routes, cls.id);
+    } else {
+        walkRoutes(out->routes, QString());
+    }
+
+    // Post-load validation: multi-slot, type×format consistency, epochSec slot restriction.
+    auto validateColumn = [&](const ColumnSpec& col, const QString& colCtx) -> bool {
+        // 2.5: at most one temporal slot per column
+        int declaredCount = (col.dateFormat.declared ? 1 : 0) +
+                            (col.datetimeFormat.declared ? 1 : 0) +
+                            (col.timeFormat.declared ? 1 : 0);
+        if (declaredCount > 1) {
+            if (err)
+                *err = colCtx + QStringLiteral(
+                                    ": column may declare at most one of dateFormat,"
+                                    " datetimeFormat, timeFormat");
+            return false;
+        }
+
+        // 2.6-2.8: effective spec consistency per slot kind
+        static const TemporalSlotKind allKinds[] = {
+            TemporalSlotKind::Date, TemporalSlotKind::DateTime, TemporalSlotKind::Time};
+        for (TemporalSlotKind k : allKinds) {
+            TemporalFormatSpec eff = effectiveTemporalFor(k, col, *out);
+            if (!eff.declared)
+                continue;
+
+            auto checkSide = [&](const TemporalSideSpec& side, const QString& sideName,
+                                 TemporalSlotKind slotKind) -> bool {
+                if (!side.declared)
+                    return true;
+
+                // 2.7: epochSec only on datetimeFormat.db
+                if (side.type == TemporalPhysType::EpochSec) {
+                    if (slotKind != TemporalSlotKind::DateTime ||
+                        sideName != QStringLiteral("db")) {
+                        if (err)
+                            *err = colCtx + QStringLiteral(": ") +
+                                   QLatin1String(slotKindName(slotKind)) + QStringLiteral(".") +
+                                   sideName +
+                                   QStringLiteral(
+                                       ".type=epochSec is only allowed on datetimeFormat.db");
+                        return false;
+                    }
+                }
+
+                // 2.6: type=string requires non-empty format
+                if (side.type == TemporalPhysType::String && side.format.isEmpty()) {
+                    if (err)
+                        *err = colCtx + QStringLiteral(": ") +
+                               QLatin1String(slotKindName(slotKind)) + QStringLiteral(".") +
+                               sideName +
+                               QStringLiteral(".type=string requires a non-empty format");
+                    return false;
+                }
+
+                // 2.6: type=epochSec requires empty format
+                if (side.type == TemporalPhysType::EpochSec && !side.format.isEmpty()) {
+                    if (err)
+                        *err = colCtx + QStringLiteral(": ") +
+                               QLatin1String(slotKindName(slotKind)) + QStringLiteral(".") +
+                               sideName +
+                               QStringLiteral(".type=epochSec must have no format (got '") +
+                               side.format + QStringLiteral("')");
+                    return false;
+                }
+
+                return true;
+            };
+
+            if (!checkSide(eff.excel, QStringLiteral("excel"), k))
+                return false;
+            if (!checkSide(eff.db, QStringLiteral("db"), k))
+                return false;
+        }
+        return true;
+    };
+
+    auto validateRouteColumns = [&](const QVector<RouteSpec>& routes,
+                                    const QString& classCtx) -> bool {
+        for (const RouteSpec& r : routes) {
+            for (const ColumnSpec& c : r.columns) {
+                QString colCtx =
+                    (classCtx.isEmpty() ? QStringLiteral("route '") + r.table + '\''
+                                        : QStringLiteral("class '") + classCtx +
+                                              QStringLiteral("' route '") + r.table + '\'') +
+                    QStringLiteral(" column '") + c.dbColumn + '\'';
+                if (!validateColumn(c, colCtx))
+                    return false;
+            }
+        }
+        return true;
+    };
+
+    if (out->mode == ProfileMode::Mixed) {
+        for (const auto& cls : out->classes) {
+            if (!validateRouteColumns(cls.routes, cls.id))
+                return false;
+        }
+    } else {
+        if (!validateRouteColumns(out->routes, QString()))
+            return false;
+    }
 
     return true;
 }

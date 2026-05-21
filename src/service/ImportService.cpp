@@ -530,7 +530,7 @@ ImportResult ImportService::run(const ProfileSpec& profile, const SchemaCatalog&
     if (profile.mode == ProfileMode::Mixed) {
         for (const auto& cls : profile.classes) {
             QString vErr;
-            if (!mapper.compileValidators(cls.routes, cls.id, &validatorMap, &vErr)) {
+            if (!mapper.compileValidators(cls.routes, cls.id, profile, &validatorMap, &vErr)) {
                 errors.addTable(profile.sheet, QString::fromLatin1(err::E_PROFILE_PARSE), vErr);
                 result.errors = errors.list();
                 return result;
@@ -538,7 +538,7 @@ ImportResult ImportService::run(const ProfileSpec& profile, const SchemaCatalog&
         }
     } else {
         QString vErr;
-        if (!mapper.compileValidators(profile.routes, QString(), &validatorMap, &vErr)) {
+        if (!mapper.compileValidators(profile.routes, QString(), profile, &validatorMap, &vErr)) {
             errors.addTable(profile.sheet, QString::fromLatin1(err::E_PROFILE_PARSE), vErr);
             result.errors = errors.list();
             return result;
@@ -606,7 +606,8 @@ ImportResult ImportService::run(const ProfileSpec& profile, const SchemaCatalog&
         }
 
         // Map Excel columns to payloads
-        ctx.payloads = mapper.map(*routesPtr, r, ctx.classId, reader, validatorMap, &errors);
+        ctx.payloads =
+            mapper.map(*routesPtr, r, ctx.classId, reader, validatorMap, profile, &errors);
 
         // Apply lookups (Phase A.5 cache → row payload); failures seed cascade suppression (§D11)
         QSet<int> lookupFailed = applyLookups(ctx.payloads, *routesPtr, lookupCache, catalog,
@@ -648,10 +649,21 @@ ImportResult ImportService::run(const ProfileSpec& profile, const SchemaCatalog&
         return result;
     }
 
-    // If errors, do NOT write
-    if (!errors.empty()) {
-        result.errors = errors.list();
-        return result;
+    // Table-level errors (row == 0) abort the entire import.
+    // Row-level errors (row > 0, e.g. E_TIME_PARSE, validator failures) skip only
+    // the failing row — per spec requirement "SHALL NEVER abort an entire sheet's import".
+    {
+        bool hasTableErrors = false;
+        for (const auto& e : errors.list()) {
+            if (e.row == 0) {
+                hasTableErrors = true;
+                break;
+            }
+        }
+        if (hasTableErrors) {
+            result.errors = errors.list();
+            return result;
+        }
     }
 
     // --- Phase D: Write (single transaction) ---
@@ -662,11 +674,20 @@ ImportResult ImportService::run(const ProfileSpec& profile, const SchemaCatalog&
         return result;
     }
 
+    // Collect rows that had mapping / validation / preflight errors; they are skipped.
+    QSet<int> failedExcelRows;
+    for (const auto& e : errors.list())
+        if (e.row > 0)
+            failedExcelRows.insert(e.row);
+
     SqlBuilder sqlBuilder;
     QHash<QString, QSqlQuery> preparedQueries;
 
     bool writeOk = true;
     for (const auto& ctx : contexts) {
+        if (failedExcelRows.contains(ctx.excelRow))
+            continue;
+
         for (const auto& payload : ctx.payloads) {
             if (payload.dbColumns.isEmpty())
                 continue;
@@ -724,6 +745,15 @@ ImportResult ImportService::run(const ProfileSpec& profile, const SchemaCatalog&
     }
 
     result.errors = errors.list();
+    // Merge runtime warnings with profile load-time diagnostics
+    result.warnings = errors.warnings();
+    for (const QString& w : profile.loadWarnings) {
+        RowError re;
+        re.sheet = profile.sheet;
+        re.code = QStringLiteral("W_PROFILE_LOAD");
+        re.message = w;
+        result.warnings.append(re);
+    }
     return result;
 }
 

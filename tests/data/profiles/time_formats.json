@@ -1,0 +1,60 @@
+{
+    "profileName": "time_formats",
+    "sheet": "Events",
+    "headerRow": 1,
+    "mode": "singleTable",
+    "table": "event",
+    "conflict": {
+        "columns": ["event_id"]
+    },
+    "dateFormat": {
+        "excelFormat": "yyyy/M/d",
+        "dbFormat": "yyyy-MM-dd"
+    },
+    "datetimeFormat": {
+        "excelFormat": "yyyy/M/d HH:mm:ss",
+        "dbFormat": "yyyy-MM-dd HH:mm:ss"
+    },
+    "timeFormat": {
+        "excelFormat": "HH:mm",
+        "dbFormat": "HH:mm:ss"
+    },
+    "columns": {
+        "event_id": {
+            "source": "EventID",
+            "validators": ["notNull", "int"]
+        },
+        "title": {
+            "source": "Title",
+            "validators": ["notNull"]
+        },
+        "event_date": {
+            "source": "EventDate"
+        },
+        "event_datetime": {
+            "source": "EventDateTime",
+            "datetimeFormat": {
+                "excelFormat": "d/M/yyyy H:mm"
+            }
+        },
+        "start_time": {
+            "source": "StartTime",
+            "timeFormat": {}
+        },
+        "legacy_date": {
+            "source": "LegacyDate",
+            "validators": ["date:yyyy-MM-dd"]
+        },
+        "date_with_fallback": {
+            "source": "DateWithFallback",
+            "dateFormat": {
+                "excelFormat": "yyyy-MM-dd",
+                "dbFormat": "yyyy-MM-dd",
+                "excelFormatFallback": ["d/M/yyyy", "MM/dd/yyyy"]
+            }
+        }
+    },
+    "export": {
+        "orderBy": ["event_date"]
+    }
+}

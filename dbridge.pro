@@ -6,7 +6,7 @@
 #   - 3rdparty/QXlsx : vendored static lib
 #   - src            : libdbridge (static)
 #   - examples/cli   : dbridge-cli example
-#   - tests          : 9 Qt Test suites (CONFIG += testcase, run with `make check`)
+#   - tests          : 17 Qt Test suites (CONFIG += testcase, run with `make check`)
 
 TEMPLATE = subdirs
 CONFIG  += ordered
@@ -29,5 +29,9 @@ tests.depends      = libdbridge qxlsx
 
 OTHER_FILES += \
     README.md \
+    docs/adr/0001-time-format-in-profile.md \
+    docs/adr/0002-export-column-order-in-exportspec.md \
+    docs/adr/0003-export-reverse-lookup.md \
+    docs/adr/0004-explicit-temporal-type.md \
     docs/validation/row-to-multitable.md \
     CMakeLists.txt

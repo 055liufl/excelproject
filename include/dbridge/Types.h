@@ -39,6 +39,8 @@ struct ImportResult {
     int readRows = 0;
     int writtenRows = 0;
     QList<RowError> errors;
+    // Non-blocking diagnostics (profile load warnings, orderBy heuristic, etc.).
+    QList<RowError> warnings;
     // Populated only when ImportOptions::dryRun == true.
     // Contains the fully-constructed RowContexts (after lookup + fkInject, before UPSERT).
     QVector<dbridge::detail::RowContext> dryRunPayloads;
@@ -48,6 +50,7 @@ struct ExportResult {
     bool ok = false;
     int writtenRows = 0;
     QList<RowError> errors;
+    QList<RowError> warnings;
 };
 
 }  // namespace dbridge

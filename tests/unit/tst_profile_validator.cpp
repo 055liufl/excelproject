@@ -336,6 +336,328 @@ class TstProfileValidator : public QObject {
         ProfileValidator v;
         QVERIFY(!v.validate(profile, cat, headers, &errors));
     }
+
+    // ---- orderBy warning tests ----
+
+    void testOrderByTemporalSortableNoWarning() {
+        // dbFormat starts with yyyy → dict-sort safe, no warning
+        auto cat = makeBasicCatalog();
+        // Add order_date column to catalog
+        TableInfo& tbl = *const_cast<TableInfo*>(cat.table(QStringLiteral("orders")));
+        tbl.columns.append({QStringLiteral("order_date"), QStringLiteral("TEXT")});
+        QStringList headers;
+        headers << QStringLiteral("OrderNo") << QStringLiteral("OrderDate");
+
+        ColumnSpec idCol;
+        idCol.dbColumn = QStringLiteral("order_no");
+        idCol.source = QStringLiteral("OrderNo");
+
+        ColumnSpec dateCol;
+        dateCol.dbColumn = QStringLiteral("order_date");
+        dateCol.source = QStringLiteral("OrderDate");
+        dateCol.dateFormat.declared = true;
+        dateCol.dateFormat.excel.declared = true;
+        dateCol.dateFormat.excel.format = QStringLiteral("yyyy/M/d");
+        dateCol.dateFormat.db.declared = true;
+        dateCol.dateFormat.db.format = QStringLiteral("yyyy-MM-dd");
+
+        RouteSpec r;
+        r.table = QStringLiteral("orders");
+        r.conflict.columns << QStringLiteral("order_no");
+        r.columns << idCol << dateCol;
+
+        ProfileSpec profile;
+        profile.name = QStringLiteral("test");
+        profile.sheet = QStringLiteral("S");
+        profile.headerRow = 1;
+        profile.routes << r;
+        profile.exportSpec.orderBy << QStringLiteral("order_date");
+
+        ErrorCollector errors;
+        ProfileValidator v;
+        v.validate(profile, cat, headers, &errors);
+        QVERIFY(errors.warnings().isEmpty());
+    }
+
+    void testOrderByTemporalNonSortableWarning() {
+        // dbFormat = "d/M/yyyy" does not start with yyyy → W_TIME_ORDERBY_NONSORTABLE
+        auto cat = makeBasicCatalog();
+        TableInfo& tbl = *const_cast<TableInfo*>(cat.table(QStringLiteral("orders")));
+        tbl.columns.append({QStringLiteral("order_date"), QStringLiteral("TEXT")});
+        QStringList headers;
+        headers << QStringLiteral("OrderNo") << QStringLiteral("OrderDate");
+
+        ColumnSpec idCol;
+        idCol.dbColumn = QStringLiteral("order_no");
+        idCol.source = QStringLiteral("OrderNo");
+
+        ColumnSpec dateCol;
+        dateCol.dbColumn = QStringLiteral("order_date");
+        dateCol.source = QStringLiteral("OrderDate");
+        dateCol.dateFormat.declared = true;
+        dateCol.dateFormat.excel.declared = true;
+        dateCol.dateFormat.excel.format = QStringLiteral("d/M/yyyy");
+        dateCol.dateFormat.db.declared = true;
+        dateCol.dateFormat.db.format = QStringLiteral("d/M/yyyy");
+
+        RouteSpec r;
+        r.table = QStringLiteral("orders");
+        r.conflict.columns << QStringLiteral("order_no");
+        r.columns << idCol << dateCol;
+
+        ProfileSpec profile;
+        profile.name = QStringLiteral("test");
+        profile.sheet = QStringLiteral("S");
+        profile.headerRow = 1;
+        profile.routes << r;
+        profile.exportSpec.orderBy << QStringLiteral("order_date");
+
+        ErrorCollector errors;
+        ProfileValidator v;
+        v.validate(profile, cat, headers, &errors);
+        QVERIFY(!errors.warnings().isEmpty());
+        QCOMPARE(errors.warnings()[0].code, QStringLiteral("W_TIME_ORDERBY_NONSORTABLE"));
+    }
+
+    // 7.5.1: orderBy column with db.type=epochSec → no W_TIME_ORDERBY_NONSORTABLE warning
+    void testOrderByEpochSecNoWarning() {
+        auto cat = makeBasicCatalog();
+        TableInfo& tbl = *const_cast<TableInfo*>(cat.table(QStringLiteral("orders")));
+        tbl.columns.append({QStringLiteral("happen_at"), QStringLiteral("INTEGER")});
+        QStringList headers;
+        headers << QStringLiteral("OrderNo") << QStringLiteral("HappenAt");
+
+        ColumnSpec idCol;
+        idCol.dbColumn = QStringLiteral("order_no");
+        idCol.source = QStringLiteral("OrderNo");
+
+        ColumnSpec tsCol;
+        tsCol.dbColumn = QStringLiteral("happen_at");
+        tsCol.source = QStringLiteral("HappenAt");
+        tsCol.datetimeFormat.declared = true;
+        tsCol.datetimeFormat.excel.declared = true;
+        tsCol.datetimeFormat.excel.format = QStringLiteral("yyyy-MM-dd HH:mm:ss");
+        tsCol.datetimeFormat.db.declared = true;
+        tsCol.datetimeFormat.db.type = TemporalPhysType::EpochSec;
+
+        RouteSpec r;
+        r.table = QStringLiteral("orders");
+        r.conflict.columns << QStringLiteral("order_no");
+        r.columns << idCol << tsCol;
+
+        ProfileSpec profile;
+        profile.name = QStringLiteral("test");
+        profile.sheet = QStringLiteral("S");
+        profile.headerRow = 1;
+        profile.routes << r;
+        profile.exportSpec.orderBy << QStringLiteral("happen_at");
+
+        ErrorCollector errors;
+        ProfileValidator v;
+        v.validate(profile, cat, headers, &errors);
+        QVERIFY(errors.warnings().isEmpty());
+    }
+
+    void testOrderByNonTemporalNoWarning() {
+        // orderBy on a plain text column → no temporal warning
+        auto cat = makeBasicCatalog();
+        QStringList headers;
+        headers << QStringLiteral("OrderNo");
+
+        ColumnSpec idCol;
+        idCol.dbColumn = QStringLiteral("order_no");
+        idCol.source = QStringLiteral("OrderNo");
+
+        RouteSpec r;
+        r.table = QStringLiteral("orders");
+        r.conflict.columns << QStringLiteral("order_no");
+        r.columns << idCol;
+
+        ProfileSpec profile;
+        profile.name = QStringLiteral("test");
+        profile.sheet = QStringLiteral("S");
+        profile.headerRow = 1;
+        profile.routes << r;
+        profile.exportSpec.orderBy << QStringLiteral("order_no");
+
+        ErrorCollector errors;
+        ProfileValidator v;
+        v.validate(profile, cat, headers, &errors);
+        QVERIFY(errors.warnings().isEmpty());
+    }
+
+    // ---- columnOrder validation tests ----
+
+    void testColumnOrderUnknownHeaderError() {
+        // "NoSuchCol" is not a known ColumnSpec.source → E_EXPORT_UNKNOWN_HEADER
+        auto cat = makeBasicCatalog();
+        QStringList headers;
+        headers << QStringLiteral("OrderNo");
+
+        RouteSpec r = makeRoute(QStringLiteral("orders"), {QStringLiteral("order_no")},
+                                {QStringLiteral("order_no")}, {QStringLiteral("OrderNo")});
+
+        ProfileSpec profile;
+        profile.name = QStringLiteral("test");
+        profile.sheet = QStringLiteral("S");
+        profile.headerRow = 1;
+        profile.routes << r;
+        profile.exportSpec.columnOrder << QStringLiteral("OrderNo") << QStringLiteral("NoSuchCol");
+
+        ErrorCollector errors;
+        ProfileValidator v;
+        v.validate(profile, cat, headers, &errors);
+
+        bool found = false;
+        for (const auto& e : errors.list()) {
+            if (e.code == QStringLiteral("E_EXPORT_UNKNOWN_HEADER")) {
+                found = true;
+                QVERIFY(e.message.contains(QStringLiteral("NoSuchCol")));
+            }
+        }
+        QVERIFY(found);
+    }
+
+    void testColumnOrderCaseSensitivityError() {
+        // "orderno" (lowercase) does not match source "OrderNo" → E_EXPORT_UNKNOWN_HEADER
+        auto cat = makeBasicCatalog();
+        QStringList headers;
+        headers << QStringLiteral("OrderNo");
+
+        RouteSpec r = makeRoute(QStringLiteral("orders"), {QStringLiteral("order_no")},
+                                {QStringLiteral("order_no")}, {QStringLiteral("OrderNo")});
+
+        ProfileSpec profile;
+        profile.name = QStringLiteral("test");
+        profile.sheet = QStringLiteral("S");
+        profile.headerRow = 1;
+        profile.routes << r;
+        profile.exportSpec.columnOrder << QStringLiteral("orderno");
+
+        ErrorCollector errors;
+        ProfileValidator v;
+        v.validate(profile, cat, headers, &errors);
+
+        bool found = false;
+        for (const auto& e : errors.list())
+            if (e.code == QStringLiteral("E_EXPORT_UNKNOWN_HEADER"))
+                found = true;
+        QVERIFY(found);
+    }
+
+    void testColumnOrderClassColumnAcceptedInMixed() {
+        // Mixed mode: classColumn = "Type" in columnOrder → should be accepted (no error)
+        auto cat = makeBasicCatalog();
+        QStringList headers;
+        headers << QStringLiteral("OrderNo") << QStringLiteral("Type");
+
+        RouteSpec r = makeRoute(QStringLiteral("orders"), {QStringLiteral("order_no")},
+                                {QStringLiteral("order_no")}, {QStringLiteral("OrderNo")});
+
+        ClassSpec cls;
+        cls.id = QStringLiteral("A");
+        cls.matchEquals = QStringLiteral("A");
+        cls.routes << r;
+
+        ProfileSpec profile;
+        profile.name = QStringLiteral("test");
+        profile.sheet = QStringLiteral("S");
+        profile.headerRow = 1;
+        profile.mode = ProfileMode::Mixed;
+        profile.classes << cls;
+        profile.exportSpec.classColumn = QStringLiteral("Type");
+        profile.exportSpec.columnOrder << QStringLiteral("Type") << QStringLiteral("OrderNo");
+
+        ErrorCollector errors;
+        ProfileValidator v;
+        v.validate(profile, cat, headers, &errors);
+
+        bool hasUnknownHeader = false;
+        for (const auto& e : errors.list())
+            if (e.code == QStringLiteral("E_EXPORT_UNKNOWN_HEADER"))
+                hasUnknownHeader = true;
+        QVERIFY(!hasUnknownHeader);
+    }
+
+    void testColumnOrderDuplicateError() {
+        // "OrderNo" appears twice → E_EXPORT_DUPLICATE_ORDER
+        auto cat = makeBasicCatalog();
+        QStringList headers;
+        headers << QStringLiteral("OrderNo");
+
+        RouteSpec r = makeRoute(QStringLiteral("orders"), {QStringLiteral("order_no")},
+                                {QStringLiteral("order_no")}, {QStringLiteral("OrderNo")});
+
+        ProfileSpec profile;
+        profile.name = QStringLiteral("test");
+        profile.sheet = QStringLiteral("S");
+        profile.headerRow = 1;
+        profile.routes << r;
+        profile.exportSpec.columnOrder << QStringLiteral("OrderNo") << QStringLiteral("OrderNo");
+
+        ErrorCollector errors;
+        ProfileValidator v;
+        v.validate(profile, cat, headers, &errors);
+
+        bool found = false;
+        for (const auto& e : errors.list())
+            if (e.code == QStringLiteral("E_EXPORT_DUPLICATE_ORDER"))
+                found = true;
+        QVERIFY(found);
+    }
+
+    void testColumnOrderWithExplicitSqlError() {
+        // explicitSql + columnOrder → E_EXPORT_ORDER_WITH_RAW_SQL
+        auto cat = makeBasicCatalog();
+        QStringList headers;
+        headers << QStringLiteral("OrderNo");
+
+        RouteSpec r = makeRoute(QStringLiteral("orders"), {QStringLiteral("order_no")},
+                                {QStringLiteral("order_no")}, {QStringLiteral("OrderNo")});
+
+        ProfileSpec profile;
+        profile.name = QStringLiteral("test");
+        profile.sheet = QStringLiteral("S");
+        profile.headerRow = 1;
+        profile.routes << r;
+        profile.exportSpec.explicitSql = QStringLiteral("SELECT * FROM orders");
+        profile.exportSpec.columnOrder << QStringLiteral("OrderNo");
+
+        ErrorCollector errors;
+        ProfileValidator v;
+        v.validate(profile, cat, headers, &errors);
+
+        bool found = false;
+        for (const auto& e : errors.list())
+            if (e.code == QStringLiteral("E_EXPORT_ORDER_WITH_RAW_SQL"))
+                found = true;
+        QVERIFY(found);
+    }
+
+    void testColumnOrderValidSubsetIsOk() {
+        // subset of known headers, no duplicates → no errors
+        auto cat = makeBasicCatalog();
+        QStringList headers;
+        headers << QStringLiteral("OrderNo") << QStringLiteral("TenantId")
+                << QStringLiteral("Total");
+
+        RouteSpec r = makeRoute(
+            QStringLiteral("orders"), {QStringLiteral("order_no")},
+            {QStringLiteral("order_no"), QStringLiteral("tenant_id"), QStringLiteral("total")},
+            {QStringLiteral("OrderNo"), QStringLiteral("TenantId"), QStringLiteral("Total")});
+
+        ProfileSpec profile;
+        profile.name = QStringLiteral("test");
+        profile.sheet = QStringLiteral("S");
+        profile.headerRow = 1;
+        profile.routes << r;
+        profile.exportSpec.columnOrder << QStringLiteral("Total") << QStringLiteral("OrderNo");
+
+        ErrorCollector errors;
+        ProfileValidator v;
+        v.validate(profile, cat, headers, &errors);
+        QVERIFY(errors.list().isEmpty());
+    }
 };
 
 QTEST_MAIN(TstProfileValidator)

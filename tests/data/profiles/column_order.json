@@ -1,0 +1,19 @@
+{
+    "profileName": "column_order",
+    "sheet": "Orders",
+    "headerRow": 1,
+    "mode": "singleTable",
+    "table": "orders",
+    "conflict": {
+        "columns": ["order_no"]
+    },
+    "columns": {
+        "order_no":  { "source": "OrderNo",  "validators": ["notNull"] },
+        "tenant_id": { "source": "TenantId", "validators": ["notNull"] },
+        "total":     { "source": "Total" }
+    },
+    "export": {
+        "orderBy": ["order_no"],
+        "columnOrder": ["Total", "OrderNo", "TenantId"]
+    }
+}

@@ -370,6 +370,124 @@ bool ProfileValidator::validate(const ProfileSpec& profile, const SchemaCatalog&
             ok = false;
     }
 
+    // Check orderBy columns with non-sortable temporal dbFormat.
+    // A dbFormat is dict-sort-safe only when it starts with "yyyy" (year is the MSB).
+    if (!profile.exportSpec.orderBy.isEmpty()) {
+        // Build a flat dbColumn → ColumnSpec pointer map across all routes.
+        QHash<QString, const ColumnSpec*> colByDb;
+        auto indexRoutes = [&](const QVector<RouteSpec>& routes) {
+            for (const auto& route : routes) {
+                for (const auto& col : route.columns) {
+                    if (!colByDb.contains(col.dbColumn))
+                        colByDb[col.dbColumn] = &col;
+                }
+            }
+        };
+        if (profile.mode == ProfileMode::Mixed) {
+            for (const auto& cls : profile.classes)
+                indexRoutes(cls.routes);
+        } else {
+            indexRoutes(profile.routes);
+        }
+
+        for (const QString& ob : profile.exportSpec.orderBy) {
+            QString colName = ob.contains('.') ? ob.section('.', -1) : ob;
+            auto it = colByDb.find(colName);
+            if (it == colByDb.end())
+                continue;
+            const ColumnSpec& col = *it.value();
+            TemporalSlotKind kind = temporalSlotKindFor(col, profile);
+            if (kind == TemporalSlotKind::None)
+                continue;
+            TemporalFormatSpec eff = effectiveTemporalFor(kind, col, profile);
+            // Skip non-string types (e.g. epochSec): INTEGER columns sort numerically, always safe.
+            if (eff.db.type != TemporalPhysType::String)
+                continue;
+            if (!eff.db.format.startsWith(QStringLiteral("yyyy"))) {
+                errors->addTableWarning(
+                    profile.sheet, QString::fromLatin1(err::W_TIME_ORDERBY_NONSORTABLE),
+                    QStringLiteral("orderBy column '") + colName +
+                        QStringLiteral("' has db.format '") + eff.db.format +
+                        QStringLiteral("' which does not start with 'yyyy' — dictionary sort order "
+                                       "may not match chronological order"));
+            }
+        }
+    }
+
+    // add-export-column-order: validate columnOrder field.
+    if (!profile.exportSpec.columnOrder.isEmpty()) {
+        // 3.4: mutually exclusive with explicitSql
+        if (!profile.exportSpec.explicitSql.isEmpty()) {
+            errors->addTable(
+                profile.sheet, QString::fromLatin1(err::E_EXPORT_ORDER_WITH_RAW_SQL),
+                QStringLiteral("export.columnOrder cannot be used together with export.sql; "
+                               "raw SQL owns column ordering"));
+            ok = false;
+        }
+
+        // 3.1: build known-header set (all ColumnSpec.source values across all routes)
+        // add-export-reverse-lookup 3.2: A headers (match[].Excel_header for roundtrip=true
+        // lookups) are added; H dbColumn names for roundtrip=true are removed from accepted set;
+        // H dbColumn names for roundtrip=false are added (they appear in Excel output as-is).
+        QSet<QString> knownHeaders;
+        auto collectSources = [&](const QVector<RouteSpec>& routes) {
+            for (const auto& route : routes) {
+                for (const auto& col : route.columns)
+                    knownHeaders.insert(col.source);
+                // Add/remove lookup-related headers to reflect post-substitution output set
+                for (const auto& lk : route.lookups) {
+                    if (lk.exportRoundtrip) {
+                        // A headers appear in output; H dbColumns do not
+                        for (const auto& mp : lk.match)
+                            knownHeaders.insert(mp.second);  // A = match[].Excel_header
+                        for (const auto& sp : lk.select)
+                            knownHeaders.remove(sp.second);  // H = select[].dbColumn
+                    } else {
+                        // H dbColumns appear in output verbatim
+                        for (const auto& sp : lk.select)
+                            knownHeaders.insert(sp.second);  // H = select[].dbColumn
+                    }
+                }
+            }
+        };
+        if (profile.mode == ProfileMode::Mixed) {
+            for (const auto& cls : profile.classes)
+                collectSources(cls.routes);
+            // classColumn is a synthetic header — valid in columnOrder for Mixed mode
+            if (!profile.exportSpec.classColumn.isEmpty())
+                knownHeaders.insert(profile.exportSpec.classColumn);
+        } else {
+            collectSources(profile.routes);
+        }
+
+        // Hint: first up-to-5 known headers for error messages
+        auto knownHint = [&]() -> QString {
+            QStringList sample = knownHeaders.values().mid(0, 5);
+            return QStringLiteral(" (known headers: ") + sample.join(QStringLiteral(", ")) +
+                   QStringLiteral(")");
+        };
+
+        // 3.2 + 3.3: unknown header and duplicate checks
+        QSet<QString> seen;
+        for (const QString& h : profile.exportSpec.columnOrder) {
+            if (seen.contains(h)) {
+                errors->addTable(profile.sheet, QString::fromLatin1(err::E_EXPORT_DUPLICATE_ORDER),
+                                 QStringLiteral("export.columnOrder contains duplicate entry '") +
+                                     h + QStringLiteral("'"));
+                ok = false;
+                continue;
+            }
+            seen.insert(h);
+            if (!knownHeaders.contains(h)) {
+                errors->addTable(profile.sheet, QString::fromLatin1(err::E_EXPORT_UNKNOWN_HEADER),
+                                 QStringLiteral("export.columnOrder entry '") + h +
+                                     QStringLiteral("' does not match any column source") +
+                                     knownHint());
+                ok = false;
+            }
+        }
+    }
+
     return ok;
 }
 

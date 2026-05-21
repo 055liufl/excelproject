@@ -145,6 +145,7 @@ dbridge/
 │   │   ├── RowPayload.h                ← RoutePayload（一张表的一行数据） + RowContext
 │   │   ├── Router.*                    ← 混编模式下根据鉴别列判断行属于 A/B/C 哪类
 │   │   ├── Mapper.*                    ← 把 Excel 一行拆成 N 个 RoutePayload
+│   │   ├── TemporalConvert.*           ← 时间字段 Excel↔DB 格式互转（dateFormat/datetimeFormat/timeFormat）
 │   │   ├── TopoSorter.*                ← 多表写入顺序排序（Kahn 算法）
 │   │   ├── FkInjector.*                ← 把父表业务键注入到子表 payload
 │   │   └── BatchUniqueness.*           ← 本批内 conflict key 重复检测
@@ -154,26 +155,34 @@ dbridge/
 │   │
 │   └── service/                        ← "整个流程怎么编排" 由这里负责
 │       ├── ErrorCollector.*            ← 错误聚合容器
+│       ├── ExportHelpers.h             ← 导出辅助工具（列序合并、反向 lookup 调度等）
 │       ├── ImportService.*             ← 导入主流程（Phase A/B/C/D）
 │       └── ExportService.*             ← 导出主流程
 │
 ├── 3rdparty/QXlsx/                     ← QXlsx 第三方库（vendored）
 │
-├── tests/                              ← 单元 + 集成测试（12 套，CMake 列在 tests/CMakeLists.txt）
-│   ├── unit/                           ← 模块级单元测试（ProfileLoader/ProfileValidator/Schema/Validators/SqlBuilder/Mapper/Router/TopoSorter/FkPreflight/LookupPrefetch/LookupSemantics）
+├── tests/                              ← 单元 + 集成测试（17 套，CMake 列在 tests/CMakeLists.txt）
+│   ├── unit/                           ← 模块级单元测试（ProfileLoader/ProfileValidator/Schema/Validators/SqlBuilder/AutoProfileBuilder/Router/TopoSorter/FkPreflight/LookupPrefetch/LookupSemantics/ExportHelpers/ReverseLookupExport/TemporalImport/TemporalExport/ColumnOrderExport）
 │   ├── integration/                    ← DataBridge 端到端集成
 │   └── data/                           ← 测试夹具
-│       ├── sql/                        ← schema 初始化 SQL（01_customer / 02_orders / 03_mixed / 04_mixed_multitable）
-│       └── profiles/                   ← Profile JSON 夹具（customer_basic / order_m_set / mixed_abc / mixed_abc_multitable）
+│       ├── sql/                        ← schema 初始化 SQL（01_customer / 02_orders / 03_mixed / 04_mixed_multitable / 05_time_formats / 06_column_order / 07_reverse_lookup）
+│       ├── profiles/                   ← Profile JSON 夹具（customer_basic / order_m_set / mixed_abc / mixed_abc_multitable / time_formats / column_order / reverse_lookup）
+│       └── xlsx/                       ← Excel 夹具（Orders / Mixed / Events / OrdersColOrder / ReverseLookup）；由 tools/build_fixtures.py 生成
 │
 ├── examples/cli/                       ← 命令行示例程序（dbridge-cli）
 │
 ├── tools/                              ← 配套脚本（独立于库本体）
+│   ├── build_fixtures.py               ← 生成 tests/data/xlsx/ 下所有夹具 xlsx（纯 Python stdlib）
 │   └── xlsx2csv.py                     ← 纯 Python stdlib，xlsx → CSV，用于导出对账（详见 §14.13.2）
 │
 └── docs/
+    ├── adr/                            ← 架构决策记录（ADR）
+    │   ├── 0001-time-format-in-profile.md
+    │   ├── 0002-export-column-order-in-exportspec.md
+    │   ├── 0003-export-reverse-lookup.md
+    │   └── 0004-explicit-temporal-type.md
     └── validation/
-        └── row-to-multitable.md        ← 端到端验证流程（场景 I / II，详见 §14.16）
+        └── row-to-multitable.md        ← 端到端验证流程（场景 I–V，详见 §14.16）
 ```
 
 **新手提示**：看代码先看 `service/`，那里是主流程；看主流程时遇到不懂的模块（比如 `Mapper`），
@@ -1027,6 +1036,23 @@ std::stable_sort(allRows.begin(), allRows.end(),
 
 ---
 
+## ⚠️ BREAKING：export 反向 lookup — H 列消失、A 列出现
+
+声明了 `lookups[]` 的 profile，升级后**导出 Excel 结构会变化**：
+
+- `lookups[*].select[*].dbColumn`（H 列，如 `customer_name`）**默认不再出现**在导出 Excel 中
+- 对应的 `lookups[*].match[*].Excel_header`（A 列，如 `CustNo`）**默认出现**在导出 Excel 中
+
+这是为了实现导入→导出的无损往返。如果不希望结构改变，在对应 lookup 上加一行：
+
+```json
+"exportRoundtrip": false
+```
+
+即可恢复旧行为（H 列保留，A 列不出现）。
+
+---
+
 ## ⚠️ BREAKING：fkInject 格式变更
 
 旧的单列对象写法 `"fkInject": { "from": "table.col", "to": "table.col" }` 已**删除**，不再向后兼容。
@@ -1160,6 +1186,24 @@ graph LR
         e22[E_LOOKUP_QUERY_FAILED<br/>lookup SELECT 失败]
     end
 
+    subgraph Temporal["时间字段错误"]
+        t1[E_TIME_PARSE<br/>导入时 Excel→内存 解析失败]
+        t2[E_TIME_PARSE_DB<br/>导出时 DB→内存 解析失败]
+        t3[W_TIME_ORDERBY_NONSORTABLE<br/>dbFormat 不满足字典序排序]
+    end
+
+    subgraph ExportOrder["导出列序错误"]
+        o1[E_EXPORT_UNKNOWN_HEADER<br/>columnOrder 含未声明表头]
+        o2[E_EXPORT_DUPLICATE_ORDER<br/>columnOrder 有重复]
+        o3[E_EXPORT_ORDER_WITH_RAW_SQL<br/>columnOrder 与 explicitSql 同时声明]
+    end
+
+    subgraph RevLookup["反向 lookup 错误（导出）"]
+        r1[E_REVERSE_LOOKUP_NOT_FOUND<br/>G 表中无匹配行]
+        r2[E_REVERSE_LOOKUP_AMBIGUOUS<br/>G 表命中多行]
+        r3[E_REVERSE_LOOKUP_QUERY_FAILED<br/>预取 SELECT 失败]
+    end
+
     subgraph Run["运行期错误"]
         e16[E_DB_UPSERT<br/>SQLite 写失败]
         e17[E_EXPORT_QUERY<br/>导出 SELECT 失败]
@@ -1263,12 +1307,12 @@ cmake --build build -j$(nproc)
 
 ```bash
 cd build
-ctest --output-on-failure          # 全部 12 个测试套件
+ctest --output-on-failure          # 全部 17 个测试套件
 ctest --output-on-failure -V       # 详细日志
 ctest -R tst_profile_loader        # 只跑某个测试（套件名见 tests/CMakeLists.txt）
 ```
 
-完整套件清单见 `tests/CMakeLists.txt`；其中 `tst_fk_preflight` 锁定 mixed 模式 FK 预校验回归，`tst_profile_validator` 覆盖 Profile × DB × Excel 三方校验，`tst_lookup_prefetch` / `tst_lookup_semantics` 覆盖 lookup 预取与行级语义（详见 §14.16 端到端验证流程）。
+完整套件清单见 `tests/CMakeLists.txt`；其中 `tst_fk_preflight` 锁定 mixed 模式 FK 预校验回归，`tst_profile_validator` 覆盖 Profile × DB × Excel 三方校验，`tst_lookup_prefetch` / `tst_lookup_semantics` 覆盖 lookup 预取与行级语义，`tst_temporal_import` / `tst_temporal_export` 覆盖时间字段格式转换，`tst_column_order_export` 覆盖导出列序，`tst_reverse_lookup_export` 覆盖反向 lookup 导出（详见 §14.16 端到端验证流程）。
 
 #### 14.2.5 安装（可选）
 
@@ -1453,7 +1497,7 @@ if (!r.ok) {
 
 #### ⑥ `exportExcel(xlsxPath, options) → ExportResult`
 
-**作用**：根据 Profile 的 `exportSpec`（或 routes 隐含的 LEFT JOIN）从 DB 查询并写入 Excel。
+**作用**：根据 Profile 的 `export`（或 routes 隐含的 LEFT JOIN）从 DB 查询并写入 Excel。
 
 ```cpp
 dbridge::ExportOptions eopts;
@@ -1667,7 +1711,7 @@ sqlite3 demo.db 'SELECT * FROM customer;'
   // — multiTable:  routes
   // — mixed:       discriminator / classes
 
-  "exportSpec": { ... }                            // 可选：导出专用配置
+  "export": { ... }                                // 可选：导出专用配置
 }
 ```
 
@@ -1721,12 +1765,14 @@ sqlite3 demo.db 'SELECT * FROM customer;'
 
 每个 lookup 元素从同一 SQLite 连接的参考表 `from` 中批量预取字段，行级别命中后合并到当前 route 的写入列集合：
 
-| 子字段 | 必填 | 说明 |
-|--------|------|------|
-| `name` | ✓ | Route 内唯一标识，不影响 DB 写入 |
-| `from` | ✓ | 参考表名（必须在同一 SQLite 连接中存在） |
-| `match` | ✓ | `[[参考表列, Excel 表头], ...]`：用 Excel 行的表头值查参考表键 |
-| `select` | ✓ | `[[参考表列, 目标 DB 列], ...]`：命中后写入当前 route 的哪些列 |
+| 子字段 | 必填 | 默认 | 说明 |
+|--------|------|------|------|
+| `name` | ✓ | — | Route 内唯一标识，不影响 DB 写入 |
+| `from` | ✓ | — | 参考表名（必须在同一 SQLite 连接中存在） |
+| `match` | ✓ | — | `[[参考表列, Excel 表头], ...]`：用 Excel 行的表头值查参考表键 |
+| `select` | ✓ | — | `[[参考表列, 目标 DB 列], ...]`：命中后写入当前 route 的哪些列 |
+| `exportRoundtrip` | 否 | `true` | `true`：导出时执行反向 lookup，H 列消失 A 列恢复；`false`：H 列原样出现，A 列不出现（详见 §⚠️ 反向 lookup BREAKING 说明） |
+| `exportOnMissing` | 否 | `"error"` | 反向 lookup 找不到匹配时的处理：`"error"` 跳过行+报 `E_REVERSE_LOOKUP_NOT_FOUND`；`"null"` 写空继续；`"skip"` 写空继续且不计入错误统计 |
 
 **错误码**：
 
@@ -1779,17 +1825,15 @@ sqlite3 demo.db 'SELECT * FROM customer;'
 }
 ```
 
-#### `exportSpec`（可选）
+#### `export`（可选）
 
 ```jsonc
 {
-  "exportSpec": {
+  "export": {
     "explicitSql": "SELECT ...",         // 用这条 SQL 而非自动 JOIN
-    "headerOrder": ["CustomerNo", "Name", "Phone"],   // 列顺序
-    "orderBy": ["table.col ASC", "..."],              // 排序键
-    "headerAlias": {                                  // DB 列名 → Excel 表头别名
-      "customer_no": "CustomerNo"
-    }
+    "columnOrder": ["CustomerNo", "Name", "Phone"],  // 输出列顺序（Excel header 名）
+    "orderBy": ["customer_no", "name"],              // 排序键（DB 列名或 table.col）
+    "classColumn": "Type"                            // Mixed 模式：写入类别标识的表头列名
   }
 }
 ```
@@ -1969,14 +2013,14 @@ auto r = bridge.exportExcel("out.xlsx", opts);
 
 #### 14.10.2 自定义列顺序 / 排序
 
-在 Profile 加 `exportSpec`：
+在 Profile 加 `export`：
 
 ```json
 {
   ...
-  "exportSpec": {
-    "headerOrder": ["Name", "Phone", "CustomerNo", "Age"],
-    "orderBy": ["customer.customer_no ASC"]
+  "export": {
+    "columnOrder": ["Name", "Phone", "CustomerNo", "Age"],
+    "orderBy": ["customer_no"]
   }
 }
 ```
@@ -1985,7 +2029,7 @@ auto r = bridge.exportExcel("out.xlsx", opts);
 
 ```json
 {
-  "exportSpec": {
+  "export": {
     "explicitSql": "SELECT c.customer_no AS CustomerNo, c.name AS Name, COUNT(o.order_no) AS OrderCount FROM customer c LEFT JOIN orders o ON o.customer = c.name GROUP BY c.customer_no ORDER BY OrderCount DESC"
   }
 }
@@ -1995,7 +2039,7 @@ auto r = bridge.exportExcel("out.xlsx", opts);
 
 #### 14.10.4 MultiTable 导出（自动 LEFT JOIN）
 
-`exportSpec.explicitSql` 不填时，库会按 routes 的 `parent` + `fkInject` 自动生成 LEFT JOIN。
+`export.explicitSql` 不填时，库会按 routes 的 `parent` + `fkInject` 自动生成 LEFT JOIN。
 
 ```sql
 SELECT o.order_no AS OrderNo, o.customer AS Customer, oi.line_no AS LineNo, oi.sku AS Sku
@@ -2177,10 +2221,13 @@ bridge.open(cs);                     // 这个连接是本线程的
 
 ### 14.16 端到端验证流程
 
-dbridge 在仓库内提供两个独立可复跑的端到端验证场景，对应 MVP 的两个硬需求：
+dbridge 在仓库内提供五个独立可复跑的端到端验证场景：
 
 - **场景 I**：单类行 → 多表集合（一行 Excel 同时进 `orders` + `order_items`）
 - **场景 II**：多类行 → 各自不同的表集合（A/B/C 三类行分别落入 m / n / o 集合）
+- **场景 III**：时间字段格式转换（日期 / 日期时间 / 时间三 slot，excelFormat↔dbFormat 互转；含子场景 §III-E epochSec 整数存储与 §III-F 新 `excel`/`db` 子对象形态等价性验证）
+- **场景 IV**：导出列序控制（`columnOrder` 精确排列输出列）
+- **场景 V**：反向 lookup 往返（导出自动反查 G 表还原 A 列；`exportOnMissing` 三种模式）
 
 完整步骤、数据准备、SQL 断言、负向用例与对账配方见 `docs/validation/row-to-multitable.md`。
 
@@ -2190,11 +2237,26 @@ dbridge 在仓库内提供两个独立可复跑的端到端验证场景，对应
 |---|---|
 | `tests/data/sql/02_orders.sql` | 场景 I schema |
 | `tests/data/profiles/order_m_set.json` | 场景 I Profile（multiTable） |
+| `tests/data/xlsx/Orders.xlsx` | 场景 I 输入 Excel |
 | `tests/data/sql/04_mixed_multitable.sql` | 场景 II schema（6 张表，3 个集合） |
 | `tests/data/profiles/mixed_abc_multitable.json` | 场景 II Profile（mixed + 每个 class 父子 routes） |
+| `tests/data/xlsx/Mixed.xlsx` | 场景 II 输入 Excel |
+| `tests/data/sql/05_time_formats.sql` | 场景 III schema（event 表，含日期/时间列） |
+| `tests/data/profiles/time_formats.json` | 场景 III Profile（profile 级 + 列级时间格式） |
+| `tests/data/xlsx/Events.xlsx` | 场景 III 输入 Excel |
+| `tests/data/sql/06_column_order.sql` | 场景 IV schema |
+| `tests/data/profiles/column_order.json` | 场景 IV Profile（含 `columnOrder`） |
+| `tests/data/xlsx/OrdersColOrder.xlsx` | 场景 IV 输入 Excel |
+| `tests/data/sql/07_reverse_lookup.sql` | 场景 V schema（orders + ref_customers） |
+| `tests/data/profiles/reverse_lookup.json` | 场景 V Profile（含 `lookups` + `exportOnMissing`） |
+| `tests/data/xlsx/ReverseLookup.xlsx` | 场景 V 输入 Excel |
+| `tests/data/sql/08_epoch_time.sql` | 场景 III-E schema（epoch_event 表，含 INTEGER 时间戳列） |
+| `tests/data/profiles/epoch_time.json` | 场景 III-E Profile（`datetimeFormat.db.type=epochSec`） |
+| `tests/data/xlsx/EpochEvents.xlsx` | 场景 III-E 输入 Excel |
 | `tools/xlsx2csv.py` | 导出对账脚本 |
+| `tools/build_fixtures.py` | 生成所有 xlsx 夹具（纯 Python stdlib） |
 
-`Orders.xlsx` 与 `Mixed.xlsx`（输入 Excel）按惯例不签入仓库；按验证文档 §I-3.2 / §II-3.2 的表格内容在本地构造即可。回归点 `tst_fk_preflight` 单元测试已锁住 mixed 模式 FK 预校验路径，避免历史 bug 复发。
+Excel 夹具已签入 `tests/data/xlsx/`，也可用 `python3 tools/build_fixtures.py` 重新生成。回归点 `tst_fk_preflight` 单元测试已锁住 mixed 模式 FK 预校验路径，`tst_temporal_import` 覆盖时间字段导入（含 epochSec 整数路径），`tst_temporal_export` 覆盖时间字段导出（含 epochSec 反序列化与 E_TIME_PARSE_DB），`tst_column_order_export` / `tst_reverse_lookup_export` 各自覆盖对应导出路径，`tst_profile_loader` 覆盖新旧形态 JSON 加载与 E_PROFILE_PARSE 负向用例。
 
 ---
 
@@ -2365,6 +2427,243 @@ A：`fkInject` 是一个数组，每个元素对应一个父表，`pairs` 列出
 ```
 
 > **注意**：旧的单列对象写法 `{ "from": "t.col", "to": "t.col" }` 已**完全移除**，不兼容。迁移方法见 §⚠️ BREAKING 章节。
+
+---
+
+**Q11：如何在 Profile 配置时间字段的 Excel 格式与 DB 存储格式？**
+
+A：使用 `dateFormat` / `datetimeFormat` / `timeFormat` 三个独立 slot（对应 `QDate` / `QDateTime` / `QTime`）。每个 slot 支持两种写法：
+
+---
+
+**旧形态（简写，向后兼容）：**
+
+```json
+{
+  "dateFormat":     { "excelFormat": "yyyy/M/d",          "dbFormat": "yyyy-MM-dd" },
+  "datetimeFormat": { "excelFormat": "yyyy/M/d HH:mm:ss", "dbFormat": "yyyy-MM-dd HH:mm:ss" },
+  "timeFormat":     { "excelFormat": "HH:mm",             "dbFormat": "HH:mm:ss" }
+}
+```
+
+旧形态字段说明：
+
+| 字段 | 必须 | 说明 |
+|---|---|---|
+| `excelFormat` | 是 | Excel 端格式字符串，用于导入解析与导出序列化 |
+| `dbFormat` | 是 | DB 存储格式字符串，用于导入写库与导出从库读取 |
+| `excelFormatFallback` | 否 | 仅导入用，主格式失败时依次尝试的备选列表 |
+
+---
+
+**新形态（`excel`/`db` 子对象，支持 `type` 字段）：**
+
+```json
+{
+  "dateFormat": {
+    "excel": { "type": "string", "format": "yyyy/M/d" },
+    "db":    { "type": "string", "format": "yyyy-MM-dd" }
+  },
+  "datetimeFormat": {
+    "excel": { "type": "string", "format": "yyyy/M/d HH:mm:ss" },
+    "db":    { "type": "string", "format": "yyyy-MM-dd HH:mm:ss" }
+  },
+  "timeFormat": {
+    "excel": { "type": "string", "format": "HH:mm" },
+    "db":    { "type": "string", "format": "HH:mm:ss" }
+  }
+}
+```
+
+`excel`/`db` 子对象字段：
+
+| 字段 | 必须 | 说明 |
+|---|---|---|
+| `type` | 否（默认 `"string"`） | 物理存储类型：`"string"` 或 `"epochSec"` |
+| `format` | type=string 时必须 | Qt 格式字符串；type=epochSec 时必须省略或为 `""` |
+| `fallback` | 否 | 仅 `excel` 侧有效，导入时主 format 失败后依次尝试 |
+
+`type` 取值表：
+
+| 值 | 适用 side | 适用 slot | 说明 |
+|---|---|---|---|
+| `"string"` | `excel`、`db` | 所有 slot | 字符串存储（默认行为） |
+| `"epochSec"` | 仅 `db` | 仅 `datetimeFormat` | Unix 纪元秒（整数），对应 SQLite `INTEGER` 列 |
+
+> **两种形态不可混用**：同一个 slot 对象内不能同时包含 `excelFormat`/`dbFormat` 等旧字段与 `excel`/`db` 子对象，否则加载时报 `E_PROFILE_PARSE`。两种形态可在不同层级（profile 级用旧、列级用新，或反之）分别使用。
+
+---
+
+**新旧形态等价对照表：**
+
+| 旧形态 | 等价新形态 |
+|---|---|
+| `"dateFormat": {"excelFormat":"fmt1","dbFormat":"fmt2"}` | `"dateFormat": {"excel":{"type":"string","format":"fmt1"},"db":{"type":"string","format":"fmt2"}}` |
+| `"excelFormatFallback": ["f1","f2"]` | `"excel": {"type":"string","format":"主格式","fallback":["f1","f2"]}` |
+| `"datetimeFormat": {"excelFormat":"f"}` (仅 excel side) | `"datetimeFormat": {"excel":{"type":"string","format":"f"}}` |
+
+---
+
+**列级别覆盖（side 整体覆盖）：**
+
+列级声明的 `excel` 或 `db` 子对象整体替换对应 side 的 profile 默认值；未声明的 side 继承 profile 默认：
+
+```json
+"columns": {
+  "event_dt": {
+    "source": "EventDT",
+    "datetimeFormat": { "db": {"type": "epochSec"} }
+  }
+}
+```
+
+上例中 `event_dt` 列覆盖 `db` side 为 epochSec，`excel` side 则整体继承全局 `datetimeFormat.excel`。
+
+> **与旧形态的区别**：旧形态为字段级合并（未声明的字段继承全局）；新形态为 side 级整体覆盖（未声明的 side 继承全局，但声明的 side 完全由列级决定）。
+
+---
+
+**epochSec 子场景（DB 存整数 Unix 时间戳）：**
+
+如果 SQLite 列类型为 `INTEGER`（Unix epoch seconds），可在 `datetimeFormat.db` 声明 `type: "epochSec"`：
+
+```json
+{
+  "datetimeFormat": {
+    "excel": { "type": "string", "format": "yyyy-MM-dd HH:mm:ss" },
+    "db":    { "type": "epochSec" }
+  },
+  "columns": {
+    "id":        { "source": "ID",       "validators": ["notNull","int"] },
+    "happen_at": { "source": "HappenAt" }
+  }
+}
+```
+
+- **导入**：Excel 字符串 `"2024-05-21 10:00:00"` 按 `excel.format` 解析为 `QDateTime`，再调 `QDateTime::toSecsSinceEpoch()` 写入 `INTEGER` 列。
+- **导出**：从 `INTEGER` 列读取 `qlonglong`，调 `QDateTime::fromSecsSinceEpoch()` 得到结构化时间，再按 `excel.format` 序列化为字符串写入 Excel。
+- **NULL vs 0**：SQL `NULL` 写空单元格；`qlonglong(0)` 对应 `"1970-01-01 00:00:00"`，不视为空。
+- **限制**：`epochSec` 仅允许用在 `datetimeFormat.db`；`dateFormat`、`timeFormat` 或 `excel` side 声明 `epochSec` 会在加载时报 `E_PROFILE_PARSE`。
+- **`orderBy`**：epochSec 列的整数自然有序，不触发 `W_TIME_ORDERBY_NONSORTABLE` 警告。
+
+---
+
+**`excelFormatFallback` 多格式回退：**
+
+```json
+"date_col": {
+  "source": "Date",
+  "dateFormat": {
+    "excelFormat": "yyyy-MM-dd",
+    "dbFormat": "yyyy-MM-dd",
+    "excelFormatFallback": ["d/M/yyyy", "MM/dd/yyyy"]
+  }
+}
+```
+
+导入时先尝试主格式，失败后依次尝试回退列表；全部失败则记 `E_TIME_PARSE` 行级错误，该行跳过。
+
+**与 `date:fmt` validator 的优先级：**
+
+- 只声明 `date:fmt` validator（无 `dateFormat`）：旧行为不变，validator 负责解析；DB 存储为 `QDate` 的默认 ISO 表示。
+- 同时声明 `dateFormat` 和 `date:fmt` validator：`dateFormat` 优先，`date:fmt` 被绕过；加载期发 info-level 诊断（不阻断）。
+- 只声明 `dateFormat`（无 validator）：temporal 层全权负责，validator chain 不含日期处理。
+
+**Excel 原生日期单元格（`QVariant::Date/DateTime`）：**
+
+xlsx 库将单元格识别为日期时，`ExcelReader` 直接返回结构化 `QDate/QDateTime`，导入时绕过 `excel.format` 解析（包括 epochSec 路径），直接进入 `db` side 序列化。
+
+**导出时格式化：**
+
+ExportService 按 `db.type` 分派：`string` 类型调 `parseString` 从 DB 字符串还原结构化值；`epochSec` 类型调 `QDateTime::fromSecsSinceEpoch`。DB 侧解析失败则记 `E_TIME_PARSE_DB`（非阻断，该单元格置空，行继续）。
+
+**`orderBy` 排序提示：**
+
+`export.orderBy` 命中时间字段时，若 `db.type=string` 且 `format` 不以 `yyyy` 开头（即不是"年→月→日"字典序），加载期发 `W_TIME_ORDERBY_NONSORTABLE` warning；`db.type=epochSec` 时整数本身有序，不发警告。
+
+**推荐的 `db.format` 起手值（type=string）：**
+
+| slot | 推荐 format | 备注 |
+|---|---|---|
+| `dateFormat` | `yyyy-MM-dd` | ISO 8601，字典序 == 时间序 |
+| `datetimeFormat` | `yyyy-MM-dd HH:mm:ss` | ISO 8601（无时区） |
+| `timeFormat` | `HH:mm:ss` | 24 小时制 |
+
+> **不引入时区**：本库不做 UTC 转换。`QDateTime` 默认本地时间；epochSec 也基于本地时间解释，如需 UTC，由宿主侧处理。
+
+---
+
+**Q12：如何控制导出 Excel 的列顺序？**
+
+在 `export` 对象里声明 `columnOrder` 数组，元素为 Excel header 名称（即 `ColumnSpec.source`）：
+
+```json
+"export": {
+  "orderBy": ["order_no"],
+  "columnOrder": ["Total", "OrderNo", "TenantId"]
+}
+```
+
+**规则：**
+
+| 情况 | 行为 |
+|---|---|
+| `columnOrder` 为空（默认） | 维持 SQL 返回列顺序，行为与旧版完全一致 |
+| `columnOrder` 列出部分列 | 列出的列按声明顺序排在最前，未列出的列按 SQL 自然顺序追加到末尾 |
+| `columnOrder` 列出全部列 | 完全按声明顺序输出 |
+| Mixed 模式 + `classColumn` 在 `columnOrder` 中 | classColumn 按声明位置插入，不再强制置首列 |
+| Mixed 模式 + `classColumn` 不在 `columnOrder` 中 | classColumn 仍自动置首列（兼容旧行为） |
+
+**约束：**
+- `columnOrder` 中每个元素必须是 profile 中已声明的 `source`（Excel header 名），否则验证期报 `E_EXPORT_UNKNOWN_HEADER`
+- `columnOrder` 中不得有重复，否则报 `E_EXPORT_DUPLICATE_ORDER`
+- `columnOrder` 与 `export.sql`（显式 SQL）互斥；同时声明报 `E_EXPORT_ORDER_WITH_RAW_SQL`
+- `columnOrder` 与 `orderBy` 完全正交，可同时使用
+
+**存量 profile 零迁移：** 不声明 `columnOrder` 时行为与之前完全一致。
+
+---
+
+**Q13：如何让导出 Excel 还原 lookup 的原始 A 列（无损往返）？**
+
+`lookups[]` 声明在导出方向自动做"反向查找"：把 DB 中存储的 H 列值（`select[*].dbColumn`）查回 G 表，还原出原始的 A 列值（`match[*].Excel_header`），写入 Excel。H 列在输出中消失，A 列出现。
+
+**最小示例**（`ref_customers` 是 G 表，`customer_name` 是 H 列，`CustNo` 是 A 列）：
+
+```json
+{
+  "lookups": [{
+    "name": "c",
+    "from": "ref_customers",
+    "match": [["c_no", "CustNo"]],
+    "select": [["c_name", "customer_name"]]
+  }],
+  "columns": { "order_no": { "source": "OrderNo" } }
+}
+```
+
+导出结果：Excel 有 `OrderNo` 和 `CustNo`，没有 `customer_name`。
+
+**关键字段：**
+
+| 字段 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `exportRoundtrip` | bool | `true` | `false` 时保留 H 列、不做反查，恢复旧行为 |
+| `exportOnMissing` | `"error"` / `"null"` / `"skip"` | `"error"` | G 表中找不到匹配行时的处理策略 |
+
+**`exportOnMissing` 三种模式：**
+
+| 值 | G 表找不到匹配时 | 多行匹配时 |
+|---|---|---|
+| `"error"`（默认）| 行级错误 `E_REVERSE_LOOKUP_NOT_FOUND`，该行跳过 | 行级错误 `E_REVERSE_LOOKUP_AMBIGUOUS`，该行跳过 |
+| `"null"` | A 列写空，行继续，不报错 | 同上（多匹配始终报错） |
+| `"skip"` | A 列写空，行继续，不报错（不计入错误总数） | 同上 |
+
+**与 `columnOrder` 协同：** `columnOrder` 中可以写 A 列名（`CustNo`），**不能**写 H 列名（`customer_name`，该列在导出中不存在，会报 `E_EXPORT_UNKNOWN_HEADER`）。
+
+**与时间字段协同：** 若 A 列对应的 `ColumnSpec` 声明了 `dateFormat`，反查还原的值会自动经过时间格式化（`dbFormat` → `excelFormat`）。
+
+**回滚方式：** 在每个 lookup 上加 `"exportRoundtrip": false`，导出行为与旧版完全一致。
 
 ---
 

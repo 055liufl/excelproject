@@ -31,6 +31,7 @@ set(DBRIDGE_SOURCES
     src/mapping/TopoSorter.cpp
     src/mapping/FkInjector.cpp
     src/mapping/BatchUniqueness.cpp
+    src/mapping/TemporalConvert.cpp
     src/sql/SqlBuilder.cpp
     src/service/ErrorCollector.cpp
     src/service/ImportService.cpp

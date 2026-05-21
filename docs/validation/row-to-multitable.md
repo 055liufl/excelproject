@@ -12,14 +12,20 @@
 
 | 场景 | 一句话 | 对应 MVP 目标 | 仓库夹具 |
 |---|---|---|---|
-| **场景 I**：单类行 → 多表集合 | 同一个 Sheet 的**每一行**同时进入父表+子表（m 集合） | §1.4 | ✅ `tests/data/profiles/order_m_set.json` + `tests/data/sql/02_orders.sql`（Orders.xlsx 本地构造） |
-| **场景 II**：多类行 → 各自的不同表集合 | 同一个 Sheet 中**多行 A/B/C**，每一类各自落入不同的多表集合（m / n / o） | §1.5 | ✅ `tests/data/profiles/mixed_abc_multitable.json` + `tests/data/sql/04_mixed_multitable.sql`（Mixed.xlsx 本地构造）；另有 `tests/data/profiles/mixed_abc.json` 作为单表精简版（m1/n1/o1）保留，与本场景互不替代 |
+| **场景 I**：单类行 → 多表集合 | 同一个 Sheet 的**每一行**同时进入父表+子表（m 集合） | §1.4 | ✅ `tests/data/profiles/order_m_set.json` + `tests/data/sql/02_orders.sql` + `tests/data/xlsx/Orders.xlsx` |
+| **场景 II**：多类行 → 各自的不同表集合 | 同一个 Sheet 中**多行 A/B/C**，每一类各自落入不同的多表集合（m / n / o） | §1.5 | ✅ `tests/data/profiles/mixed_abc_multitable.json` + `tests/data/sql/04_mixed_multitable.sql` + `tests/data/xlsx/Mixed.xlsx`；另有 `tests/data/profiles/mixed_abc.json` 作为单表精简版（m1/n1/o1）保留，与本场景互不替代 |
+| **场景 III**：时间格式导入/导出 | 导入时 Excel 日期字符串按 `excelFormat` 解析并以 `dbFormat` 写入 SQLite；导出时反向还原；`excelFormatFallback` 梯级回退 | 能力 `time-format` | ✅ `tests/data/profiles/time_formats.json` + `tests/data/sql/05_time_formats.sql` + `tests/data/xlsx/Events.xlsx` |
+| **场景 IV**：导出列顺序控制 | `columnOrder` 使声明列优先排序，未声明列以自然顺序追加；Mixed 模式 `classColumn` 可嵌入或自动前置 | 能力 `export-column-order` | ✅ `tests/data/profiles/column_order.json` + `tests/data/sql/06_column_order.sql` + `tests/data/xlsx/OrdersColOrder.xlsx` |
+| **场景 V**：导出反向 lookup（无损往返） | 导入时 lookup 把 A 列（Excel 表头）替换为 H 列（DB 列）存入库；导出时反向 lookup 恢复 A 列，H 列不出现于 Excel | 能力 `export-reverse-lookup` | ✅ `tests/data/profiles/reverse_lookup.json` + `tests/data/sql/07_reverse_lookup.sql` + `tests/data/xlsx/ReverseLookup.xlsx` |
 
-两个场景互补：
+五个场景互补：
 - 场景 I 证明"**一行**可以同时进**多张表**"。
 - 场景 II 证明"**多行**之间可以各自路由到**完全不同的表集合**"。
+- 场景 III 证明"**日期 / 时间字段**跨 Excel ↔ SQLite 边界的格式转换在导入和导出两个方向正确运作"。
+- 场景 IV 证明"**导出列顺序**可通过 `columnOrder` 显式控制，不影响数据完整性"。
+- 场景 V 证明"**反向 lookup** 使导入时的字段替换在导出时完全可逆，实现无损往返"。
 
-只有同时通过，"一行对多表 + 多行对多表集合"这一整组需求才视为验证闭环。
+五个场景同时通过，才视为整套功能的验证闭环。
 
 > 下文出现的 CLI 命令统一以仓库自带的 `examples/cli/dbridge-cli` 为准，调用形式见 `examples/cli/main.cpp`：
 > ```
@@ -88,7 +94,7 @@ sqlite3 /tmp/scenarioI.db < tests/data/sql/02_orders.sql
 sqlite3 /tmp/scenarioI.db "PRAGMA foreign_keys = ON; SELECT sqlite_version();"   # ≥ 3.24.0
 ```
 
-### I-3.2 Excel 输入（本地构造，约定路径 `tests/data/xlsx/Orders.xlsx`）
+### I-3.2 Excel 输入（`tests/data/xlsx/Orders.xlsx`）
 
 单 Sheet 名 `Orders`，第 1 行为表头，**共 4 行业务数据**：
 
@@ -206,20 +212,20 @@ sort /tmp/out_I.csv | sha256sum   # 应与 in_I 完全一致
 
 ### I-4.4 负向场景（I-V4 / I-V6）
 
-| 场景 | 制造方式 | 期望错误码 |
-|---|---|---|
-| 父业务键缺失 | 第 2 行 `OrderNo` 清空 | `E_VALIDATE_NULL` |
-| 同批 conflict 冲突且非 key 字段不一致 | 第 1、2 行 `Amount` 改成不同值 | `E_VALIDATE_DUPLICATE` |
-| Profile 拓扑成环 | 给 `orders` 加 `parent: "order_items"` | `E_PROFILE_TOPOLOGY_CYCLE` |
-| FK 引用不存在 | 子行 `OrderNo` 改成数据库中不存在的订单号且父行已被删 | `E_VALIDATE_FK` |
+| 场景 | 制造方式 | 期望错误码 | 期望库状态 |
+|---|---|---|---|
+| 父业务键缺失 | 第 2 行 `OrderNo` 清空 | `E_VALIDATE_NULL` | **行级错误**：第 2 行跳过，第 1、3 行正常写入（两表非空） |
+| 同批 conflict 冲突且非 key 字段不一致 | 第 1、2 行 `OrderNo` 相同但 `Amount` 不同 | `E_VALIDATE_DUPLICATE` | **行级错误**：重复行跳过，另一行写入（两表有部分数据） |
+| Profile 拓扑成环 | 给 `orders` 加 `parent: "order_items"` | `E_PROFILE_TOPOLOGY_CYCLE` | **表级错误（row=0）**：整批中止，两张表均为 0 行 |
+| FK 引用不存在 | 子行 `OrderNo` 改成数据库中不存在的订单号且父行已被删 | `E_VALIDATE_FK` | **行级错误**：对应行跳过，其余行正常写入 |
 
-每个用例运行后 `SELECT COUNT(*)` 两张表都应为 0。
+> **行级 vs 表级区分**（代码依据 `ImportService.cpp:652-666`）：`row > 0` 错误（如 `E_VALIDATE_*`）仅跳过失败行，其余行继续导入并提交；`row == 0` 错误（如 `E_PROFILE_TOPOLOGY_CYCLE`、`E_PROFILE_PARSE`）在 Phase D 写入前中止整批，DB 不写任何行。
 
 ---
 
 # 场景 II：多类行 → 各自的不同表集合（m / n / o）
 
-> **夹具状态**：本场景的 schema / Profile 已签入仓库（路径见 §II-3.1 / §II-3.3）。`Mixed.xlsx` 是 xlsx 二进制不签入仓库，按 §II-3.2 表格在本地构造即可。本场景已在 master HEAD 通过端到端验证：6 张表行数、FK 完整性、A/B/C 集合互不污染、日期字段 ISO 形态均符合预期；mixed 模式下的 FK 预校验路径由 `tst_fk_preflight` 单元测试守护，避免历史误报 `E_VALIDATE_FK` 的回归。
+> **夹具状态**：本场景全部夹具（schema / Profile / `Mixed.xlsx`）已签入仓库（路径见 §II-3.1 / §II-3.2 / §II-3.3）；可用 `python3 tools/build_fixtures.py` 重新生成 xlsx。本场景已在 master HEAD 通过端到端验证：6 张表行数、FK 完整性、A/B/C 集合互不污染、日期字段 ISO 形态均符合预期；mixed 模式下的 FK 预校验路径由 `tst_fk_preflight` 单元测试守护，避免历史误报 `E_VALIDATE_FK` 的回归。
 >
 > 仓库中另有 `tests/data/profiles/mixed_abc.json` + `tests/data/sql/03_mixed.sql`，把每个 class 路由到**单张**目标表（m1 / n1 / o1），用以最小化覆盖 §1.5 鉴别逻辑——与本场景并存，互不替代。
 
@@ -312,7 +318,7 @@ CREATE TABLE invoice_lines (
 );
 ```
 
-### II-3.2 Excel 输入（本地构造，约定路径 `tests/data/xlsx/Mixed.xlsx`）
+### II-3.2 Excel 输入（`tests/data/xlsx/Mixed.xlsx`）
 
 单 Sheet 名 `Mixed`，第 1 行表头是 **A/B/C 三类列的并集 + `Type` 鉴别列**。每一行只填写自己 class 需要的列，其他单元格留空。**共 6 行业务数据**：
 
@@ -510,34 +516,763 @@ sort /tmp/out_II.csv | sha256sum   # 应一致
 
 | 场景 | 制造方式 | 期望错误码 | 期望库状态 |
 |---|---|---|---|
-| 未匹配类 | 把第 3 行 `Type` 改为 `X` | `E_ROUTE_UNMATCHED`（指向第 3 行 `Type=X`） | 6 张表全部 0 |
-| 跨集合污染尝试 | 把 C 行 `Type` 误填为 `A`，但 `OrderNo` 列为空 | `E_VALIDATE_NULL`（A class 的 `OrderNo`） | 6 张表全部 0 |
-| n 集合 FK 缺失 | B 行 `ShipmentNo` 清空 | `E_VALIDATE_NULL` | 6 张表全部 0 |
-| 子行业务键越界 | C 行 `InvLineNo` 改成 0 | `E_VALIDATE_INT`（`int>=1`） | 6 张表全部 0 |
-| FK 父行批/库均缺失 | 子行 FK 值在批内与 DB 中都查不到 | `E_VALIDATE_FK` —— 单元回归用例 `tst_fk_preflight::testParentMissing` 覆盖 | 6 张表全部 0 |
+| 未匹配类 | 把第 3 行 `Type` 改为 `X` | `E_ROUTE_UNMATCHED`（指向该行 `Type=X`） | **行级错误**：该行跳过，其余行正常写入（各表非空） |
+| 跨集合污染尝试 | 把 C 行 `Type` 误填为 `A`，但 `OrderNo` 列为空 | `E_VALIDATE_NULL`（A class 的 `OrderNo`） | **行级错误**：该行跳过，同批其余行正常写入 |
+| n 集合 FK 缺失 | B 行 `ShipmentNo` 清空 | `E_VALIDATE_NULL` | **行级错误**：该行跳过，同批其余行正常写入 |
+| 子行业务键越界 | C 行 `InvLineNo` 改成 0 | `E_VALIDATE_TYPE`（`int>=1`） | **行级错误**：该行跳过，同批其余行正常写入 |
+| FK 父行批/库均缺失 | 子行 FK 值在批内与 DB 中都查不到 | `E_VALIDATE_FK` —— 单元回归用例 `tst_fk_preflight::testParentMissing` 覆盖 | **行级错误**：该行跳过，同批其余行正常写入 |
 
-每个用例运行后均执行：
-
-```sql
-SELECT (SELECT COUNT(*) FROM orders)
-     + (SELECT COUNT(*) FROM order_items)
-     + (SELECT COUNT(*) FROM shipments)
-     + (SELECT COUNT(*) FROM shipment_legs)
-     + (SELECT COUNT(*) FROM invoices)
-     + (SELECT COUNT(*) FROM invoice_lines) AS total_rows;
--- 期望 0
-```
+> **行级 vs 表级区分**：以上全部场景均为 `row > 0` 行级错误，只跳过失败行，不中止整批。验证方式：执行负向用例后确认**报错行不在 DB 中**，同时**同批其他行均已写入**（各对应表行数 > 0）。
+>
+> 若需验证"整批中止"（6 张表全部 0）的路径，需触发 `row == 0` 的表级错误（如 `E_PROFILE_TOPOLOGY_CYCLE`）。
 
 ---
 
-## 通过准则（两个场景共用）
+# 场景 III：时间格式导入/导出
 
-只有同时满足以下条件，"一行→多表 + 多行→多表集合"才算验证通过：
+## III-1 验证目标
+
+| 序号 | 验收点 | 来源 |
+|---|---|---|
+| III-V1 | Profile 级 `dateFormat`/`datetimeFormat`/`timeFormat` 独立加载，三槽互不串联 | 能力 `time-format` §三独立槽 |
+| III-V2 | 导入时 Excel 字符串按 `excelFormat` 解析，再按 `dbFormat` 序列化写入 SQLite | 能力 §导入解析路径 |
+| III-V3 | `excelFormatFallback` 按数组顺序依次尝试，首个成功的生效 | 能力 §fallback 梯级回退 |
+| III-V4 | 列级 `dateFormat` 字段级覆盖：只声明 `excelFormat` 时 `dbFormat` 继承 Profile 级 | 能力 §列级覆盖字段合并 |
+| III-V5 | 导出时 DB 字符串按 `dbFormat` 解析，再按 `excelFormat` 序列化写回 Excel | 能力 §导出序列化路径 |
+| III-V6 | 导入失败 `E_TIME_PARSE` → 仅该行跳过，其余行继续；导出失败 `E_TIME_PARSE_DB` → 仅该格置空，该行其余格继续 | 能力 §失败语义行级隔离 |
+| III-V7 | 使用非 `yyyy` 开头 `dbFormat` 的列作为 `orderBy` 对象 → Profile 加载成功并触发 `W_TIME_ORDERBY_NONSORTABLE` | 能力 §不可排序警告 |
+
+## III-2 验证拓扑
+
+```
+Excel: Events.xlsx (单 Sheet "Events")
+   │  EventID, Title, EventDate, EventDateTime, StartTime, LegacyDate, DateWithFallback
+   ▼
+DataBridge.importExcel(profile=time_formats.json)
+   ├── event_date       ← excelFormat:"yyyy/M/d"        →解析→ dbFormat:"yyyy-MM-dd"
+   ├── event_datetime   ← excelFormat:"d/M/yyyy H:mm"   →解析→ dbFormat:"yyyy-MM-dd HH:mm:ss"  [列级覆盖]
+   ├── start_time       ← excelFormat:"HH:mm"           →解析→ dbFormat:"HH:mm:ss"
+   ├── legacy_date      ← validators:["date:yyyy-MM-dd"]          [旧式兼容]
+   └── date_with_fallback ← excelFormat:"yyyy-MM-dd" + fallback:["d/M/yyyy","MM/dd/yyyy"]
+   ▼
+SQLite: scenarioIII.db  →  event 表（时间列均以 dbFormat 字符串存储）
+   ▼
+DataBridge.exportExcel(...)  →  Events.exported.xlsx（时间列还原回 excelFormat）
+```
+
+## III-3 数据准备
+
+### III-3.1 Schema（路径 `tests/data/sql/05_time_formats.sql`）
+
+```sql
+CREATE TABLE IF NOT EXISTS event (
+    event_id           INTEGER PRIMARY KEY,
+    title              TEXT    NOT NULL,
+    event_date         TEXT,            -- 存储格式 yyyy-MM-dd
+    event_datetime     TEXT,            -- 存储格式 yyyy-MM-dd HH:mm:ss
+    start_time         TEXT,            -- 存储格式 HH:mm:ss
+    legacy_date        TEXT,            -- 存储格式 yyyy-MM-dd（旧式 validator）
+    date_with_fallback TEXT             -- 存储格式 yyyy-MM-dd
+);
+```
+
+初始化：
+
+```bash
+sqlite3 /tmp/scenarioIII.db < tests/data/sql/05_time_formats.sql
+```
+
+### III-3.2 Excel 输入（`tests/data/xlsx/Events.xlsx`）
+
+单 Sheet 名 `Events`，**共 3 行业务数据**：
+
+| EventID | Title | EventDate | EventDateTime | StartTime | LegacyDate | DateWithFallback |
+|---------|-------|-----------|---------------|-----------|------------|-----------------|
+| 1 | Workshop | 2026/5/21 | 21/5/2026 9:30 | 09:30 | 2026-05-21 | 2026-05-21 |
+| 2 | Conference | 2026/6/1 | 1/6/2026 14:00 | 14:00 | 2026-06-01 | 01/06/2026 |
+| 3 | Seminar | 2026/7/15 | 15/7/2026 18:30 | 18:30 | 2026-07-15 | 07/15/2026 |
+
+- `EventDate` 用 Profile 级 `dateFormat.excelFormat = "yyyy/M/d"` 解析（III-V2）。
+- `EventDateTime` 用**列级覆盖** `excelFormat = "d/M/yyyy H:mm"` 解析；`dbFormat` 继承 Profile 级 `"yyyy-MM-dd HH:mm:ss"`（III-V4）。
+- `DateWithFallback` 第 1 行 `"2026-05-21"` 命中主格式；第 2 行 `"01/06/2026"` 回退 `"d/M/yyyy"`（d=01, M=06）；第 3 行 `"07/15/2026"` 回退 `"MM/dd/yyyy"`（III-V3）。
+- `LegacyDate` 使用旧式 `validators:["date:yyyy-MM-dd"]`，不走新 `dateFormat` 路径，行为不变。
+
+### III-3.3 Profile（复用 `tests/data/profiles/time_formats.json`）
+
+文件已签入，关键字段节选：
+
+```json
+{
+  "profileName": "time_formats",
+  "sheet": "Events",
+  "mode": "singleTable",
+  "table": "event",
+  "conflict": { "columns": ["event_id"] },
+  "dateFormat":     { "excelFormat": "yyyy/M/d",          "dbFormat": "yyyy-MM-dd" },
+  "datetimeFormat": { "excelFormat": "yyyy/M/d HH:mm:ss", "dbFormat": "yyyy-MM-dd HH:mm:ss" },
+  "timeFormat":     { "excelFormat": "HH:mm",             "dbFormat": "HH:mm:ss" },
+  "columns": {
+    "event_datetime": {
+      "source": "EventDateTime",
+      "datetimeFormat": { "excelFormat": "d/M/yyyy H:mm" }
+    },
+    "start_time": {
+      "source": "StartTime",
+      "timeFormat": {}
+    },
+    "date_with_fallback": {
+      "source": "DateWithFallback",
+      "dateFormat": {
+        "excelFormat": "yyyy-MM-dd",
+        "dbFormat":    "yyyy-MM-dd",
+        "excelFormatFallback": ["d/M/yyyy", "MM/dd/yyyy"]
+      }
+    }
+  },
+  "export": { "orderBy": ["event_date"] }
+}
+```
+
+## III-4 执行步骤
+
+### III-4.1 导入
+
+```bash
+./build/examples/cli/dbridge-cli \
+  /tmp/scenarioIII.db \
+  tests/data/profiles/time_formats.json \
+  tests/data/xlsx/Events.xlsx \
+  import
+```
+
+期望：无错误，`Imported 3 rows`。
+
+### III-4.2 SQL 断言（III-V2 / III-V3 / III-V4）
+
+```sql
+-- III-V2：event_date 均以 yyyy-MM-dd 存储
+SELECT event_id, event_date FROM event ORDER BY event_id;
+-- 期望：1→'2026-05-21'，2→'2026-06-01'，3→'2026-07-15'
+
+-- III-V4 列级覆盖：event_datetime 按列级 excelFormat 解析，按 profile 级 dbFormat 存储
+SELECT event_datetime FROM event ORDER BY event_id;
+-- 期望：'2026-05-21 09:30:00'，'2026-06-01 14:00:00'，'2026-07-15 18:30:00'
+
+-- III-V2 timeFormat
+SELECT start_time FROM event ORDER BY event_id;
+-- 期望：'09:30:00'，'14:00:00'，'18:30:00'
+
+-- III-V3 fallback：三行 date_with_fallback 均正确写入
+SELECT date_with_fallback FROM event ORDER BY event_id;
+-- 期望：'2026-05-21'，'2026-06-01'，'2026-07-15'
+```
+
+### III-4.3 导出（III-V5）
+
+```bash
+./build/examples/cli/dbridge-cli \
+  /tmp/scenarioIII.db \
+  tests/data/profiles/time_formats.json \
+  /tmp/Events.exported.xlsx \
+  export
+```
+
+目视核查导出文件（用 `tools/xlsx2csv.py` 辅助，或直接开 Excel/LibreOffice）：
+
+| 列 | 期望导出格式 | 示例值 |
+|---|---|---|
+| `EventDate` | `excelFormat:"yyyy/M/d"` | `2026/5/21`，`2026/6/1`，`2026/7/15` |
+| `EventDateTime` | 列级 `excelFormat:"d/M/yyyy H:mm"` | `21/5/2026 9:30`，`1/6/2026 14:00`，`15/7/2026 18:30` |
+| `StartTime` | `excelFormat:"HH:mm"` | `09:30`，`14:00`，`18:30` |
+| `DateWithFallback` | `excelFormat:"yyyy-MM-dd"` | `2026-05-21`，`2026-06-01`，`2026-07-15` |
+
+### III-4.4 负向场景（III-V6 / III-V7）
+
+| 场景 | 制造方式 | 期望结果 |
+|---|---|---|
+| 导入 `E_TIME_PARSE`（主格式不匹配） | 第 2 行 `EventDate` 改为 `"abc"` | 第 2 行跳过，emit `E_TIME_PARSE`；第 1、3 行正常写入，库中存 2 行 |
+| 导入 `E_TIME_PARSE`（fallback 全失败） | 第 3 行 `DateWithFallback` 改为 `"9999-99-99"` | 第 3 行跳过，emit `E_TIME_PARSE`；第 1、2 行正常写入 |
+| 导出 `E_TIME_PARSE_DB` | 直接 `UPDATE event SET event_date='20260521' WHERE event_id=1` 后导出 | row-1 的 `EventDate` 格写空，emit `E_TIME_PARSE_DB`；同行其余格正常写出 |
+| `W_TIME_ORDERBY_NONSORTABLE` | 新建 Profile，令 `datetimeFormat.dbFormat = "d/M/yyyy H:mm"`，`orderBy: ["event_datetime"]` | Profile 加载成功，`result.warnings` 包含 `W_TIME_ORDERBY_NONSORTABLE`，消息含 `"event_datetime"` 和 `"d/M/yyyy H:mm"` |
+
+---
+
+## III-E epoch 子场景：DB 存 Unix epoch seconds 的端到端验证
+
+本子场景覆盖 `type: "epochSec"` 路径：SQLite 列类型为 `INTEGER`，以 Unix 纪元秒存储。
+
+### III-E.1 夹具
+
+| 文件 | 路径 |
+|---|---|
+| Schema | `tests/data/sql/08_epoch_time.sql` |
+| Profile | `tests/data/profiles/epoch_time.json` |
+| Excel 输入 | `tests/data/xlsx/EpochEvents.xlsx` |
+
+Profile 关键配置：
+
+```json
+{
+  "datetimeFormat": {
+    "excel": { "type": "string", "format": "yyyy-MM-dd HH:mm:ss" },
+    "db":    { "type": "epochSec" }
+  }
+}
+```
+
+### III-E.2 导入断言
+
+```bash
+dbridge-cli /tmp/epochE.db tests/data/profiles/epoch_time.json tests/data/xlsx/EpochEvents.xlsx import
+```
+
+```sql
+-- 验证 happen_at 存储为整数（非字符串）
+SELECT typeof(happen_at) FROM epoch_event;
+-- 期望每行均为 integer
+
+-- 验证 epoch=0 对应 "1970-01-01 00:00:00"（行 3）
+SELECT happen_at FROM epoch_event WHERE event_id=3;
+-- 期望：epoch_seconds_of_local_"1970-01-01 00:00:00"
+-- （本地时区 UTC+8 时为 -28800，UTC+0 时为 0）
+
+-- 验证往返：epoch 解析回字符串与输入一致
+SELECT datetime(happen_at, 'unixepoch', 'localtime') FROM epoch_event WHERE event_id=1;
+-- 期望：2024-05-21 10:00:00（仅在 UTC 环境正确；本地时区用宿主侧工具验证）
+```
+
+### III-E.3 导出断言（III-E 往返）
+
+```bash
+dbridge-cli /tmp/epochE.db tests/data/profiles/epoch_time.json /tmp/EpochEvents.exported.xlsx export
+```
+
+导出后与原始 `EpochEvents.xlsx` 比对：`HappenAt` 列的字符串值应与输入完全一致（在相同时区环境下）。
+
+### III-E.4 epochSec 特殊边界
+
+| 场景 | 制造方式 | 期望结果 |
+|---|---|---|
+| NULL → 空单元格 | `UPDATE epoch_event SET happen_at=NULL WHERE event_id=1`（需先 `ALTER` 去掉 NOT NULL） | 导出时该格为空，不报错 |
+| 0 → 不视为空 | `UPDATE epoch_event SET happen_at=0 WHERE event_id=1` | 导出时该格为 `"1970-01-01 00:00:00"`（本地时区），不为空 |
+| 非整数字符串 | 直接 `UPDATE epoch_event SET happen_at='abc'` 后导出 | 该格置空，emit `E_TIME_PARSE_DB`，行继续 |
+| epochSec 用于 `dateFormat` | 在 `dateFormat.db` 声明 `type: "epochSec"` | Profile 加载时报 `E_PROFILE_PARSE`，阻止加载 |
+| epochSec 用于 `excel` side | 在 `datetimeFormat.excel` 声明 `type: "epochSec"` | Profile 加载时报 `E_PROFILE_PARSE`，阻止加载 |
+| `orderBy` 含 epochSec 列 | `"export": {"orderBy": ["happen_at"]}` | Profile 加载成功，无 `W_TIME_ORDERBY_NONSORTABLE`（整数自然有序） |
+
+---
+
+## III-F 新 side-object 形态与 side 级整体覆盖验证
+
+本子场景覆盖 `add-time-explicit-type` 引入的核心新语义：显式 `type` 字段、`excel`/`db` sub-object 形态，以及与旧形态的混用规则。夹具复用 §III-3 的 `Events.xlsx` 和 `05_time_formats.sql`；Profile 变体均以 JSON 片段内联，无需额外签入文件。
+
+### III-F.1 新形态等价性（type=string 路径）
+
+将 §III-3.3 Profile 的时间 slot 改写为新形态后，导入结果应与 §III-4.2 完全一致。
+
+**等价关系**：
+
+```jsonc
+// 旧形态（§III-3.3 已签入）
+"dateFormat": { "excelFormat": "yyyy/M/d", "dbFormat": "yyyy-MM-dd" }
+
+// 等价新形态（type 可省略，省略时默认 "string"）
+"dateFormat": {
+  "excel": { "type": "string", "format": "yyyy/M/d" },
+  "db":    { "type": "string", "format": "yyyy-MM-dd" }
+}
+```
+
+将 `tests/data/profiles/time_formats.json` 中所有 slot 改写为新形态后另存为 `/tmp/time_formats_newstyle.json`，用同一 `Events.xlsx` 导入新库：
+
+```bash
+sqlite3 /tmp/scenarioIII_new.db < tests/data/sql/05_time_formats.sql
+
+./build/examples/cli/dbridge-cli \
+  /tmp/scenarioIII_new.db \
+  /tmp/time_formats_newstyle.json \
+  tests/data/xlsx/Events.xlsx \
+  import
+```
+
+执行 §III-4.2 中相同的 SQL 断言——结果应与旧形态完全一致：
+
+```sql
+SELECT event_date FROM event ORDER BY event_id;
+-- 期望：'2026-05-21'，'2026-06-01'，'2026-07-15'
+
+SELECT event_datetime FROM event ORDER BY event_id;
+-- 期望：'2026-05-21 09:30:00'，'2026-06-01 14:00:00'，'2026-07-15 18:30:00'
+```
+
+**预期**：Profile 加载无警告，数据行为与旧形态无差异。
+
+### III-F.2 side 级整体覆盖：列仅覆盖 db side
+
+**语义差异**（旧形态字段级合并 vs 新形态 side 级整体覆盖）：
+
+| 列级声明方式 | 覆盖范围 |
+|---|---|
+| 旧：`{ "datetimeFormat": {"excelFormat":"d/M/yyyy H:mm"} }` | 仅覆盖 excelFormat 字段；dbFormat 继承 profile 级 **该字段** |
+| 新：`{ "datetimeFormat": {"excel": {...}} }` | excel side **整体**替换；db side **整体**继承 profile |
+| 新：`{ "datetimeFormat": {"db": {...}} }` | db side **整体**替换（含 type）；excel side **整体**继承 profile |
+
+验证「列仅声明 db side，excel side 从 profile 整体继承」：
+
+```jsonc
+// Profile 级（新形态）
+"datetimeFormat": {
+  "excel": { "type": "string", "format": "d/M/yyyy H:mm" },
+  "db":    { "type": "string", "format": "yyyy-MM-dd HH:mm:ss" }
+},
+"columns": {
+  "event_datetime": {
+    "source": "EventDateTime",
+    "datetimeFormat": {
+      // 仅覆盖 db side：db 改用带秒的格式
+      "db": { "type": "string", "format": "yyyy-MM-dd HH:mm:00" }
+      // excel side 未声明 → 整体继承 profile 级 excel（"d/M/yyyy H:mm"）
+    }
+  }
+}
+```
+
+导入 `Events.xlsx`（第 2 行 `EventDateTime = "1/6/2026 14:00"`）后断言：
+
+```sql
+SELECT event_datetime FROM event WHERE event_id=2;
+-- 期望：'2026-06-01 14:00:00'
+-- （excel side 沿用 profile 的 "d/M/yyyy H:mm" 完成解析；db side 使用列级格式序列化）
+```
+
+**预期**：Profile 加载成功；excel 解析路径使用 profile 级 `"d/M/yyyy H:mm"`；db 序列化路径使用列级声明的 `"yyyy-MM-dd HH:mm:00"`。
+
+### III-F.3 旧新跨层混用：profile 级旧形态 + 列级新形态
+
+Profile 级保留旧形态，列级使用新形态覆盖 db side：
+
+```jsonc
+// Profile 级旧形态（excelFormat/dbFormat 平铺）
+"dateFormat": { "excelFormat": "yyyy/M/d", "dbFormat": "yyyy-MM-dd" },
+
+"columns": {
+  "event_date": {
+    "source": "EventDate",
+    "dateFormat": {
+      // 列级新形态（仅覆盖 db side，整体替换）
+      "db": { "type": "string", "format": "yyyy.MM.dd" }
+      // excel side 未声明 → 整体继承 profile 旧形态正规化后的 excel side
+    }
+  }
+}
+```
+
+导入后断言：
+
+```sql
+SELECT event_date FROM event WHERE event_id=1;
+-- 期望：'2026.05.21'（db side 被列级新形态整体替换为点分格式）
+
+SELECT event_date FROM event WHERE event_id=2;
+-- 期望：'2026.06.01'（列级覆盖对每一行均生效）
+```
+
+**预期**：Profile 加载成功（跨层混用合法）；列级 `db` 整体覆盖（包含 type）；`excel` 继承 profile 旧形态（正规化为 `{type:"string", format:"yyyy/M/d"}`）。
+
+**逆向混用**（Profile 级新形态 + 列级旧形态）：同样合法，列级旧形态正规化为新形态后执行 side 整体覆盖。
+
+### III-F.4 负向：Profile 加载时 E_PROFILE_PARSE
+
+以下场景均在 Profile 加载阶段报错，不进入导入/导出流程；可通过 `dbridge-cli` 触发后检查 stderr，或在单元测试中直接断言：
+
+| 触发场景 | 触发构造 | 期望错误信息要点 |
+|---|---|---|
+| `type="string"` 无 format | `"dateFormat": {"db": {"type":"string"}}` | 含 slot 名、side 名、"format required" 语义 |
+| `type="epochSec"` 带非空 format | `"datetimeFormat": {"db": {"type":"epochSec","format":"yyyy-MM-dd HH:mm:ss"}}` | 含 "epochSec must have no format" |
+| 未知 type 值 | `"dateFormat": {"db": {"type":"unix_ms"}}` | 含 `"unix_ms"` 和 `"epochSec"` 可用值列表 |
+| 同 slot 对象内新旧形态共存 | `"dateFormat": {"excelFormat":"yyyy/M/d", "excel":{"type":"string","format":"yyyy/M/d"}}` | 含 slot 名和不可混用提示 |
+| `type="epochSec"` 用于 dateFormat.db | `"dateFormat": {"db": {"type":"epochSec"}}` | 含 "epochSec is only allowed on datetimeFormat.db" |
+| `type="epochSec"` 用于 excel side | `"datetimeFormat": {"excel": {"type":"epochSec","format":""}}` | 含 "epochSec is only allowed on db side" |
+
+> **与 §III-E 的分工**：§III-E 验证 epochSec 在 **运行时**（导入/导出）的端到端行为；§III-F 验证新形态在 **Profile 加载时**的语义正确性和等价性。两者互补。
+
+---
+
+# 场景 IV：导出列顺序控制
+
+## IV-1 验证目标
+
+| 序号 | 验收点 | 来源 |
+|---|---|---|
+| IV-V1 | `columnOrder` 声明的列依序排在 Excel 最前，未声明列以 SQL 投影顺序追加于后 | 能力 `export-column-order` §声明列优先 |
+| IV-V2 | `columnOrder` 包含所有列时，输出恰为 `columnOrder` 本身，无追加后缀 | 能力 §全量声明 |
+| IV-V3 | Mixed 模式 `classColumn` 不在 `columnOrder` → 自动前置为第一列 | 能力 §classColumn 默认前置 |
+| IV-V4 | Mixed 模式 `classColumn` 在 `columnOrder` 中 → 按声明位置放置，不再自动前置 | 能力 §classColumn 显式定位 |
+| IV-V5 | `columnOrder` 与 `orderBy` 正交：行排序与列顺序可同时独立生效 | 能力 §正交性 |
+| IV-V6 | 列顺序重排不修改、不丢失、不重复任何列的数据值 | 能力 §数据完整性 |
+| IV-V7 | 负向：未知表头 `E_EXPORT_UNKNOWN_HEADER`（大小写敏感）；重复条目 `E_EXPORT_DUPLICATE_ORDER`；与 raw SQL 并存 `E_EXPORT_ORDER_WITH_RAW_SQL` | 能力 §验证约束 |
+
+## IV-2 验证拓扑
+
+```
+Excel: OrdersColOrder.xlsx (单 Sheet "Orders")
+   │  OrderNo, TenantId, Total
+   ▼
+DataBridge.importExcel(profile=column_order.json)
+   ▼
+SQLite: scenarioIV.db  →  orders(order_no PK, tenant_id, total)
+   ▼
+DataBridge.exportExcel(columnOrder=["Total","OrderNo","TenantId"], orderBy=["order_no"])
+   ▼
+OrdersColOrder.exported.xlsx
+   └── 列顺序：Total | OrderNo | TenantId
+       行排序：order_no 升序
+```
+
+## IV-3 数据准备
+
+### IV-3.1 Schema（路径 `tests/data/sql/06_column_order.sql`）
+
+```sql
+CREATE TABLE IF NOT EXISTS orders (
+    order_no  TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    total     REAL DEFAULT 0
+);
+```
+
+初始化：
+
+```bash
+sqlite3 /tmp/scenarioIV.db < tests/data/sql/06_column_order.sql
+```
+
+### IV-3.2 Excel 输入（`tests/data/xlsx/OrdersColOrder.xlsx`）
+
+单 Sheet 名 `Orders`，**共 3 行业务数据**：
+
+| OrderNo | TenantId | Total |
+|---------|----------|-------|
+| SO-001  | TENANT-A | 100.0 |
+| SO-002  | TENANT-B | 200.0 |
+| SO-003  | TENANT-A | 50.0  |
+
+### IV-3.3 Profile（复用 `tests/data/profiles/column_order.json`）
+
+```json
+{
+  "profileName": "column_order",
+  "sheet": "Orders",
+  "mode": "singleTable",
+  "table": "orders",
+  "conflict": { "columns": ["order_no"] },
+  "columns": {
+    "order_no":  { "source": "OrderNo",  "validators": ["notNull"] },
+    "tenant_id": { "source": "TenantId", "validators": ["notNull"] },
+    "total":     { "source": "Total" }
+  },
+  "export": {
+    "orderBy": ["order_no"],
+    "columnOrder": ["Total", "OrderNo", "TenantId"]
+  }
+}
+```
+
+SQL 投影自然顺序（按 `columns` 声明顺序）：`order_no → tenant_id → total`。`columnOrder` 包含全部 3 列，期望输出顺序为 `Total → OrderNo → TenantId`（IV-V2）。
+
+## IV-4 执行步骤
+
+### IV-4.1 导入
+
+```bash
+./build/examples/cli/dbridge-cli \
+  /tmp/scenarioIV.db \
+  tests/data/profiles/column_order.json \
+  tests/data/xlsx/OrdersColOrder.xlsx \
+  import
+```
+
+期望：无错误，`Imported 3 rows`。
+
+### IV-4.2 SQL 断言
+
+```sql
+SELECT order_no, tenant_id, total FROM orders ORDER BY order_no;
+-- 期望：SO-001/TENANT-A/100.0，SO-002/TENANT-B/200.0，SO-003/TENANT-A/50.0
+```
+
+### IV-4.3 导出（IV-V1 / IV-V2 / IV-V5 / IV-V6）
+
+```bash
+./build/examples/cli/dbridge-cli \
+  /tmp/scenarioIV.db \
+  tests/data/profiles/column_order.json \
+  /tmp/OrdersColOrder.exported.xlsx \
+  export
+```
+
+```bash
+python3 tools/xlsx2csv.py /tmp/OrdersColOrder.exported.xlsx > /tmp/out_IV.csv
+head -1 /tmp/out_IV.csv   # 应为：Total,OrderNo,TenantId
+```
+
+目视核查：
+- 第 1 行（表头）：`Total, OrderNo, TenantId`（IV-V1 / IV-V2）。
+- 数据行按 `order_no` 升序：SO-001、SO-002、SO-003（IV-V5）。
+- 每行数值与导入输入完全一致，无精度损失（IV-V6）。
+
+### IV-4.4 Mixed 模式 classColumn 位置验证（IV-V3 / IV-V4）
+
+使用如下**本地构造** Profile（`mixed_colorder_test.json`，无需签入）配合场景 II 的 `scenarioII.db`：
+
+```json
+{
+  "sheet": "Mixed",
+  "mode": "mixed",
+  "discriminator": { "source": "Type" },
+  "classes": [
+    {
+      "id": "A",
+      "match": { "equals": "A" },
+      "routes": [{
+        "table": "orders",
+        "conflict": { "columns": ["order_no"] },
+        "columns": {
+          "order_no": { "source": "OrderNo" },
+          "total":    { "source": "Total" }
+        }
+      }]
+    }
+  ],
+  "export": {
+    "classColumn": "Type",
+    "columnOrder": ["OrderNo", "Total"]
+  }
+}
+```
+
+**IV-V3**（classColumn 不在 columnOrder）：期望 Excel 表头 = `Type, OrderNo, Total`（Type 自动前置）。
+
+修改 `columnOrder` 为 `["OrderNo", "Type", "Total"]` 后再导出（**IV-V4**）：期望 Excel 表头 = `OrderNo, Type, Total`（Type 按声明位置插入，不再自动前置）。
+
+### IV-4.5 负向场景（IV-V7）
+
+> **重要：`columnOrder` 错误在 `import` 阶段触发，不在 `export` 阶段。**
+> `ProfileValidator`（由 `ImportService` 调用）在导入时对 Profile 做三方对账；`ExportService` 直接使用已验证的 Profile，不再重新校验。因此，下列负向用例需用 `dbridge-cli ... import`（不是 `export`）来触发错误。
+
+| 场景 | 制造方式 | 触发命令 | 期望错误码 | 期望消息 |
+|---|---|---|---|---|
+| 未知表头 | `columnOrder: ["Total", "OrderNo", "Typo"]` | `import` | `E_EXPORT_UNKNOWN_HEADER` | 含 `"Typo"` |
+| 大小写不匹配 | `columnOrder: ["total", "OrderNo"]`（源为 `"Total"`）| `import` | `E_EXPORT_UNKNOWN_HEADER` | 含 `"total"` |
+| 重复条目 | `columnOrder: ["OrderNo", "Total", "OrderNo"]` | `import` | `E_EXPORT_DUPLICATE_ORDER` | 含 `"OrderNo"` |
+| 与 raw SQL 并存 | 同时设 `export.explicitSql: "SELECT ..."` 和 `columnOrder: ["Total"]` | `import` | `E_EXPORT_ORDER_WITH_RAW_SQL` | — |
+
+---
+
+# 场景 V：导出反向 lookup（无损往返）
+
+## V-1 验证目标
+
+| 序号 | 验收点 | 来源 |
+|---|---|---|
+| V-V1 | `exportRoundtrip: true`（默认）时，导出行中 H 列（`select[].dbColumn`）消失，A 列（`match[].Excel_header`）出现并填入反向查找值 | 能力 `export-reverse-lookup` §H 列移除 A 列恢复 |
+| V-V2 | `exportRoundtrip: false` 时 H 列原样出现，A 列不出现 | 能力 §exportRoundtrip 开关 |
+| V-V3 | `exportOnMissing: "null"` → 未命中时 A 列写空格，行继续，无错误 | 能力 §exportOnMissing |
+| V-V4 | `exportOnMissing: "skip"` → 行为同 `"null"`（A 列写空，行继续），不计入错误统计；用于已知旧数据兼容（区别仅为 error counting，不影响行输出） | 能力 §exportOnMissing |
+| V-V5 | `exportOnMissing: "error"`（默认）→ 未命中时 emit `E_REVERSE_LOOKUP_NOT_FOUND`，行跳过，其余行继续 | 能力 §exportOnMissing |
+| V-V6 | 多行命中（歧义）→ `E_REVERSE_LOOKUP_AMBIGUOUS`，不可被任何 `exportOnMissing` 值压制 | 能力 §歧义强制报错 |
+| V-V7 | 预取 SELECT 失败 → `E_REVERSE_LOOKUP_QUERY_FAILED`，整 sheet 中止 | 能力 §预取失败 |
+| V-V8 | 批量预取：N 行 K 个不同 H 值 → 恰好执行 `ceil(K / chunk_limit)` 次 SELECT，不逐行查询 | 能力 §批量预取 |
+| V-V9 | 同 identity lookup 跨 route 共享一次预取结果（identity merging）| 能力 §identity 合并 |
+| V-V10 | 导入 + 导出组合往返后，输出 Excel 中 A 列值与导入 Excel 中 A 列值一致（无损往返） | 端到端 roundtrip |
+
+## V-2 验证拓扑
+
+```
+ref_customers(c_no PK, c_name)  ←── 参考表（预先种入，不经 Excel 导入）
+   │
+   │ import: match c_no = 客户编号
+   │         select c_name → customer_name（H 列，存入 orders）
+   ▼
+Excel: ReverseLookup.xlsx (Sheet "Orders")
+   │  OrderNo, OrderDate, 客户编号
+   ▼
+DataBridge.importExcel(profile=reverse_lookup.json)
+   └── orders(order_no PK, order_date, customer_name)   ← H 列存库，A 列不存库
+   ▼
+DataBridge.exportExcel(exportRoundtrip=true)
+   └── 反向 lookup：customer_name → ref_customers → c_no → 写入"客户编号"列
+   ▼
+ReverseLookup.exported.xlsx
+   └── 列：OrderNo | OrderDate | 客户编号（A 列还原，customer_name 列不出现）
+```
+
+## V-3 数据准备
+
+### V-3.1 Schema（路径 `tests/data/sql/07_reverse_lookup.sql`）
+
+```sql
+CREATE TABLE IF NOT EXISTS ref_customers (
+    c_no   TEXT PRIMARY KEY,
+    c_name TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS orders (
+    order_no      TEXT PRIMARY KEY,
+    order_date    TEXT,
+    customer_name TEXT            -- H 列：导入时由 lookup select 填入
+);
+```
+
+初始化并种入参考数据：
+
+```bash
+sqlite3 /tmp/scenarioV.db < tests/data/sql/07_reverse_lookup.sql
+sqlite3 /tmp/scenarioV.db "
+  INSERT INTO ref_customers VALUES ('C001', 'Alice Corp');
+  INSERT INTO ref_customers VALUES ('C002', 'Bob Inc');
+"
+```
+
+### V-3.2 Excel 输入（`tests/data/xlsx/ReverseLookup.xlsx`）
+
+单 Sheet 名 `Orders`，**共 3 行业务数据**：
+
+| OrderNo | OrderDate  | 客户编号 |
+|---------|------------|---------|
+| SO-001  | 2026-05-21 | C001    |
+| SO-002  | 2026-05-22 | C002    |
+| SO-003  | 2026-05-23 | C001    |
+
+- `客户编号` 是 A 列（`match[].Excel_header`）；导入时用它匹配 `ref_customers.c_no`，拉取 `c_name` 写入 `orders.customer_name`（H 列）。
+- 导出时反向：`customer_name` → 查 `ref_customers` → 还原 `c_no` → 写回 `客户编号` 列。
+
+### V-3.3 Profile（路径 `tests/data/profiles/reverse_lookup.json`，需本地创建）
+
+```json
+{
+  "profileName": "reverse_lookup",
+  "sheet": "Orders",
+  "headerRow": 1,
+  "mode": "singleTable",
+  "table": "orders",
+  "conflict": { "columns": ["order_no"] },
+  "lookups": [
+    {
+      "name": "cust",
+      "from": "ref_customers",
+      "match":  [["c_no", "客户编号"]],
+      "select": [["c_name", "customer_name"]],
+      "exportRoundtrip": true,
+      "exportOnMissing": "error"
+    }
+  ],
+  "columns": {
+    "order_no":   { "source": "OrderNo",   "validators": ["notNull"] },
+    "order_date": { "source": "OrderDate" }
+  },
+  "export": { "orderBy": ["order_no"] }
+}
+```
+
+- `columns` 中无需声明 `customer_name`——它由 lookup 的 `select` 自动填入。
+- `exportRoundtrip: true`（默认）使导出路径执行反向查找。
+- `exportOnMissing: "error"`（默认）在未命中时报错跳行。
+
+## V-4 执行步骤
+
+### V-4.1 导入
+
+```bash
+./build/examples/cli/dbridge-cli \
+  /tmp/scenarioV.db \
+  tests/data/profiles/reverse_lookup.json \
+  tests/data/xlsx/ReverseLookup.xlsx \
+  import
+```
+
+期望：无错误，`Imported 3 rows`。
+
+### V-4.2 SQL 断言（V-V1 前置确认）
+
+```sql
+-- 确认 H 列（customer_name）已由 lookup 填入，不是 NULL
+SELECT order_no, customer_name FROM orders ORDER BY order_no;
+-- 期望：SO-001→'Alice'，SO-002→'Bob'，SO-003→'Alice'
+
+-- 确认 A 列（客户编号）没有存入 orders 表（orders 表无此列）
+PRAGMA table_info(orders);
+-- customer_name 列存在；不存在名为 '客户编号' 的列（汉字列名未落库）
+```
+
+### V-4.3 导出往返（V-V1 / V-V8 / V-V10）
+
+```bash
+./build/examples/cli/dbridge-cli \
+  /tmp/scenarioV.db \
+  tests/data/profiles/reverse_lookup.json \
+  /tmp/ReverseLookup.exported.xlsx \
+  export
+```
+
+```bash
+python3 tools/xlsx2csv.py tests/data/xlsx/ReverseLookup.xlsx     > /tmp/in_V.csv
+python3 tools/xlsx2csv.py /tmp/ReverseLookup.exported.xlsx       > /tmp/out_V.csv
+```
+
+**注意：列顺序差异属预期行为。** 输入 Excel 列顺序为 `OrderNo,OrderDate,客户编号`，而导出列顺序为 `OrderDate,OrderNo,客户编号`（DB schema 的字典序，因未声明 `columnOrder`）。因此 `sort | sha256sum` 哈希**不会相同**。V-V10 无损往返的通过准则是**值等价**，而非哈希一致：
+
+```bash
+# V-V10 值等价验证：客户编号列按 order_no 排序后应与输入一致
+cut -d, -f3 /tmp/in_V.csv  | tail -n +2 | sort   # 输入 A 列
+cut -d, -f3 /tmp/out_V.csv | tail -n +2 | sort   # 输出 A 列（应相同）
+```
+
+目视核查导出文件：
+- 表头包含 `客户编号`（A 列已恢复）。
+- 表头**不包含** `customer_name`（H 列已移除）（V-V1）。
+- `客户编号` 值为 `C001`、`C002`、`C001`，与导入输入一致。
+
+### V-4.4 `exportRoundtrip: false` 验证（V-V2）
+
+修改 Profile 中 `"exportRoundtrip": false`，重新导出：
+
+```bash
+./build/examples/cli/dbridge-cli \
+  /tmp/scenarioV.db \
+  /tmp/reverse_lookup_no_roundtrip.json \
+  /tmp/ReverseLookup.noroundtrip.xlsx \
+  export
+```
+
+期望：
+- 表头包含 `customer_name`（H 列原样出现）。
+- 表头**不包含** `客户编号`（A 列不恢复）（V-V2）。
+
+### V-4.5 负向场景（V-V3 ~ V-V7）
+
+| 场景 | 制造方式 | 期望结果 |
+|---|---|---|
+| `exportOnMissing: "error"`（默认），无命中 | 向 orders 插入 `order_no='SO-999', customer_name='Unknown Corp'`，保留 ref_customers 不变 | `E_REVERSE_LOOKUP_NOT_FOUND`（含 `"cust"` 和 `"Unknown Corp"`）；SO-999 行跳过，其余行正常输出 |
+| `exportOnMissing: "null"`，无命中 | 同上，Profile 改 `"exportOnMissing": "null"` | SO-999 行输出，`客户编号` 格为空，无错误 |
+| `exportOnMissing: "skip"`，无命中 | 同上，Profile 改 `"exportOnMissing": "skip"` | 行为同 `"null"`（A 列写空，行继续）；区别仅为该缺失不计入错误统计，用于已知旧数据兼容 |
+| 歧义多行命中（V-V6） | 向 ref_customers 插入 `('C003','Alice Corp')`（c_name 重复），导出含 SO-001/SO-003 的行 | `E_REVERSE_LOOKUP_AMBIGUOUS`（消息含 `"cust"`、命中数 `2`）；无论 `exportOnMissing` 设何值，均不可压制 |
+| 预取 SELECT 失败（V-V7） | 将 `ref_customers` 表改名后执行导出 | `E_REVERSE_LOOKUP_QUERY_FAILED`，整 sheet 导出中止，不输出任何行 |
+
+---
+
+## 通过准则（五个场景共用）
+
+只有同时满足以下条件，整套功能才视为验证通过：
 
 1. 场景 I §I-4 全部断言通过。
-2. 场景 II §II-4 全部断言通过；尤其要确认 A/B/C 行**没有**互相污染对方的表集合。
-3. 两个场景的负向用例都返回预期错误码，库内计数仍为 0。
-4. 两个场景的导出对账 CSV 哈希一致。
+2. 场景 II §II-4 全部断言通过；尤其确认 A/B/C 行**没有**互相污染对方的表集合。
+3. 场景 III §III-4 全部 SQL 断言和负向场景通过；导出时间字段呈现正确 `excelFormat` 格式。
+4. 场景 III §III-E epochSec 路径通过：`happen_at` 存储为整数、NULL vs 0 区分正确、错误格式触发 `E_TIME_PARSE_DB`。
+5. 场景 III §III-F 新形态路径通过：新形态等价旧形态、side 级整体覆盖语义正确、旧新跨层混用加载成功、六项 `E_PROFILE_PARSE` 均准确触发。
+6. 场景 IV §IV-4 全部断言通过；CSV 表头顺序与 `columnOrder` 声明完全一致；负向错误码准确触发。
+7. 场景 V §V-4 往返数据值等价（A 列 `客户编号` 排序后与输入一致；列顺序因无 `columnOrder` 而按 DB schema 字典序，`sort | sha256sum` 不相等属预期行为）；负向场景错误码准确触发；`exportRoundtrip: false` 时 H/A 列切换正确。
+8. 所有场景的负向用例均返回预期错误码，不出现引擎崩溃或静默数据污染。
 
 ---
 
@@ -625,14 +1360,24 @@ sort /tmp/out.csv | sha256sum
 |---|---|---|
 | `tests/data/sql/02_orders.sql` | ✅ | 场景 I schema |
 | `tests/data/profiles/order_m_set.json` | ✅ | 场景 I Profile |
-| `tests/data/xlsx/Orders.xlsx` | ❌ 本地构造 | 场景 I 输入 Excel（按 §I-3.2 构造，xlsx 二进制不签入仓库） |
+| `tests/data/xlsx/Orders.xlsx` | ✅ | 场景 I 输入 Excel |
 | `tests/data/sql/04_mixed_multitable.sql` | ✅ | 场景 II schema |
 | `tests/data/profiles/mixed_abc_multitable.json` | ✅ | 场景 II Profile |
-| `tests/data/xlsx/Mixed.xlsx` | ❌ 本地构造 | 场景 II 输入 Excel（按 §II-3.2 构造，xlsx 二进制不签入仓库） |
+| `tests/data/xlsx/Mixed.xlsx` | ✅ | 场景 II 输入 Excel |
+| `tests/data/sql/05_time_formats.sql` | ✅ | 场景 III schema（`event` 表） |
+| `tests/data/profiles/time_formats.json` | ✅ | 场景 III Profile |
+| `tests/data/xlsx/Events.xlsx` | ✅ | 场景 III 输入 Excel |
+| `tests/data/sql/06_column_order.sql` | ✅ | 场景 IV schema（`orders` 简化版，只含 order_no / tenant_id / total） |
+| `tests/data/profiles/column_order.json` | ✅ | 场景 IV Profile |
+| `tests/data/xlsx/OrdersColOrder.xlsx` | ✅ | 场景 IV 输入 Excel |
+| `tests/data/sql/07_reverse_lookup.sql` | ✅ | 场景 V schema（`ref_customers` + `orders`） |
+| `tests/data/profiles/reverse_lookup.json` | ✅ | 场景 V Profile |
+| `tests/data/xlsx/ReverseLookup.xlsx` | ✅ | 场景 V 输入 Excel |
 | `tools/xlsx2csv.py` | ✅ | 对账辅助脚本（纯 Python 标准库实现，无外部依赖） |
+| `tools/build_fixtures.py` | ✅ | 生成全部 xlsx 夹具的脚本（纯 Python stdlib；重新生成：`python3 tools/build_fixtures.py`） |
 | `tests/unit/tst_fk_preflight.cpp` | ✅ | FK 预校验回归测试（7 用例，含 `testMixedParentInBatch` / `testParentMissing` / `testLookupDerivedGroupSkipsProbe`） |
 
-`Orders.xlsx` 与 `Mixed.xlsx` 是二进制文件，按惯例不直接签入仓库——由验证执行者依照 §I-3.2 / §II-3.2 的表格内容用 Excel / LibreOffice / `openpyxl` 构造即可。后续若要把这两份 xlsx 也沉淀为可重复夹具，建议增加 `tools/build_fixtures.py` 从 JSON 描述用 QXlsx/openpyxl 重新生成。
+所有夹具（schema SQL、Profile JSON、xlsx 二进制）均已签入仓库。若需重新生成 xlsx，运行 `python3 tools/build_fixtures.py` 即可。
 
 ---
 

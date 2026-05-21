@@ -1,0 +1,23 @@
+{
+    "profileName": "reverse_lookup",
+    "sheet": "Orders",
+    "headerRow": 1,
+    "mode": "singleTable",
+    "table": "orders",
+    "conflict": { "columns": ["order_no"] },
+    "lookups": [
+        {
+            "name": "cust",
+            "from": "ref_customers",
+            "match":  [["c_no", "客户编号"]],
+            "select": [["c_name", "customer_name"]],
+            "exportRoundtrip": true,
+            "exportOnMissing": "error"
+        }
+    ],
+    "columns": {
+        "order_no":   { "source": "OrderNo",   "validators": ["notNull"] },
+        "order_date": { "source": "OrderDate" }
+    },
+    "export": { "orderBy": ["order_no"] }
+}

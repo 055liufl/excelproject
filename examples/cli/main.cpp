@@ -66,6 +66,12 @@ int main(int argc, char* argv[]) {
         auto result = bridge.importExcel(xlsxPath, opts);
         if (result.ok) {
             std::cout << "Imported " << result.writtenRows << " rows\n";
+            if (!result.errors.empty()) {
+                std::cerr << "  (with " << result.errors.size() << " row-level errors)\n";
+                for (const auto& e : result.errors)
+                    std::cerr << "  [" << e.code.toStdString() << "] row " << e.row << " "
+                              << e.column.toStdString() << ": " << e.message.toStdString() << '\n';
+            }
         } else {
             std::cerr << "Import failed with " << result.errors.size() << " errors:\n";
             for (const auto& e : result.errors) {
@@ -80,6 +86,12 @@ int main(int argc, char* argv[]) {
         auto result = bridge.exportExcel(xlsxPath, opts);
         if (result.ok) {
             std::cout << "Exported " << result.writtenRows << " rows\n";
+            if (!result.errors.empty()) {
+                std::cerr << "  (with " << result.errors.size() << " row-level errors)\n";
+                for (const auto& e : result.errors)
+                    std::cerr << "  [" << e.code.toStdString() << "] row " << e.row << " "
+                              << e.column.toStdString() << ": " << e.message.toStdString() << '\n';
+            }
         } else {
             std::cerr << "Export failed with " << result.errors.size() << " errors:\n";
             for (const auto& e : result.errors) {

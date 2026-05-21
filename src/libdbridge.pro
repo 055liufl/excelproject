@@ -96,11 +96,13 @@ HEADERS += \
     mapping/RowPayload.h \
     mapping/Router.h \
     mapping/Mapper.h \
+    mapping/TemporalConvert.h \
     mapping/TopoSorter.h \
     mapping/FkInjector.h \
     mapping/BatchUniqueness.h \
     sql/SqlBuilder.h \
     service/ErrorCollector.h \
+    service/ExportHelpers.h \
     service/ImportService.h \
     service/ExportService.h
 
@@ -118,6 +120,7 @@ SOURCES += \
     validation/ForeignKeyPreflight.cpp \
     mapping/Router.cpp \
     mapping/Mapper.cpp \
+    mapping/TemporalConvert.cpp \
     mapping/TopoSorter.cpp \
     mapping/FkInjector.cpp \
     mapping/BatchUniqueness.cpp \

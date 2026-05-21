@@ -14,7 +14,8 @@ class ProfileLoader {
     bool readSingleTable(const QJsonObject& o, ProfileSpec* out, QString* err);
     bool readMultiTable(const QJsonObject& o, ProfileSpec* out, QString* err);
     bool readMixed(const QJsonObject& o, ProfileSpec* out, QString* err);
-    bool readRoute(const QJsonObject& o, RouteSpec* out, QString* err);
+    bool readRoute(const QJsonObject& o, RouteSpec* out, QString* err,
+                   QStringList* warnings = nullptr);
     bool readColumn(const QString& dbCol, const QJsonObject& o, ColumnSpec* out, QString* err);
     bool validateToken(const QString& token, QString* err);
 };

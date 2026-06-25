@@ -1,4 +1,5 @@
 #pragma once
+#include "dbridge/DataBridge.h"
 #include "dbridge/sync/SyncConfig.h"
 #include "dbridge/sync/SyncTypes.h"
 
@@ -23,6 +24,7 @@
 #include "transport/InboxWatcher.h"
 #include "transport/OutboxWriter.h"
 #include <functional>
+#include <future>
 #include <memory>
 #include <sqlite3.h>
 
@@ -57,6 +59,16 @@ class SyncWorker : public QThread {
     // Non-empty when waitForInit() returns false or the worker emitted errorOccurred
     // during init.
     QString initError() const;
+
+    // I-04: Submit import to run on the worker thread using wconn + session capture.
+    // Blocks until the import completes (safe: caller thread waits, worker executes).
+    // Falls back to bridge.runImportOnDb directly if worker is not ready.
+    ImportResult submitImportSync(DataBridge& bridge, const ImportOptions& opts,
+                                  const QString& xlsxPath);
+
+    // I-19: Notify worker that a foreground sync() is waiting for ACK.
+    // The worker will emit E_SYNC_ACK_TIMEOUT if no ACK arrives within ackMaxDelayMs.
+    void startAckWait();
 
    signals:
     void progressUpdated(dbridge::sync::SyncProgress p);
@@ -119,10 +131,15 @@ class SyncWorker : public QThread {
     std::unique_ptr<RebaseEngine> rebaser_;
     std::unique_ptr<QuarantineStore> quarantine_;
 
-    // Inbox scan state: list of pending artifact paths
-    QStringList pendingArtifacts_;
     qint64 streamEpoch_ = 0;
     qint64 localOriginSeq_ = 0;  // next seq for local node
+
+    // I-16: Rebase buffers keyed by "origin/originSeq"; populated after each apply_v2.
+    QHash<QString, QByteArray> rebaseBuffers_;
+
+    // I-19: ACK timeout tracking (foreground sync() waits for ACK).
+    bool ackWaiting_ = false;
+    qint64 ackDeadlineMs_ = 0;
 };
 
 }  // namespace dbridge::sync

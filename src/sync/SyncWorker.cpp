@@ -19,6 +19,7 @@
 #include "sync/conflict/RebaseEngine.h"
 #include "sync/conflict/RoutingTable.h"
 #include "sync/schema/SchemaEligibility.h"
+#include <future>
 
 namespace dbridge::sync {
 
@@ -242,6 +243,16 @@ void SyncWorker::run() {
             broadcast();
             lastBroadcastMs = nowMs;
         }
+
+        // I-19: ACK timeout — emit E_SYNC_ACK_TIMEOUT if foreground sync() is waiting
+        // and no ACK has arrived within ackMaxDelayMs.
+        if (ackWaiting_ && nowMs >= ackDeadlineMs_) {
+            ackWaiting_ = false;
+            emit errorOccurred({QLatin1String(err::E_SYNC_ACK_TIMEOUT), Severity::Error,
+                                QStringLiteral("sync"), config_.nodeId(),
+                                QStringLiteral("ACK not received within ackMaxDelayMs=") +
+                                    QString::number(config_.ackMaxDelayMs())});
+        }
     }
 
     // I-10: watcher_->stop() removed — no QTimer/QFileSystemWatcher to tear down.
@@ -372,6 +383,18 @@ bool SyncWorker::processChangesetArtifact(const DecodeResult& dec, const QString
         return false;
     }
 
+    // I-16: Store rebase buffer keyed by "origin/seq" for use in broadcastToPeer.
+    if (!res.applyOutcome.rebaseBuffer.isEmpty()) {
+        QString key = hdr.origin + QLatin1Char('/') + QString::number(hdr.originSeq);
+        rebaseBuffers_.insert(key, res.applyOutcome.rebaseBuffer);
+        if (rebaseBuffers_.size() > 500) {
+            rebaseBuffers_.erase(rebaseBuffers_.begin());
+        }
+    }
+
+    // I-19: A successful apply counts as an ACK signal for the foreground sync() wait.
+    ackWaiting_ = false;
+
     // Update local origin seq if this is our own changeset echoed back
     if (hdr.origin == config_.nodeId() && hdr.originSeq > localOriginSeq_)
         localOriginSeq_ = hdr.originSeq;
@@ -472,6 +495,22 @@ void SyncWorker::broadcastTopeer(const QString& peer) {
         if (!routing_->shouldRoute(peer, entry.origin, entry.originSeq, peerAckedSeq))
             continue;
 
+        // I-16: Rebase the changeset onto any stored rebase buffer before broadcast.
+        QByteArray changesetToSend = entry.changeset;
+        QString rebaseKey = entry.origin + QLatin1Char('/') + QString::number(entry.originSeq);
+        if (rebaseBuffers_.contains(rebaseKey) && rebaser_) {
+            QByteArray rebased;
+            QString rebaseErr;
+            if (rebaser_->rebase(rebaseBuffers_.value(rebaseKey), entry.changeset, &rebased,
+                                 &rebaseErr)) {
+                changesetToSend = rebased;
+            } else {
+                emit errorOccurred({err::E_SYNC_REBASE_FAILED, Severity::Warning,
+                                    QStringLiteral("broadcast"), peer, rebaseErr});
+                continue;  // skip this entry — don't send un-rebased
+            }
+        }
+
         // Encode and write to outbox
         PayloadHeader hdr;
         hdr.origin = entry.origin;
@@ -480,7 +519,7 @@ void SyncWorker::broadcastTopeer(const QString& peer) {
         hdr.schemaVer = config_.schemaVersion();
         hdr.routeTag = peer;
 
-        QByteArray payload = codec_->encodeChangeset(hdr, entry.changeset);
+        QByteArray payload = codec_->encodeChangeset(hdr, changesetToSend);
         QString artifactName = peer + QStringLiteral("_") + QString::number(entry.localSeq) +
                                QStringLiteral(".payload");
         QString writeErr;
@@ -498,6 +537,83 @@ void SyncWorker::broadcastTopeer(const QString& peer) {
 qint64 SyncWorker::computePeerAckedSeq(const QString& peer) {
     // I-15 fix: query the acked seq for this specific peer, not the global min.
     return ackStore_->ackedSeq(*wconnPtr_, peer, config_.nodeId(), streamEpoch_);
+}
+
+// I-04: Submit import to run on the worker thread using wconn + session capture.
+ImportResult SyncWorker::submitImportSync(DataBridge& bridge, const ImportOptions& opts,
+                                          const QString& xlsxPath) {
+    if (!isRunning() || !wconnPtr_) {
+        // Worker not ready — fall back to direct bridge call (same as before, no session capture)
+        qWarning() << "[SyncWorker] submitImportSync: worker not ready, using direct db_";
+        return bridge.runImportOnDb(xlsxPath, opts, *wconnPtr_);
+    }
+
+    // Blocking import on worker thread using wconn with session capture via CapturedWriteTemplate.
+    // Uses std::promise/future: safe because this thread blocks until the task completes.
+    std::promise<ImportResult> promise;
+    std::future<ImportResult> future = promise.get_future();
+
+    enqueue([this, &bridge, opts, xlsxPath, &promise]() mutable {
+        if (!wconnPtr_ || !hPtr_) {
+            ImportResult r;
+            RowError e;
+            e.code = QLatin1String(err::E_SYNC_INIT);
+            e.message = QStringLiteral("wconn not available in worker");
+            r.errors.append(e);
+            promise.set_value(r);
+            return;
+        }
+
+        // Run ImportService on wconn, wrapped in WriteTxn + SessionRecorder (branch C semantics).
+        WriteTxn txn(*wconnPtr_);
+        QString txnErr;
+        if (!txn.begin(&txnErr)) {
+            ImportResult r;
+            RowError e;
+            e.code = QLatin1String(err::E_SYNC_INIT);
+            e.message = txnErr;
+            r.errors.append(e);
+            promise.set_value(r);
+            return;
+        }
+
+        QString sessionErr;
+        rec_->begin(hPtr_, config_.syncTables(), &sessionErr);
+
+        // Run import on wconn (uses stored profiles/catalog from DataBridge, writes to wconn)
+        ImportResult result = bridge.runImportOnDb(xlsxPath, opts, *wconnPtr_);
+
+        if (result.ok) {
+            // Seal session into changelog (captures the import as a local write)
+            qint64 localSeq = 0;
+            QString sealErr;
+            QString fp = guard_ ? guard_->fingerprint() : QString();
+            rec_->sealInto(hPtr_, *clog_, *wconnPtr_, txn, config_.nodeId(), streamEpoch_,
+                           config_.schemaVersion(), fp, 0, 0, &localSeq, &sealErr);
+            txn.commit(nullptr);
+        } else {
+            rec_->abort();
+            txn.rollback();
+        }
+        promise.set_value(result);
+    });
+
+    // Block until worker executes the task (with timeout)
+    if (future.wait_for(std::chrono::seconds(60)) == std::future_status::timeout) {
+        ImportResult r;
+        RowError e;
+        e.code = QLatin1String(err::E_SYNC_INIT);
+        e.message = QStringLiteral("submitImportSync timed out after 60s");
+        r.errors.append(e);
+        return r;
+    }
+    return future.get();
+}
+
+// I-19: Signal worker that a foreground sync() is waiting for ACK.
+void SyncWorker::startAckWait() {
+    ackWaiting_ = true;
+    ackDeadlineMs_ = QDateTime::currentMSecsSinceEpoch() + config_.ackMaxDelayMs();
 }
 
 }  // namespace dbridge::sync

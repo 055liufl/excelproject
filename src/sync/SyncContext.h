@@ -1,10 +1,13 @@
 #pragma once
+#include "dbridge/Types.h"
 #include "dbridge/sync/SyncConfig.h"
 
 #include <QMutex>
+#include <QSqlDatabase>
 #include <QString>
 
 #include "ForegroundGate.h"
+#include <functional>
 #include <memory>
 #include <optional>
 
@@ -20,6 +23,11 @@ struct SyncContext {
 
     // Reference count; context is destroyed when refCount reaches 0.
     int refCount = 0;
+
+    // I-04: Set by SyncEngine after worker init. BatchTransfer calls this to route
+    // imports through SyncWorker (wconn + session capture). Null when sync not active.
+    // Signature: (xlsxPath, options) -> ImportResult (blocking, runs on worker thread)
+    std::function<ImportResult(const QString&, const ImportOptions&)> importFn;
 };
 
 // Process-wide singleton registry of SyncContext objects.

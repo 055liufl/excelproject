@@ -205,6 +205,39 @@ ImportResult DataBridge::importExcel(const QString& xlsxPath, const ImportOption
     return d_->importSvc_.run(it.value(), d_->catalog_, xlsxPath, options, d_->db_);
 }
 
+QString DataBridge::dbPath() const {
+    return d_->dbOpen_ ? d_->db_.databaseName() : QString();
+}
+
+ImportResult DataBridge::runImportOnDb(const QString& xlsxPath, const ImportOptions& options,
+                                       QSqlDatabase& db) {
+    ImportResult result;
+    if (!d_->dbOpen_) {
+        RowError e;
+        e.code = QString::fromLatin1(err::E_OPEN_DB);
+        e.message = QStringLiteral("Database not open");
+        result.errors.append(e);
+        return result;
+    }
+    auto it = d_->profiles_.find(options.profileName);
+    if (it == d_->profiles_.end()) {
+        RowError e;
+        e.code = QString::fromLatin1(err::E_PROFILE_PARSE);
+        e.message = QStringLiteral("Profile not loaded: ") + options.profileName;
+        result.errors.append(e);
+        return result;
+    }
+    QString schErr;
+    if (!d_->refreshCatalog(&schErr)) {
+        RowError e;
+        e.code = QString::fromLatin1(err::E_OPEN_DB);
+        e.message = QStringLiteral("Schema refresh failed: ") + schErr;
+        result.errors.append(e);
+        return result;
+    }
+    return d_->importSvc_.run(it.value(), d_->catalog_, xlsxPath, options, db);
+}
+
 ExportResult DataBridge::exportExcel(const QString& xlsxPath, const ExportOptions& options) {
     ExportResult result;
     if (!d_->dbOpen_) {

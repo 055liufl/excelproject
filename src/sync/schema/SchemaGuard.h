@@ -20,6 +20,11 @@ class SchemaGuard {
     // types, and PK list → SHA-256 hex string.
     static QString computeFingerprint(QSqlDatabase& db, const QStringList& tables);
 
+    // Current local fingerprint (set via setLocal)
+    QString fingerprint() const {
+        return localFp_;
+    }
+
    private:
     qint64 localVer_ = 0;
     QString localFp_;

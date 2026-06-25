@@ -86,6 +86,11 @@ bool SyncEngine::initialize(const SyncConfig& config, QString* err) {
         return false;
     }
 
+    // I-04: Wire importFn so BatchTransfer can route imports through SyncWorker.
+    ctx_->importFn = [this](const QString& xlsxPath, const ImportOptions& opts) -> ImportResult {
+        return worker_->submitImportSync(bridge_, opts, xlsxPath);
+    };
+
     initialized_ = true;
     appendLog(Severity::Info, QStringLiteral("init"),
               QStringLiteral("SyncEngine initialized for node ") + configPtr_->nodeId());
@@ -105,14 +110,12 @@ bool SyncEngine::sync(QString* err) {
     setProgress(SyncState::Importing);
 
     // Enqueue a full scan+broadcast task on the worker.
-    // I-14 fix: gate is released inside the worker task (not here in sync()),
-    // so the caller sees state transition happen after the worker has processed the request.
-    // I-19 note: ACK timeout (E_SYNC_ACK_TIMEOUT) would be emitted here once the
-    // M1c ACK state machine is implemented; for now it remains a placeholder.
+    // I-14 fix: gate is released inside the worker task.
+    // I-19: Start ACK deadline timer so worker emits E_SYNC_ACK_TIMEOUT if no ACK arrives.
+    worker_->startAckWait();
     worker_->enqueue([this]() {
-        // The worker loop already calls scanInbox + broadcast on each iteration;
-        // this task signals that a foreground sync request was received.
-        // Full scan+ACK-wait state machine is deferred to M1c.
+        // The worker loop calls scanInbox + broadcast each iteration;
+        // this task also explicitly triggers a broadcast cycle right now.
         ctx_->gate.release();
         setProgress(SyncState::Completed, 100);
         QMutexLocker lk(&snapMutex_);

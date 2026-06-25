@@ -2,6 +2,8 @@
 #include "dbridge/Export.h"
 #include "dbridge/Types.h"
 
+#include <QSqlDatabase>
+
 #include <memory>
 
 namespace dbridge {
@@ -29,6 +31,14 @@ class DBRIDGE_EXPORT DataBridge {
 
     ImportResult importExcel(const QString& xlsxPath, const ImportOptions& options);
     ExportResult exportExcel(const QString& xlsxPath, const ExportOptions& options);
+
+    // Returns the SQLite file path (empty if not open). Used by sync layer to route imports.
+    QString dbPath() const;
+
+    // Run import using stored profiles/catalog but writing to the provided db connection.
+    // Called by SyncWorker to run ImportService on wconn with session capture (I-04).
+    ImportResult runImportOnDb(const QString& xlsxPath, const ImportOptions& options,
+                               QSqlDatabase& db);
 
    private:
     std::unique_ptr<detail::DataBridgePrivate> d_;

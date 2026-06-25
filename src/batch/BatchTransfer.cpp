@@ -3,6 +3,8 @@
 #include <QDebug>
 #include <QtConcurrent/QtConcurrent>
 
+#include "sync/SyncContext.h"
+
 namespace dbridge {
 
 // ---------------------------------------------------------------------------
@@ -81,14 +83,43 @@ bool BatchTransfer::startExport(const ExportOptions& options, QString* err) {
 // ---------------------------------------------------------------------------
 
 void BatchTransfer::runImport(const ImportOptions& opts) {
-    // WARNING (I-04): This implementation calls DataBridge::importExcel() directly and
-    // bypasses SyncWorker and session capture.  When sync is active, writes to tracked
-    // tables will NOT be captured in the sync changelog.  Full routing through the
-    // SyncWorker write queue is planned for M3.  Until then, callers that need sync
-    // consistency must quiesce the sync engine before running batch imports.
-    qWarning() << "[BatchTransfer] runImport: current implementation uses DataBridge directly; "
-                  "sync-active writes to sync tables will not be captured by SyncWorker session. "
-                  "Complete routing via SyncWorker write queue is deferred to M3.";
+    // I-04: Route import through SyncWorker if sync is active for this database.
+    // Check SyncContextRegistry for an active context; if importFn is set, the engine
+    // has wired up a worker-thread import path with session capture.
+    {
+        const QString dbPath = bridge_.dbPath();
+        if (!dbPath.isEmpty()) {
+            QString ctxKey;
+            auto ctx = sync::SyncContextRegistry::instance().getOrCreate(dbPath, &ctxKey, nullptr);
+            if (ctx && ctx->importFn) {
+                // Sync is active: run import on SyncWorker thread with session capture.
+                // xlsxPath is carried in opts.profileName (design limitation; M3 adds dedicated
+                // field).
+                const QString xlsxPath = opts.profileName;
+                ImportResult result = ctx->importFn(xlsxPath, opts);
+                sync::SyncContextRegistry::instance().release(ctxKey);
+                // Commit result and finish
+                if (importStopRequested_.load()) {
+                    QMutexLocker lock(&mutex_);
+                    importResult_ = result;
+                    importErrors_ = result.errors;
+                    importProgress_ = TransferProgress{0, 0, -1};
+                    importState_ = TransferState::Stopped;
+                } else {
+                    QMutexLocker lock(&mutex_);
+                    importResult_ = result;
+                    importErrors_ = result.errors;
+                    importProgress_ = TransferProgress{result.ok ? 100 : 0,
+                                                       static_cast<qint64>(result.writtenRows), -1};
+                    importState_ = result.ok ? TransferState::Completed : TransferState::Failed;
+                }
+                return;
+            }
+            if (ctx)
+                sync::SyncContextRegistry::instance().release(ctxKey);
+        }
+    }
+    // Sync not active: fall back to direct DataBridge call (no session capture).
 
     // Report 0 % at the start.
     {

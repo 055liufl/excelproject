@@ -48,4 +48,38 @@ inline constexpr const char* E_REVERSE_LOOKUP_NOT_FOUND = "E_REVERSE_LOOKUP_NOT_
 inline constexpr const char* E_REVERSE_LOOKUP_AMBIGUOUS = "E_REVERSE_LOOKUP_AMBIGUOUS";
 inline constexpr const char* E_REVERSE_LOOKUP_QUERY_FAILED = "E_REVERSE_LOOKUP_QUERY_FAILED";
 
+// ── Sync engine error / fatal codes (v0.5) ───────────────────────────────────
+inline constexpr const char* E_SYNC_INIT = "E_SYNC_INIT";
+inline constexpr const char* E_SYNC_SESSION_UNAVAILABLE = "E_SYNC_SESSION_UNAVAILABLE";
+inline constexpr const char* E_SYNC_SCHEMA_MISMATCH = "E_SYNC_SCHEMA_MISMATCH";
+inline constexpr const char* E_SYNC_PAYLOAD_CORRUPT = "E_SYNC_PAYLOAD_CORRUPT";
+inline constexpr const char* E_SYNC_TRANSPORT = "E_SYNC_TRANSPORT";
+inline constexpr const char* E_SYNC_APPLY_FK = "E_SYNC_APPLY_FK";
+inline constexpr const char* E_SYNC_APPLY_CONSTRAINT = "E_SYNC_APPLY_CONSTRAINT";
+inline constexpr const char* E_SYNC_NODE_UNKNOWN = "E_SYNC_NODE_UNKNOWN";
+inline constexpr const char* E_SYNC_GAP = "E_SYNC_GAP";
+inline constexpr const char* E_SYNC_STAGE_STALE = "E_SYNC_STAGE_STALE";
+inline constexpr const char* E_SYNC_STAGE_CONFLICT = "E_SYNC_STAGE_CONFLICT";
+inline constexpr const char* E_SYNC_PEER_DEAD = "E_SYNC_PEER_DEAD";
+inline constexpr const char* E_SYNC_SELECTION_EMPTY = "E_SYNC_SELECTION_EMPTY";
+inline constexpr const char* E_SYNC_FK_CLOSURE_MISSING = "E_SYNC_FK_CLOSURE_MISSING";
+inline constexpr const char* E_SYNC_FK_CYCLE_UNSUPPORTED = "E_SYNC_FK_CYCLE_UNSUPPORTED";
+inline constexpr const char* E_SYNC_SELECTION_TOO_LARGE = "E_SYNC_SELECTION_TOO_LARGE";
+inline constexpr const char* E_SYNC_PUSH_SCHEMA_MOVED = "E_SYNC_PUSH_SCHEMA_MOVED";
+inline constexpr const char* E_BUSY = "E_BUSY";
+inline constexpr const char* E_SYNC_WRITE_BLOCKED = "E_SYNC_WRITE_BLOCKED";
+inline constexpr const char* E_SYNC_UNSUPPORTED_SCHEMA = "E_SYNC_UNSUPPORTED_SCHEMA";
+inline constexpr const char* E_SYNC_ACK_TIMEOUT = "E_SYNC_ACK_TIMEOUT";
+inline constexpr const char* E_SYNC_REBASE_FAILED = "E_SYNC_REBASE_FAILED";
+inline constexpr const char* E_SYNC_BASELINE_FAILED = "E_SYNC_BASELINE_FAILED";
+
+// ── Sync engine warning codes ────────────────────────────────────────────────
+inline constexpr const char* W_SYNC_CONFLICT_REPLACED = "W_SYNC_CONFLICT_REPLACED";
+inline constexpr const char* W_SYNC_BASELINE_LARGE = "W_SYNC_BASELINE_LARGE";
+inline constexpr const char* W_SYNC_PAYLOAD_LARGE = "W_SYNC_PAYLOAD_LARGE";
+inline constexpr const char* W_SYNC_UNTRACKED_CHANGE = "W_SYNC_UNTRACKED_CHANGE";
+inline constexpr const char* W_SYNC_PEER_LAGGING = "W_SYNC_PEER_LAGGING";
+inline constexpr const char* W_SYNC_PUSH_ROW_DRIFTED = "W_SYNC_PUSH_ROW_DRIFTED";
+inline constexpr const char* W_SYNC_CONCURRENT_MANUAL_PUSH = "W_SYNC_CONCURRENT_MANUAL_PUSH";
+
 }  // namespace dbridge::err

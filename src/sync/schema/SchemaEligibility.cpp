@@ -129,31 +129,33 @@ SchemaEligibility::TableInfo SchemaEligibility::introspect(QSqlDatabase& db, con
         struct ColInfo {
             int pkSeq;
             bool notNull;
+            QString type;
         };
-        QMap<int, ColInfo> pkMap;  // pk_seq -> {pkSeq, notNull}
+        QMap<int, ColInfo> pkMap;  // pk_seq -> ColInfo
         while (q.next()) {
             int pkSeq = q.value(5).toInt();  // pk column: >0 means part of PK
             bool nn = q.value(3).toBool();   // notnull
             QString colName = q.value(1).toString();
+            QString colType = q.value(2).toString();
             if (pkSeq > 0) {
-                pkMap.insert(pkSeq, {pkSeq, nn});
+                pkMap.insert(pkSeq, {pkSeq, nn, colType});
                 info.pkCols.append(colName);
             }
         }
-        // Check all PK cols are NOT NULL (SQLite rowid tables: INTEGER PK is implicitly NOT NULL)
+
+        // I-17 fix: check NOT NULL for each PK column correctly.
+        // Only INTEGER PRIMARY KEY (single-column, type == "INTEGER") is a rowid alias
+        // and is implicitly NOT NULL even when PRAGMA notnull reports 0.
+        // All other PK columns must have notnull=1 to be eligible.
         info.pkNotNull = true;
         for (auto it = pkMap.begin(); it != pkMap.end(); ++it) {
-            if (!it.value().notNull) {
+            const ColInfo& ci = it.value();
+            bool isIntegerRowid = (pkMap.size() == 1 &&
+                                   ci.type.toUpper() == QLatin1String("INTEGER") && ci.pkSeq == 1);
+            if (!isIntegerRowid && !ci.notNull) {
                 info.pkNotNull = false;
                 break;
             }
-        }
-        // A single INTEGER PK (rowid alias) is always NOT NULL
-        if (info.pkCols.size() == 1 && !info.pkNotNull) {
-            // Re-check: INTEGER PRIMARY KEY is always not-null in SQLite
-            // We rely on the notnull flag from PRAGMA; but rowid aliases may show notnull=0
-            // Accept it as implicitly not-null if it's the sole PK column
-            info.pkNotNull = true;
         }
     }
 

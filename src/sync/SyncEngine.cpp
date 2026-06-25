@@ -5,12 +5,6 @@
 #include <QDateTime>
 #include <QDebug>
 #include <QObject>
-#include <QSqlError>
-#include <QSqlQuery>
-
-#include "sync/SyncDDL.h"
-#include "sync/capture/SqliteHandle.h"
-#include "sync/schema/SchemaEligibility.h"
 
 namespace dbridge::sync {
 
@@ -44,70 +38,53 @@ bool SyncEngine::initialize(const SyncConfig& config, QString* err) {
     configPtr_ = std::make_unique<SyncConfig>(config);
     setProgress(SyncState::Idle);
 
-    // Acquire (or create) the shared SyncContext for this database file
+    // Acquire (or create) the shared SyncContext for this database file.
+    // canonicalKey_ receives the dev+inode key used for release() (I-12 fix).
     QString ctxErr;
-    ctx_ = SyncContextRegistry::instance().getOrCreate(configPtr_->sqlitePath(), &ctxErr);
+    ctx_ = SyncContextRegistry::instance().getOrCreate(configPtr_->sqlitePath(), &canonicalKey_,
+                                                       &ctxErr);
     if (!ctx_) {
         if (err)
             *err = ctxErr;
         appendError({err::E_SYNC_INIT, Severity::Fatal, "init", configPtr_->nodeId(), ctxErr});
         return false;
     }
-
-    // Derive canonical key for later release
-    // The registry stores by dev+inode; we'll just use the path as key here
-    canonicalKey_ = configPtr_->sqlitePath();
     ctx_->config = *configPtr_;
 
-    QSqlDatabase& wconn = ctx_->wconn;
-
-    // Verify SQLite session extension is available
-    sqlite3* h = SqliteHandle::of(wconn);
-    if (!h) {
-        if (err)
-            *err = QStringLiteral("Cannot obtain sqlite3* handle");
-        return false;
-    }
-    if (!SqliteHandle::sessionAvailable(h)) {
-        if (err)
-            *err = QStringLiteral("SQLite session extension not available");
-        return false;
-    }
-
-    // Create sync DDL tables
-    QString ddlErr;
-    for (const QString& stmt : ddl::allCreateStatements()) {
-        QSqlQuery q(wconn);
-        if (!q.exec(stmt)) {
-            ddlErr = q.lastError().text() + QStringLiteral(" | SQL: ") + stmt.left(80);
-            if (err)
-                *err = ddlErr;
-            appendError({err::E_SYNC_INIT, Severity::Fatal, "ddl", configPtr_->nodeId(), ddlErr});
-            return false;
-        }
-    }
-
-    // Schema eligibility check
-    QStringList rejected;
-    QString eligErr;
-    if (!SchemaEligibility::verify(wconn, configPtr_->syncTables(), &rejected, &eligErr)) {
-        QString msg = eligErr;
-        if (!rejected.isEmpty())
-            msg += QStringLiteral("; rejected: ") + rejected.join(QLatin1Char(','));
-        if (err)
-            *err = msg;
-        appendError(
-            {err::E_SYNC_UNSUPPORTED_SCHEMA, Severity::Fatal, "schema", configPtr_->nodeId(), msg});
-        return false;
-    }
-
-    // Start the SyncWorker thread
-    worker_ = std::make_unique<SyncWorker>(wconn, h, *configPtr_);
+    // Start SyncWorker — it creates its own write connection in run() (I-01 / I-02 fix).
+    worker_ = std::make_unique<SyncWorker>(*configPtr_);
     QObject::connect(worker_.get(), &SyncWorker::progressUpdated,
                      [this](SyncProgress p) { onWorkerProgress(p); });
     QObject::connect(worker_.get(), &SyncWorker::errorOccurred,
                      [this](SyncError e) { onWorkerError(e); });
     worker_->start();
+
+    // Block until worker finishes initialisation (or times out / fails).
+    if (!worker_->waitForInit(10000)) {
+        QString workerErr = worker_->initError();
+        if (err)
+            *err = workerErr.isEmpty() ? QStringLiteral("Worker init timeout") : workerErr;
+        appendError({err::E_SYNC_INIT, Severity::Fatal, "init", configPtr_->nodeId(),
+                     err ? *err : QString()});
+        worker_->requestStop();
+        worker_->wait(3000);
+        worker_.reset();
+        SyncContextRegistry::instance().release(canonicalKey_);
+        ctx_.reset();
+        return false;
+    }
+    if (!worker_->initError().isEmpty()) {
+        if (err)
+            *err = worker_->initError();
+        appendError({err::E_SYNC_INIT, Severity::Fatal, "init", configPtr_->nodeId(),
+                     worker_->initError()});
+        worker_->requestStop();
+        worker_->wait(3000);
+        worker_.reset();
+        SyncContextRegistry::instance().release(canonicalKey_);
+        ctx_.reset();
+        return false;
+    }
 
     initialized_ = true;
     appendLog(Severity::Info, QStringLiteral("init"),
@@ -127,21 +104,22 @@ bool SyncEngine::sync(QString* err) {
 
     setProgress(SyncState::Importing);
 
-    // Enqueue a full scan+broadcast task on the worker
+    // Enqueue a full scan+broadcast task on the worker.
+    // I-14 fix: gate is released inside the worker task (not here in sync()),
+    // so the caller sees state transition happen after the worker has processed the request.
+    // I-19 note: ACK timeout (E_SYNC_ACK_TIMEOUT) would be emitted here once the
+    // M1c ACK state machine is implemented; for now it remains a placeholder.
     worker_->enqueue([this]() {
-        // The worker already does scanInbox+broadcast in its loop;
-        // this explicit enqueue forces an immediate cycle.
-        // (No additional logic needed — the loop handles it.)
-    });
-
-    ctx_->gate.release();
-
-    {
+        // The worker loop already calls scanInbox + broadcast on each iteration;
+        // this task signals that a foreground sync request was received.
+        // Full scan+ACK-wait state machine is deferred to M1c.
+        ctx_->gate.release();
+        setProgress(SyncState::Completed, 100);
         QMutexLocker lk(&snapMutex_);
         result_.ok = true;
         result_.finalState = SyncState::Completed;
-    }
-    setProgress(SyncState::Completed, 100);
+    });
+    // Note: gate is released inside the enqueued task above; do NOT release here.
     return true;
 }
 
@@ -197,19 +175,16 @@ bool SyncEngine::syncSelected(const SyncSelection& selection, QString* err) {
 
     // Enqueue selection push resolution on the worker thread
     // (full implementation would call SelectionResolver + FkClosureBuilder + ChunkStreamer)
-    bool success = true;
-    worker_->enqueue([this, &selection, &success]() {
-        Q_UNUSED(selection)
+    // I-05 fix: capture selection by value to avoid dangling reference after return.
+    worker_->enqueue([this, sel = selection]() {
+        Q_UNUSED(sel)
         // Placeholder: actual selection push logic goes here via SyncSelectionPushService
         // (assembles SelectionResolver -> FkClosureBuilder -> ChunkStreamer -> OutboxWriter)
         Q_UNUSED(this)
     });
 
     ctx_->gate.release();
-
-    if (!success && err)
-        *err = QStringLiteral("Selection push failed");
-    return success;
+    return true;
 }
 
 // --- Private helpers ---

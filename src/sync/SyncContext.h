@@ -2,9 +2,7 @@
 #include "dbridge/sync/SyncConfig.h"
 
 #include <QMutex>
-#include <QSqlDatabase>
 #include <QString>
-#include <QThread>
 
 #include "ForegroundGate.h"
 #include <memory>
@@ -14,11 +12,10 @@ namespace dbridge::sync {
 
 // Holds shared state for one physical SQLite database across all SyncEngine / BatchTransfer
 // instances that share the same file (keyed by OS dev+inode, G-07).
+// Note: write connection is owned by SyncWorker (created in its run() thread), not here.
 struct SyncContext {
     std::optional<SyncConfig> config;  // set by SyncEngine::initialize()
     ForegroundGate gate;
-    QSqlDatabase wconn;  // the single write connection owned by SyncWorker
-    QString wconnName;
     QString contextUuid;  // stored in __sync_context_uuid for double-checking
 
     // Reference count; context is destroyed when refCount reaches 0.
@@ -31,8 +28,10 @@ class SyncContextRegistry {
     static SyncContextRegistry& instance();
 
     // Open or retrieve context for the SQLite file at path.
+    // On success, fills *canonicalKeyOut with the dev+inode key to use for release().
     // Returns nullptr + sets *err on failure.
-    std::shared_ptr<SyncContext> getOrCreate(const QString& sqlitePath, QString* err = nullptr);
+    std::shared_ptr<SyncContext> getOrCreate(const QString& sqlitePath, QString* canonicalKeyOut,
+                                             QString* err = nullptr);
 
     // Decrement ref; destroys context if refCount reaches 0.
     void release(const QString& canonicalKey);

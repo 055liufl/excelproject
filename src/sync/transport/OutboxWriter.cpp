@@ -61,9 +61,9 @@ bool OutboxWriter::writeAtomic(const QString& finalName, const QByteArray& data,
         f.close();
     }
 
-    // 3. Atomic rename (tmp → final)
-    if (QFile::exists(finalPath))
-        QFile::remove(finalPath);
+    // 3. Atomic rename (tmp → final).
+    // I-11 fix: POSIX rename() is atomic and replaces the destination if it exists,
+    // so the prior QFile::remove(finalPath) window has been removed.
     if (!QFile::rename(tmpPath, finalPath)) {
         if (err)
             *err = QStringLiteral("rename failed: %1 → %2").arg(tmpPath, finalPath);
@@ -71,15 +71,40 @@ bool OutboxWriter::writeAtomic(const QString& finalName, const QByteArray& data,
         return false;
     }
 
-    // 4. Write .ready marker (empty file signals receiver)
+    // 4. Write .ready marker (empty file signals receiver), with flush + fsync.
     const QString readyPath = finalPath + QStringLiteral(".ready");
-    QFile rf(readyPath);
-    if (!rf.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-        if (err)
-            *err = QStringLiteral("cannot write .ready: %1").arg(rf.errorString());
-        return false;
+    {
+        QFile rf(readyPath);
+        if (!rf.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+            if (err)
+                *err = QStringLiteral("cannot write .ready: %1").arg(rf.errorString());
+            return false;
+        }
+        // I-11 fix: flush + fsync the .ready marker so it is durable before return.
+        if (!rf.flush()) {
+            if (err)
+                *err = QStringLiteral("flush .ready failed: %1").arg(rf.errorString());
+            rf.remove();
+            return false;
+        }
+        int rfd = static_cast<int>(rf.handle());
+        if (rfd >= 0)
+            ::fsync(rfd);
+        rf.close();
     }
-    rf.close();
+
+    // 5. I-11 fix: fsync the containing directory so the rename and .ready creation
+    // survive a crash (required on POSIX; no-op on Windows where QFile::rename uses
+    // MoveFileEx which is already durable).
+    {
+        QByteArray dirPath = d.absolutePath().toLocal8Bit();
+        int dirFd = ::open(dirPath.constData(), O_RDONLY);
+        if (dirFd >= 0) {
+            ::fsync(dirFd);
+            ::close(dirFd);
+        }
+    }
+
     return true;
 }
 

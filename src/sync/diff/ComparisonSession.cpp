@@ -1,10 +1,13 @@
 #include "ComparisonSession.h"
 
+#include <QSqlDatabase>
 #include <QSqlError>
 #include <QSqlQuery>
 #include <QSqlRecord>
+#include <QUuid>
 
 #include <algorithm>
+#include <memory>
 
 namespace dbridge::sync {
 
@@ -305,6 +308,115 @@ QString ComparisonSession::getPkColumn(const QString& table) const {
 
     pkColCache_.insert(table, pkCol);
     return pkCol;
+}
+
+// ---------------------------------------------------------------------------
+// I-18: createComparisonSession factory
+//
+// Owns all helper objects (TableStateStore, DiffEngine, InboundTableGate,
+// UpsertExecutor) as well as the QSqlDatabase connection used for read-only
+// diff operations.  The owned session is wrapped in a thin RAII holder so
+// that the connection is cleaned up when the IComparisonSession is destroyed.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// OwningComparisonSession wraps a ComparisonSession and keeps its dependency
+// objects alive for the full lifetime of the session.
+struct OwnedDeps {
+    QString connName;
+    QSqlDatabase rconn;
+    TableStateStore ts;
+    DiffEngine diff;
+    InboundTableGate gate;
+    UpsertExecutor upsert;
+};
+
+class OwningComparisonSession : public IComparisonSession {
+   public:
+    explicit OwningComparisonSession(std::unique_ptr<OwnedDeps> deps,
+                                     std::unique_ptr<ComparisonSession> inner)
+        : deps_(std::move(deps)), inner_(std::move(inner)) {
+    }
+
+    ~OwningComparisonSession() override {
+        inner_.reset();
+        deps_->rconn.close();
+        QSqlDatabase::removeDatabase(deps_->connName);
+    }
+
+    QList<TableDiff> tableDiffs() const override {
+        return inner_->tableDiffs();
+    }
+    QList<RowDiff> rowDiffs(const QString& t, int off, int lim) const override {
+        return inner_->rowDiffs(t, off, lim);
+    }
+    bool stageRow(const QString& t, const QString& pk) override {
+        return inner_->stageRow(t, pk);
+    }
+    bool stageTable(const QString& t) override {
+        return inner_->stageTable(t);
+    }
+    bool unstage(const QString& t, const QString& pk) override {
+        return inner_->unstage(t, pk);
+    }
+    bool acceptLocal(const QString& t, const QString& pk) override {
+        return inner_->acceptLocal(t, pk);
+    }
+    bool acceptRemote(const QString& t, const QString& pk) override {
+        return inner_->acceptRemote(t, pk);
+    }
+    bool stageCell(const QString& t, const QString& pk, const QString& col,
+                   const QVariant& v) override {
+        return inner_->stageCell(t, pk, col, v);
+    }
+    QList<RowDiff> fetchRemoteRows(const QString& t, const QString& tok, int ps,
+                                   const QString& snap) const override {
+        return inner_->fetchRemoteRows(t, tok, ps, snap);
+    }
+    bool save(QString* err) override {
+        return inner_->save(err);
+    }
+    void discard() override {
+        inner_->discard();
+    }
+
+   private:
+    std::unique_ptr<OwnedDeps> deps_;
+    std::unique_ptr<ComparisonSession> inner_;
+};
+
+}  // anonymous namespace
+
+std::unique_ptr<IComparisonSession> createComparisonSession(const SyncConfig& config,
+                                                            QString* err) {
+    auto deps = std::make_unique<OwnedDeps>();
+
+    // Open a read-only connection for diff operations.
+    deps->connName =
+        QStringLiteral("dbridge_cs_") + QUuid::createUuid().toString(QUuid::WithoutBraces);
+    deps->rconn = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), deps->connName);
+    deps->rconn.setDatabaseName(config.sqlitePath());
+    deps->rconn.setConnectOptions(
+        QStringLiteral("QSQLITE_OPEN_READONLY=1;QSQLITE_BUSY_TIMEOUT=5000"));
+    if (!deps->rconn.open()) {
+        if (err)
+            *err = deps->rconn.lastError().text();
+        QSqlDatabase::removeDatabase(deps->connName);
+        return nullptr;
+    }
+
+    // streamEpoch is not known here at factory time (it is owned by SyncWorker);
+    // use 0 as a placeholder — the caller can call initialize() to set up diffs.
+    constexpr qint64 kPlaceholderEpoch = 0;
+
+    auto session = std::make_unique<ComparisonSession>(
+        deps->rconn,  // rconn
+        deps->rconn,  // wconn: same connection; sufficient for read-only diff; save() will
+                      // need a proper write connection when called (M2 will wire this up)
+        deps->ts, deps->diff, deps->gate, deps->upsert, kPlaceholderEpoch);
+
+    return std::make_unique<OwningComparisonSession>(std::move(deps), std::move(session));
 }
 
 }  // namespace dbridge::sync

@@ -14,6 +14,7 @@
 #include "AppliedVectorStore.h"
 #include "ChangesetApplier.h"
 #include "RowWinnerStore.h"
+#include "UpsertExecutor.h"
 #include <sqlite3.h>
 
 namespace dbridge::sync {
@@ -70,8 +71,12 @@ class CapturedWriteTemplate {
     WriteResult branchA(const WriteParams& p);   // InboundChangeset
     WriteResult branchBC(const WriteParams& p);  // InboundSelectionPush or LocalWrite
 
-    // Execute a single RowMutation UPSERT.
+    // Execute a single RowMutation UPSERT (legacy, kept for reference; branchBC uses
+    // UpsertExecutor).
     bool execMutation(const RowMutation& m, QString* err);
+
+    // Parse a changeset blob into a list of TableMutations for table_state accounting (I-07).
+    QList<TableMutation> extractMutations(const QByteArray& changeset);
 
     QSqlDatabase& wconn_;
     sqlite3* h_;

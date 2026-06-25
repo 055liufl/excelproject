@@ -11,67 +11,41 @@ InboxWatcher::InboxWatcher(const QString& inboxDir, QSqlDatabase& db, InboxLedge
     : QObject(parent), dir_(inboxDir), db_(db), ledger_(ledger) {
 }
 
-void InboxWatcher::start() {
-    if (!watcher_) {
-        watcher_ = new QFileSystemWatcher(this);
-        watcher_->addPath(dir_);
-        connect(watcher_, &QFileSystemWatcher::directoryChanged, this,
-                &InboxWatcher::onDirectoryChanged);
-    }
-    if (!timer_) {
-        timer_ = new QTimer(this);
-        timer_->setInterval(10000);  // 10 s fallback
-        connect(timer_, &QTimer::timeout, this, &InboxWatcher::onTimer);
-        timer_->start();
-    }
-    // Startup scan
-    scanInbox();
-}
+// ---------------------------------------------------------------------------
+// scan() — called directly on the worker thread (no event loop required).
+// Returns newly discovered artifact paths (full paths, not just names).
+// ---------------------------------------------------------------------------
 
-void InboxWatcher::stop() {
-    if (timer_) {
-        timer_->stop();
-    }
-    if (watcher_) {
-        watcher_->removePaths(watcher_->directories());
-    }
-}
+QStringList InboxWatcher::scan(QSqlDatabase& db) {
+    QStringList newArtifacts;
 
-void InboxWatcher::onDirectoryChanged(const QString& /*path*/) {
-    scanInbox();
-}
-
-void InboxWatcher::onTimer() {
-    scanInbox();
-}
-
-void InboxWatcher::scanInbox() {
     QDir d(dir_);
     if (!d.exists())
-        return;
+        return newArtifacts;
 
-    // Find all .ready markers.
+    // Find all .ready markers, sorted by time (oldest first for FIFO processing).
     const QStringList readyFiles =
-        d.entryList(QStringList{QStringLiteral("*.ready")}, QDir::Files, QDir::Name);
+        d.entryList(QStringList{QStringLiteral("*.ready")}, QDir::Files, QDir::Time);
 
     for (const QString& readyName : readyFiles) {
-        // Derive artifact name: strip the trailing ".ready"
-        QString artifactName = readyName;
-        if (artifactName.endsWith(QStringLiteral(".ready")))
-            artifactName.chop(6);  // len(".ready") == 6
+        // Derive artifact name: strip the trailing ".ready" (6 chars)
+        QString artifactName = readyName.left(readyName.length() - 6);
 
         // Check ledger: skip if already consumed or corrupt.
-        LedgerStatus st = ledger_.status(db_, artifactName);
+        LedgerStatus st = ledger_.status(db, artifactName);
         if (st == LedgerStatus::Consumed || st == LedgerStatus::Corrupt)
             continue;
 
-        // Mark as seen (idempotent).
-        ledger_.markSeen(db_, artifactName, nullptr);
+        // Mark as seen (idempotent: no-op if already known).
+        if (st != LedgerStatus::Seen)
+            ledger_.markSeen(db, artifactName, nullptr);
 
         const QString artifactPath = d.filePath(artifactName);
         if (QFileInfo::exists(artifactPath))
-            emit artifactReady(artifactPath);
+            newArtifacts.append(artifactPath);
     }
+
+    return newArtifacts;
 }
 
 }  // namespace dbridge::sync

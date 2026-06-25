@@ -44,6 +44,10 @@ class ChangesetApplier {
     };
 
     static int conflictCb(void* ctx, int conflict, sqlite3_changeset_iter* iter);
+
+    // Post-apply: update row_winner for all successfully inserted/updated rows.
+    void updateWinnersFromChangeset(const QByteArray& changeset, const QString& origin, int rank,
+                                    qint64 seq, RowWinnerStore& winners, QSqlDatabase& wconn);
 };
 
 }  // namespace dbridge::sync

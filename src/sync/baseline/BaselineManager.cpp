@@ -1,5 +1,7 @@
 #include "sync/baseline/BaselineManager.h"
 
+#include "dbridge/Errors.h"
+
 #include <QDataStream>
 #include <QSqlError>
 #include <QSqlQuery>
@@ -184,6 +186,9 @@ bool BaselineManager::exportBaseline(QSqlDatabase& rconn, const QStringList& tab
     qint64 maxSeq = 0;
     QByteArray data;
     if (!serializeTables(rconn, tables, &data, &maxSeq, err)) {
+        // I-20: map inner failure to E_SYNC_BASELINE_FAILED error code.
+        if (err && !err->startsWith(QLatin1String("E_SYNC")))
+            *err = QStringLiteral("%1: %2").arg(QLatin1String(err::E_SYNC_BASELINE_FAILED), *err);
         return false;
     }
     out->data = data;
@@ -199,13 +204,22 @@ bool BaselineManager::applyBaseline(QSqlDatabase& wconn, sqlite3* /*h*/,
                                     TableStateStore& ts, RowWinnerStore& rw,
                                     ConsistencyCache& cache, qint64 epoch, const QString& origin,
                                     qint64* newAnchorSeq, QString* err) {
+    // I-20 helper: prefix err with E_SYNC_BASELINE_FAILED if not already an E_SYNC code.
+    auto wrapErr = [&](QString* ep) {
+        if (ep && !ep->startsWith(QLatin1String("E_SYNC")))
+            *ep = QStringLiteral("%1: %2").arg(QLatin1String(err::E_SYNC_BASELINE_FAILED), *ep);
+    };
+
     WriteTxn txn(wconn);
-    if (!txn.begin(err))
+    if (!txn.begin(err)) {
+        wrapErr(err);
         return false;
+    }
 
     QStringList tables;
     if (!deserializeAndApply(wconn, art.data, &tables, err)) {
         txn.rollback();
+        wrapErr(err);
         return false;
     }
 
@@ -213,6 +227,7 @@ bool BaselineManager::applyBaseline(QSqlDatabase& wconn, sqlite3* /*h*/,
     // baselineGeneration = sourceMaxSeq serves as the generation stamp.
     if (!av.reset(wconn, origin, epoch, art.sourceMaxSeq, err)) {
         txn.rollback();
+        wrapErr(err);
         return false;
     }
 
@@ -220,17 +235,21 @@ bool BaselineManager::applyBaseline(QSqlDatabase& wconn, sqlite3* /*h*/,
     // — caller may re-apply with real fp after schema negotiation).
     if (!ts.resetFromBaseline(wconn, tables, epoch, QString(), err)) {
         txn.rollback();
+        wrapErr(err);
         return false;
     }
 
     // Clear row winner store — all rows now reflect baseline truth.
     if (!rw.resetAll(wconn, err)) {
         txn.rollback();
+        wrapErr(err);
         return false;
     }
 
-    if (!txn.commit(err))
+    if (!txn.commit(err)) {
+        wrapErr(err);
         return false;
+    }
 
     // Invalidate in-memory consistency cache for each table (outside txn is fine).
     for (const QString& table : tables) {

@@ -7,18 +7,22 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QSqlDatabase>
 #include <QSqlError>
 #include <QSqlQuery>
+#include <QUuid>
 
+#include "sync/SyncDDL.h"
 #include "sync/WriteTxn.h"
+#include "sync/capture/SqliteHandle.h"
 #include "sync/conflict/ConflictArbiter.h"
 #include "sync/conflict/RebaseEngine.h"
 #include "sync/conflict/RoutingTable.h"
+#include "sync/schema/SchemaEligibility.h"
 
 namespace dbridge::sync {
 
-SyncWorker::SyncWorker(QSqlDatabase& wconn, sqlite3* h, SyncConfig config)
-    : wconn_(wconn), h_(h), config_(std::move(config)) {
+SyncWorker::SyncWorker(SyncConfig config) : config_(std::move(config)) {
     av_ = std::make_unique<AppliedVectorStore>();
     rw_ = std::make_unique<RowWinnerStore>();
     ts_ = std::make_unique<TableStateStore>();
@@ -55,58 +59,166 @@ void SyncWorker::requestStop() {
     queueCond_.wakeAll();
 }
 
-void SyncWorker::run() {
-    QString initErr;
+bool SyncWorker::waitForInit(int timeoutMs) {
+    return initSemaphore_.tryAcquire(1, timeoutMs);
+}
 
-    // --- One-time initialization on the worker thread ---
+QString SyncWorker::initError() const {
+    return initError_;
+}
+
+void SyncWorker::run() {
+    // --- Create write connection on the worker thread (I-02 fix) ---
+    QString connName =
+        QStringLiteral("dbridge_sw_") + QUuid::createUuid().toString(QUuid::WithoutBraces);
+    QSqlDatabase wconn = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), connName);
+    wconn.setDatabaseName(config_.sqlitePath());
+    wconn.setConnectOptions(QStringLiteral("QSQLITE_BUSY_TIMEOUT=5000"));
+    if (!wconn.open()) {
+        initError_ = QStringLiteral("cannot open db: ") + wconn.lastError().text();
+        initSemaphore_.release();
+        QSqlDatabase::removeDatabase(connName);
+        return;
+    }
+
+    // WAL + foreign_keys
+    {
+        QSqlQuery q(wconn);
+        q.exec(QStringLiteral("PRAGMA journal_mode=WAL"));
+        q.exec(QStringLiteral("PRAGMA foreign_keys=ON"));
+    }
+
+    sqlite3* h = SqliteHandle::of(wconn);
+    if (!h) {
+        initError_ = QStringLiteral("cannot get sqlite3* handle");
+        initSemaphore_.release();
+        wconn.close();
+        QSqlDatabase::removeDatabase(connName);
+        return;
+    }
+    if (!SqliteHandle::sessionAvailable(h)) {
+        initError_ = QStringLiteral("E_SYNC_SESSION_UNAVAILABLE");
+        initSemaphore_.release();
+        wconn.close();
+        QSqlDatabase::removeDatabase(connName);
+        return;
+    }
+
+    // Run DDL
+    for (const QString& stmt : ddl::allCreateStatements()) {
+        QSqlQuery q(wconn);
+        if (!q.exec(stmt)) {
+            initError_ = QStringLiteral("DDL: ") + q.lastError().text();
+            initSemaphore_.release();
+            wconn.close();
+            QSqlDatabase::removeDatabase(connName);
+            return;
+        }
+    }
+
+    // Schema eligibility check
+    QStringList rejected;
+    QString eligErr;
+    if (!SchemaEligibility::verify(wconn, config_.syncTables(), &rejected, &eligErr)) {
+        initError_ = QStringLiteral("E_SYNC_UNSUPPORTED_SCHEMA: ") + eligErr;
+        if (!rejected.isEmpty())
+            initError_ += QStringLiteral("; rejected: ") + rejected.join(QLatin1Char(','));
+        initSemaphore_.release();
+        wconn.close();
+        QSqlDatabase::removeDatabase(connName);
+        return;
+    }
+
+    // Expose pointers for task closures (valid only within this run() lifetime)
+    wconnPtr_ = &wconn;
+    hPtr_ = h;
+
+    // --- One-time store initialization on the worker thread ---
     streamEpoch_ = QDateTime::currentMSecsSinceEpoch();
 
-    if (!av_->init(wconn_, &initErr)) {
-        emit errorOccurred({err::E_SYNC_INIT, Severity::Fatal, "init", config_.nodeId(), initErr});
+    QString initErr;
+    if (!av_->init(wconn, &initErr)) {
+        initError_ = initErr;
+        initSemaphore_.release();
+        wconnPtr_ = nullptr;
+        hPtr_ = nullptr;
+        wconn.close();
+        QSqlDatabase::removeDatabase(connName);
         return;
     }
-    if (!rw_->init(wconn_, &initErr)) {
-        emit errorOccurred({err::E_SYNC_INIT, Severity::Fatal, "init", config_.nodeId(), initErr});
+    if (!rw_->init(wconn, &initErr)) {
+        initError_ = initErr;
+        initSemaphore_.release();
+        wconnPtr_ = nullptr;
+        hPtr_ = nullptr;
+        wconn.close();
+        QSqlDatabase::removeDatabase(connName);
         return;
     }
-    if (!ts_->init(wconn_, &initErr)) {
-        emit errorOccurred({err::E_SYNC_INIT, Severity::Fatal, "init", config_.nodeId(), initErr});
+    if (!ts_->init(wconn, &initErr)) {
+        initError_ = initErr;
+        initSemaphore_.release();
+        wconnPtr_ = nullptr;
+        hPtr_ = nullptr;
+        wconn.close();
+        QSqlDatabase::removeDatabase(connName);
         return;
     }
-    if (!clog_->init(wconn_, &initErr)) {
-        emit errorOccurred({err::E_SYNC_INIT, Severity::Fatal, "init", config_.nodeId(), initErr});
+    if (!clog_->init(wconn, &initErr)) {
+        initError_ = initErr;
+        initSemaphore_.release();
+        wconnPtr_ = nullptr;
+        hPtr_ = nullptr;
+        wconn.close();
+        QSqlDatabase::removeDatabase(connName);
         return;
     }
-    if (!ledger_->init(wconn_, &initErr)) {
-        emit errorOccurred({err::E_SYNC_INIT, Severity::Fatal, "init", config_.nodeId(), initErr});
+    if (!ledger_->init(wconn, &initErr)) {
+        initError_ = initErr;
+        initSemaphore_.release();
+        wconnPtr_ = nullptr;
+        hPtr_ = nullptr;
+        wconn.close();
+        QSqlDatabase::removeDatabase(connName);
         return;
     }
-    if (!ackStore_->init(wconn_, &initErr)) {
-        emit errorOccurred({err::E_SYNC_INIT, Severity::Fatal, "init", config_.nodeId(), initErr});
+    if (!ackStore_->init(wconn, &initErr)) {
+        initError_ = initErr;
+        initSemaphore_.release();
+        wconnPtr_ = nullptr;
+        hPtr_ = nullptr;
+        wconn.close();
+        QSqlDatabase::removeDatabase(connName);
         return;
     }
-    if (!quarantine_->init(wconn_, &initErr)) {
-        emit errorOccurred({err::E_SYNC_INIT, Severity::Fatal, "init", config_.nodeId(), initErr});
+    if (!quarantine_->init(wconn, &initErr)) {
+        initError_ = initErr;
+        initSemaphore_.release();
+        wconnPtr_ = nullptr;
+        hPtr_ = nullptr;
+        wconn.close();
+        QSqlDatabase::removeDatabase(connName);
         return;
     }
 
-    QString schemaFp = SchemaGuard::computeFingerprint(wconn_, config_.syncTables());
+    QString schemaFp = SchemaGuard::computeFingerprint(wconn, config_.syncTables());
     guard_->setLocal(config_.schemaVersion(), schemaFp);
 
     routing_->configure(config_.nodeId(), config_.peerNodes());
     arbiter_->setRankMap(config_.allRanks());
 
     // Initialize CapturedWriteTemplate now that all stores are ready
-    tpl_ = std::make_unique<CapturedWriteTemplate>(wconn_, h_, *av_, *rw_, *ts_, *clog_, *rec_,
+    tpl_ = std::make_unique<CapturedWriteTemplate>(wconn, h, *av_, *rw_, *ts_, *clog_, *rec_,
                                                    *guard_, *applier_, config_.nodeId(),
                                                    streamEpoch_, schemaFp, config_.schemaVersion());
 
-    // Create InboxWatcher on this thread
-    watcher_ = std::make_unique<InboxWatcher>(config_.inboxDir(), wconn_, *ledger_);
-    connect(
-        watcher_.get(), &InboxWatcher::artifactReady, this,
-        [this](const QString& path) { pendingArtifacts_.append(path); }, Qt::DirectConnection);
-    watcher_->start();
+    // Create InboxWatcher on this thread.
+    // I-10 fix: InboxWatcher no longer uses QFileSystemWatcher/QTimer (which require an event
+    // loop).  It now exposes a synchronous scan() method called explicitly in scanInbox().
+    watcher_ = std::make_unique<InboxWatcher>(config_.inboxDir(), wconn, *ledger_);
+
+    // Signal successful initialization to initialize() caller
+    initSemaphore_.release();
 
     qint64 lastBroadcastMs = 0;
 
@@ -132,8 +244,16 @@ void SyncWorker::run() {
         }
     }
 
-    watcher_->stop();
+    // I-10: watcher_->stop() removed — no QTimer/QFileSystemWatcher to tear down.
     ackChan_->flush(*codec_);
+
+    // Teardown: clear pointers before closing connection
+    tpl_.reset();
+    watcher_.reset();
+    wconnPtr_ = nullptr;
+    hPtr_ = nullptr;
+    wconn.close();
+    QSqlDatabase::removeDatabase(connName);
 }
 
 void SyncWorker::processPendingTasks() {
@@ -148,21 +268,23 @@ void SyncWorker::processPendingTasks() {
 }
 
 void SyncWorker::scanInbox() {
-    // Also check for newly-discovered artifacts from InboxWatcher
-    QStringList toProcess;
-    toProcess.swap(pendingArtifacts_);
+    if (!wconnPtr_)
+        return;
 
-    // Additionally poll ledger for any 'seen' artifacts not yet consumed
-    QStringList seenPending = ledger_->pendingSeen(wconn_);
-    for (const QString& name : seenPending) {
-        QString fullPath = config_.inboxDir() + QDir::separator() + name;
-        if (!toProcess.contains(fullPath))
-            toProcess.append(fullPath);
+    // I-10 fix: use synchronous scan() instead of signal-driven InboxWatcher.
+    // Direct scan (no event loop needed).
+    QStringList found = watcher_->scan(*wconnPtr_);
+
+    // Also add ledger pending-seen artifacts not yet seen by the directory scan.
+    QStringList pending = ledger_->pendingSeen(*wconnPtr_);
+    for (const QString& name : pending) {
+        QString full = config_.inboxDir() + QDir::separator() + name;
+        if (!found.contains(full))
+            found.append(full);
     }
 
-    for (const QString& path : toProcess) {
+    for (const QString& path : found)
         processArtifact(path);
-    }
 }
 
 bool SyncWorker::processArtifact(const QString& path) {
@@ -175,7 +297,7 @@ bool SyncWorker::processArtifact(const QString& path) {
     }
 
     // Check ledger
-    LedgerStatus st = ledger_->status(wconn_, name);
+    LedgerStatus st = ledger_->status(*wconnPtr_, name);
     if (st == LedgerStatus::Consumed || st == LedgerStatus::Corrupt)
         return true;
 
@@ -193,13 +315,13 @@ bool SyncWorker::processArtifact(const QString& path) {
     QString decErr;
     if (!codec_->decode(data, &dec, &decErr)) {
         QString markErr;
-        ledger_->markCorrupt(wconn_, name, &markErr);
+        ledger_->markCorrupt(*wconnPtr_, name, &markErr);
         emit errorOccurred(
             {err::E_SYNC_PAYLOAD_CORRUPT, Severity::Error, "inbox", dec.header.origin, decErr});
         return false;
     }
 
-    ledger_->markSeen(wconn_, name, nullptr);
+    ledger_->markSeen(*wconnPtr_, name, nullptr);
 
     bool ok = false;
     if (dec.kind == PayloadKind::Changeset)
@@ -208,7 +330,7 @@ bool SyncWorker::processArtifact(const QString& path) {
         ok = processSelectionPushArtifact(dec, name);
 
     if (ok) {
-        ledger_->markConsumed(wconn_, name, nullptr);
+        ledger_->markConsumed(*wconnPtr_, name, nullptr);
         // Send ACK back
         ChangesetAck ack;
         ack.origin = dec.header.origin;
@@ -226,8 +348,8 @@ bool SyncWorker::processChangesetArtifact(const DecodeResult& dec, const QString
     QString schemaErr;
     if (!guard_->verifyPayload(hdr.schemaVer, hdr.schemaFingerprint, &schemaErr)) {
         // Quarantine
-        quarantine_->quarantine(wconn_, hdr.origin, hdr.originSeq, hdr.streamEpoch, hdr.schemaVer,
-                                dec.changeset, nullptr);
+        quarantine_->quarantine(*wconnPtr_, hdr.origin, hdr.originSeq, hdr.streamEpoch,
+                                hdr.schemaVer, dec.changeset, nullptr);
         emit errorOccurred(
             {err::E_SYNC_SCHEMA_MISMATCH, Severity::Warning, "apply", hdr.origin, schemaErr});
         return false;
@@ -295,25 +417,36 @@ bool SyncWorker::processSelectionPushArtifact(const DecodeResult& dec, const QSt
     return true;
 }
 
-bool SyncWorker::processAckArtifact(const QString& path, const QString& /*name*/) {
+bool SyncWorker::processAckArtifact(const QString& path, const QString& name) {
     QFile f(path);
     if (!f.open(QIODevice::ReadOnly))
         return false;
     QByteArray data = f.readAll();
     f.close();
 
+    // I-15 fix: parse the sending peer from the artifact file name.
+    // ACK file name format: ack__{fromPeer}__{toPeer}__{ms}.ack
+    // parts[0]="ack", parts[1]=fromPeer, parts[2]=toPeer, parts[3]=ms+".ack"
+    QString peer;
+    {
+        QStringList parts = name.split(QStringLiteral("__"));
+        if (parts.size() >= 3)
+            peer = parts[1];  // fromPeer
+    }
+
     // Try changeset ACK first
     ChangesetAck csAck;
     if (codec_->decodeChangesetAck(data, &csAck)) {
-        ackStore_->updateAcked(wconn_, csAck.origin, csAck.origin, csAck.streamEpoch,
-                               csAck.appliedSeq, nullptr);
+        // I-15 fix: pass peer (sender) as the first peer argument, not csAck.origin.
+        if (!peer.isEmpty())
+            ackStore_->updateAcked(*wconnPtr_, peer, csAck.origin, csAck.streamEpoch,
+                                   csAck.appliedSeq, nullptr);
         return true;
     }
     // Try chunk ACK
     PushChunkAck chunkAck;
     if (codec_->decodeChunkAck(data, &chunkAck)) {
-        // Record chunk ack — just log for now; push progress tracking is in
-        // __sync_push_chunk_progress
+        // Record chunk ack in push_chunk_progress (full implementation deferred).
         return true;
     }
     return false;
@@ -331,7 +464,7 @@ void SyncWorker::broadcastTopeer(const QString& peer) {
 
     // Read pending entries from changelog
     QList<ChangelogStore::Entry> entries = clog_->readRange(
-        wconn_, peer, peerAckedSeq, static_cast<int>(config_.broadcastThreshold()));
+        *wconnPtr_, peer, peerAckedSeq, static_cast<int>(config_.broadcastThreshold()));
 
     qint64 bytesSent = 0;
     for (const auto& entry : entries) {
@@ -363,7 +496,8 @@ void SyncWorker::broadcastTopeer(const QString& peer) {
 }
 
 qint64 SyncWorker::computePeerAckedSeq(const QString& peer) {
-    return ackStore_->minAckedSeq(wconn_, config_.nodeId(), streamEpoch_);
+    // I-15 fix: query the acked seq for this specific peer, not the global min.
+    return ackStore_->ackedSeq(*wconnPtr_, peer, config_.nodeId(), streamEpoch_);
 }
 
 }  // namespace dbridge::sync

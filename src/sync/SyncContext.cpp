@@ -2,7 +2,6 @@
 
 #include <QCoreApplication>
 #include <QFileInfo>
-#include <QSqlDatabase>
 #include <QUuid>
 
 #ifdef Q_OS_WIN
@@ -53,10 +52,14 @@ QString SyncContextRegistry::canonicalKey(const QString& path, QString* err) {
 }
 
 std::shared_ptr<SyncContext> SyncContextRegistry::getOrCreate(const QString& sqlitePath,
+                                                              QString* canonicalKeyOut,
                                                               QString* err) {
     QString key = canonicalKey(sqlitePath, err);
     if (key.isEmpty())
         return nullptr;
+
+    if (canonicalKeyOut)
+        *canonicalKeyOut = key;
 
     QMutexLocker lk(&mutex_);
     auto it = registry_.find(key);
@@ -78,8 +81,6 @@ void SyncContextRegistry::release(const QString& canonicalKey_) {
     if (it == registry_.end())
         return;
     if (--it.value()->refCount <= 0) {
-        if (it.value()->wconn.isOpen())
-            it.value()->wconn.close();
         registry_.erase(it);
     }
 }

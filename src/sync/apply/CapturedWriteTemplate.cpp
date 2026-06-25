@@ -1,9 +1,14 @@
 #include "CapturedWriteTemplate.h"
 
+#include "dbridge/Errors.h"
+
+#include <QCryptographicHash>
 #include <QDateTime>
 #include <QSqlError>
 #include <QSqlQuery>
 #include <QStringList>
+
+#include <sqlite3.h>
 
 namespace dbridge::sync {
 
@@ -51,7 +56,7 @@ WriteResult CapturedWriteTemplate::execute(const WriteParams& params) {
 }
 
 // ---------------------------------------------------------------------------
-// Branch A: InboundChangeset
+// Branch A: InboundChangeset (I-07)
 // ---------------------------------------------------------------------------
 
 WriteResult CapturedWriteTemplate::branchA(const WriteParams& p) {
@@ -74,7 +79,7 @@ WriteResult CapturedWriteTemplate::branchA(const WriteParams& p) {
     }
     if (sc == SeqCheckResult::Gap) {
         txn.rollback();
-        result.errorCode = QStringLiteral("SEQ_GAP");
+        result.errorCode = QLatin1String(err::E_SYNC_GAP);
         result.errorMsg = QStringLiteral("gap for origin=%1 seq=%2").arg(p.origin).arg(p.seq);
         return result;
     }
@@ -106,7 +111,15 @@ WriteResult CapturedWriteTemplate::branchA(const WriteParams& p) {
         return result;
     }
 
-    // 5. Store raw blob in changelog (appendForward)
+    // 5a. Update table_state from changeset mutations (I-07)
+    QList<TableMutation> muts = extractMutations(p.changesetBlob);
+    if (!muts.isEmpty()) {
+        // Non-fatal: log failure but continue — table_state is a soft-accounting layer.
+        if (!ts_.applyMutations(wconn_, muts, p.epoch, p.schemaFp, p.seq, &err))
+            err.clear();  // swallow; will be recomputed on next baseline reset if needed
+    }
+
+    // 5b. Store raw blob in changelog (appendForward)
     qint64 localSeq = 0;
     if (!clog_.appendForward(wconn_, p.origin, nodeId_, p.seq, p.epoch, p.schemaVer, p.schemaFp,
                              p.changesetBlob, &localSeq, &err)) {
@@ -124,11 +137,12 @@ WriteResult CapturedWriteTemplate::branchA(const WriteParams& p) {
 
     result.ok = true;
     result.localChangelogSeq = localSeq;
+    result.tableMutations = muts;
     return result;
 }
 
 // ---------------------------------------------------------------------------
-// Branch B/C: InboundSelectionPush or LocalWrite
+// Branch B/C: InboundSelectionPush or LocalWrite (I-08)
 // ---------------------------------------------------------------------------
 
 WriteResult CapturedWriteTemplate::branchBC(const WriteParams& p) {
@@ -180,22 +194,21 @@ WriteResult CapturedWriteTemplate::branchBC(const WriteParams& p) {
         return result;
     }
 
-    // Execute row mutations
-    for (const RowMutation& m : p.mutations) {
-        if (!execMutation(m, &err)) {
-            rec_.abort();
-            txn.rollback();
-            result.errorCode = QStringLiteral("MUTATION");
-            result.errorMsg = err;
-            return result;
-        }
+    // Execute row mutations via UpsertExecutor (I-08: replaces hand-rolled execMutation loop).
+    UpsertExecutor upsertEx;
+    QList<dbridge::RowError> rowErrors;
+    if (!upsertEx.apply(wconn_, p.mutations, &rowErrors, &err)) {
+        rec_.abort();
+        txn.rollback();
+        result.errorCode = QStringLiteral("E_DB_UPSERT");
+        result.errorMsg = err;
+        return result;
     }
 
     // Seal changeset into changelog
     qint64 localSeq = 0;
     qint64 parentSeq = 0;  // caller may enrich later
     qint64 originSeq = isInbound ? p.seq : 0;
-    const QString kind = isInbound ? QStringLiteral("selection_push") : QStringLiteral("local");
     const QString origin = isInbound ? p.origin : nodeId_;
     const qint64 epoch = isInbound ? p.epoch : streamEpoch_;
 
@@ -223,6 +236,43 @@ WriteResult CapturedWriteTemplate::branchBC(const WriteParams& p) {
         upsert.exec();
     }
 
+    // Update table_state from RowMutations (I-08).
+    QList<TableMutation> tmuts;
+    tmuts.reserve(p.mutations.size());
+    for (const RowMutation& m : p.mutations) {
+        TableMutation tm;
+        tm.table = m.table;
+        tm.isInsert = (m.mode == UpsertMode::DoUpdate);
+        tm.isDelete = false;
+
+        // Build pkHash from PK columns.
+        QByteArray pkMat;
+        for (int i = 0; i < m.columns.size(); ++i) {
+            if (m.pkColumns.contains(m.columns[i])) {
+                pkMat.append(m.values[i].toString().toUtf8());
+                pkMat.append('\0');
+            }
+        }
+        QByteArray pkH = QCryptographicHash::hash(pkMat, QCryptographicHash::Sha256).left(16);
+        tm.pkHash = QString::fromLatin1(pkH.toHex());
+
+        // Content hash from all values.
+        QByteArray contentMat;
+        for (const QVariant& v : m.values) {
+            contentMat.append(v.toString().toUtf8());
+            contentMat.append('\0');
+        }
+        tm.afterHash = QCryptographicHash::hash(contentMat, QCryptographicHash::Sha256).left(16);
+        tmuts.append(tm);
+    }
+
+    if (!tmuts.isEmpty()) {
+        // Non-fatal: log swallowed; table_state can be rebuilt from baseline.
+        ts_.applyMutations(wconn_, tmuts, isInbound ? p.epoch : streamEpoch_,
+                           isInbound ? p.schemaFp : schemaFp_, isInbound ? p.seq : 0, &err);
+        err.clear();
+    }
+
     if (!txn.commit(&err)) {
         result.errorCode = QStringLiteral("TXN_COMMIT");
         result.errorMsg = err;
@@ -231,11 +281,127 @@ WriteResult CapturedWriteTemplate::branchBC(const WriteParams& p) {
 
     result.ok = true;
     result.localChangelogSeq = localSeq;
+    result.tableMutations = tmuts;
     return result;
 }
 
 // ---------------------------------------------------------------------------
-// private: execMutation
+// private: extractMutations — parse changeset blob into TableMutation list (I-07)
+// ---------------------------------------------------------------------------
+
+QList<TableMutation> CapturedWriteTemplate::extractMutations(const QByteArray& changeset) {
+    QList<TableMutation> muts;
+    if (changeset.isEmpty())
+        return muts;
+
+    sqlite3_changeset_iter* iter = nullptr;
+    if (sqlite3changeset_start(
+            &iter, changeset.size(),
+            const_cast<void*>(static_cast<const void*>(changeset.constData()))) != SQLITE_OK)
+        return muts;
+
+    while (sqlite3changeset_next(iter) == SQLITE_ROW) {
+        const char* tbl = nullptr;
+        int nCol = 0, op = 0, indirect = 0;
+        sqlite3changeset_op(iter, &tbl, &nCol, &op, &indirect);
+
+        unsigned char* pkMask = nullptr;
+        sqlite3changeset_pk(iter, &pkMask, nullptr);
+
+        // Build pkHash and content hashes from column values.
+        auto hashSlice = [&](bool useNew) -> QByteArray {
+            QByteArray mat;
+            for (int i = 0; i < nCol; i++) {
+                sqlite3_value* val = nullptr;
+                if (useNew)
+                    sqlite3changeset_new(iter, i, &val);
+                else
+                    sqlite3changeset_old(iter, i, &val);
+                if (!val) {
+                    mat.append('\0');
+                    continue;
+                }
+                const int vt = sqlite3_value_type(val);
+                if (vt == SQLITE_TEXT) {
+                    const char* txt = reinterpret_cast<const char*>(sqlite3_value_text(val));
+                    mat.append(txt ? txt : "");
+                } else if (vt == SQLITE_INTEGER) {
+                    mat.append(QByteArray::number(static_cast<qint64>(sqlite3_value_int64(val))));
+                } else if (vt == SQLITE_BLOB) {
+                    const void* b = sqlite3_value_blob(val);
+                    const int bl = sqlite3_value_bytes(val);
+                    if (b && bl > 0)
+                        mat.append(static_cast<const char*>(b), bl);
+                }
+                mat.append('\0');
+            }
+            return QCryptographicHash::hash(mat, QCryptographicHash::Sha256).left(16);
+        };
+
+        auto pkHashStr = [&](bool useNew) -> QString {
+            QByteArray mat;
+            for (int i = 0; i < nCol; i++) {
+                if (!pkMask || !pkMask[i])
+                    continue;
+                sqlite3_value* val = nullptr;
+                if (useNew)
+                    sqlite3changeset_new(iter, i, &val);
+                else
+                    sqlite3changeset_old(iter, i, &val);
+                if (!val) {
+                    mat.append('\0');
+                    continue;
+                }
+                const int vt = sqlite3_value_type(val);
+                if (vt == SQLITE_TEXT) {
+                    const char* txt = reinterpret_cast<const char*>(sqlite3_value_text(val));
+                    mat.append(txt ? txt : "");
+                } else if (vt == SQLITE_INTEGER) {
+                    mat.append(QByteArray::number(static_cast<qint64>(sqlite3_value_int64(val))));
+                } else if (vt == SQLITE_BLOB) {
+                    const void* b = sqlite3_value_blob(val);
+                    const int bl = sqlite3_value_bytes(val);
+                    if (b && bl > 0)
+                        mat.append(static_cast<const char*>(b), bl);
+                }
+                mat.append('\0');
+            }
+            if (mat.isEmpty())
+                mat = hashSlice(useNew);  // fallback: hash all cols
+            QByteArray h = QCryptographicHash::hash(mat, QCryptographicHash::Sha256).left(16);
+            return QString::fromLatin1(h.toHex());
+        };
+
+        TableMutation tm;
+        tm.table = QString::fromUtf8(tbl ? tbl : "");
+
+        if (op == SQLITE_INSERT) {
+            tm.pkHash = pkHashStr(true);
+            tm.afterHash = hashSlice(true);
+            tm.isInsert = true;
+            tm.isDelete = false;
+        } else if (op == SQLITE_DELETE) {
+            tm.pkHash = pkHashStr(false);
+            tm.beforeHash = hashSlice(false);
+            tm.isInsert = false;
+            tm.isDelete = true;
+        } else if (op == SQLITE_UPDATE) {
+            tm.pkHash = pkHashStr(false);  // PK must not change across UPDATE
+            tm.beforeHash = hashSlice(false);
+            tm.afterHash = hashSlice(true);
+            tm.isInsert = false;
+            tm.isDelete = false;
+        } else {
+            continue;
+        }
+        muts.append(tm);
+    }
+    sqlite3changeset_finalize(iter);
+    return muts;
+}
+
+// ---------------------------------------------------------------------------
+// private: execMutation (kept for completeness; branchBC now uses UpsertExecutor)
 // ---------------------------------------------------------------------------
 
 bool CapturedWriteTemplate::execMutation(const RowMutation& m, QString* err) {

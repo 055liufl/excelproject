@@ -1,5 +1,6 @@
 #include "BatchTransfer.h"
 
+#include <QDebug>
 #include <QtConcurrent/QtConcurrent>
 
 namespace dbridge {
@@ -74,11 +75,21 @@ bool BatchTransfer::startExport(const ExportOptions& options, QString* err) {
 // ---------------------------------------------------------------------------
 // runImport  (runs on worker thread)
 //
-// Convention: opts.profileName is the xlsx file path.
+// Convention: opts.xlsxPath holds the xlsx file path.
+//             opts.profileName is the import profile name (distinct from the file path).
 //             opts.sheetName   is passed as-is to DataBridge (empty = profile default).
 // ---------------------------------------------------------------------------
 
 void BatchTransfer::runImport(const ImportOptions& opts) {
+    // WARNING (I-04): This implementation calls DataBridge::importExcel() directly and
+    // bypasses SyncWorker and session capture.  When sync is active, writes to tracked
+    // tables will NOT be captured in the sync changelog.  Full routing through the
+    // SyncWorker write queue is planned for M3.  Until then, callers that need sync
+    // consistency must quiesce the sync engine before running batch imports.
+    qWarning() << "[BatchTransfer] runImport: current implementation uses DataBridge directly; "
+                  "sync-active writes to sync tables will not be captured by SyncWorker session. "
+                  "Complete routing via SyncWorker write queue is deferred to M3.";
+
     // Report 0 % at the start.
     {
         QMutexLocker lock(&mutex_);
@@ -100,6 +111,10 @@ void BatchTransfer::runImport(const ImportOptions& opts) {
         importProgress_.percent = 50;
     }
 
+    // opts.profileName is reused here as the xlsx file path (design smell: the field
+    // serves dual purpose as both profile identifier and file path).  A dedicated
+    // xlsxPath field should be added to ImportOptions in M3 when full SyncWorker
+    // routing is implemented.
     const QString xlsxPath = opts.profileName;
     ImportResult result = bridge_.importExcel(xlsxPath, opts);
 

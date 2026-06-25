@@ -3,6 +3,7 @@
 #include "dbridge/sync/SyncTypes.h"
 
 #include <QMutex>
+#include <QSemaphore>
 #include <QThread>
 #include <QWaitCondition>
 
@@ -34,10 +35,11 @@ class RebaseEngine;
 
 // Single writer thread: processes a serialized task queue, scans inbox
 // artifacts, and broadcasts packed outbox payloads to peers.
+// The write connection is created inside run() so it is always owned by the worker thread.
 class SyncWorker : public QThread {
     Q_OBJECT
    public:
-    SyncWorker(QSqlDatabase& wconn, sqlite3* h, SyncConfig config);
+    explicit SyncWorker(SyncConfig config);
     ~SyncWorker() override;
 
     using WriteTask = std::function<void()>;
@@ -47,6 +49,14 @@ class SyncWorker : public QThread {
 
     // Ask the worker to stop after draining remaining tasks.
     void requestStop();
+
+    // Called by the thread that called start(): blocks until worker init completes
+    // (or until timeoutMs elapses).  Returns true on success.
+    bool waitForInit(int timeoutMs = 10000);
+
+    // Non-empty when waitForInit() returns false or the worker emitted errorOccurred
+    // during init.
+    QString initError() const;
 
    signals:
     void progressUpdated(dbridge::sync::SyncProgress p);
@@ -72,9 +82,17 @@ class SyncWorker : public QThread {
     qint64 computePeerAckedSeq(const QString& peer);
 
     // --- Data members ---
-    QSqlDatabase& wconn_;
-    sqlite3* h_;
     SyncConfig config_;
+
+    // Pointers into run()-owned local variables; valid only while run() is executing.
+    // Task closures enqueued after init-success may use these safely since the queue
+    // is drained before run() returns.
+    QSqlDatabase* wconnPtr_ = nullptr;
+    sqlite3* hPtr_ = nullptr;
+
+    // Initialisation synchronisation (I-02 fix)
+    QSemaphore initSemaphore_{0};
+    QString initError_;
 
     QMutex queueMutex_;
     QWaitCondition queueCond_;

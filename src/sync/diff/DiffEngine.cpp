@@ -22,6 +22,9 @@ QList<TableDiff> DiffEngine::tableDiffs(QSqlDatabase& rconn, const QStringList& 
         QString localFp, localChecksum;
         qint64 localRowCount = 0;
         QString err;
+        // I-13 fix: readState() returns false either when no row exists in table_state
+        // (the normal "we have never synced this table" case) or on a query error.
+        // Both cases are treated as "local has no state record for this table".
         bool localFound = localTs.readState(rconn, table, streamEpoch, &localFp, &localChecksum,
                                             &localRowCount, &err);
 
@@ -36,7 +39,9 @@ QList<TableDiff> DiffEngine::tableDiffs(QSqlDatabase& rconn, const QStringList& 
             td.status = TableDiffStatus::Identical;
         } else {
             const RemoteMeta& rm = remote[table];
-            if (localChecksum == rm.checksum) {
+            // I-13 fix: Identical requires matching checksum, schema fingerprint, AND row count.
+            if (localChecksum == rm.checksum && localFp == rm.schemaFp &&
+                localRowCount == rm.rowCount) {
                 td.status = TableDiffStatus::Identical;
             } else {
                 td.status = TableDiffStatus::Different;

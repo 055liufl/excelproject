@@ -1,7 +1,8 @@
 # SQLite 同步工具实现计划
 
-> 版本：v0.4（草案）
+> 版本：v0.5（草案）
 > 日期：2026-06-25
+> 本版整改：纳入第四轮 **Codex（gpt-5.5）计划复评 S-01~S-04**（1 Critical / 1 High / 2 Medium；R-01~R-12 经复评 10 条已解决、R-03/R-04 部分解决于本版收口）——缺口 pending **复用 inbox+ledger（`seen` 未 consumed、不 ACK、三时机重扫、缺口超时→`E_SYNC_GAP`→baseline，不新建表）**（S-01/R-03 收口）、eligibility 在 **T1.11 initialize attach 前显式调用**（S-02/R-04 收口）、§4 依赖图补全 `T1.3→T1.6`/`T1.5x`/`T1.8→T1.12`/`T1.0c→T1.11`（S-03）、T1.6 **M1 仅实跑分支 A，B/C 为接口占位由消费任务接入**（S-04）。
 > 来源：`specs/SQLite-同步工具-设计文档.md` **v0.5**、`specs/SQLite-同步工具-需求文档.md` v0.5
 > 本版整改：纳入第三轮 **Codex（gpt-5.5）计划评审 R-01~R-12**（3 Critical / 5 High / 4 Medium），将设计 v0.5（第三轮设计评审 G-01~G-10）新增不变量**任务化/排序化/夹具化**——`CapturedWriteTemplate` 三分支化（入站 changeset 挂起捕获，R-02/G-03）、`RowWinnerStore` + `__sync_row_winner` + 低 rank 跨批后到夹具（R-01/G-01）、入站严格连续应用 + 缺口 pending（R-03/G-05）、同步表 eligibility（R-04/G-04）、`TransportAdapter` 拆分 + `__sync_inbox_ledger`（R-05/G-08）、`SyncContext` key 加固（R-06/G-07）、分片幂等键含 origin/epoch（R-07）、判等以校验和为准（R-08/G-06）、新错误码触发点（R-09/G-09）、迁移 stop 取消收口（R-10/G-02）、阶段 0 闸门补全（R-11）、M1b 拆 b1/b2/b3（R-12）。
 > 历史整改：第二轮 **Q-01~Q-08**（统一 `CapturedWriteTemplate`、M1 崩溃夹具、`UpsertExecutor` 提取契约、typed ACK、M1 拆 M1a/b/c、依赖排序、DoD 校正、旧写拒绝 `E_SYNC_WRITE_BLOCKED`）；第一轮 **P-01~P-13** 依赖错序已实质修复。
@@ -86,7 +87,7 @@ M1b 经设计 v0.5 新增不变量后明显过载，**内部拆 b1/b2/b3**（R-1
 | T1.3 | `ChangelogStore`（写/`readRange`；**`appendForward(origin, 原 blob, 元数据)` 供分支 A 转发，R-02**） | T1.1 | M |
 | T1.4 | `PayloadCodec`（公共头 + `ChangesetPayload`，类型化 `DecodeResult`） | T1.0a | M |
 | T1.5a | **`OutboxPublisher`（R-05/G-08）**：原子发布 `tmp→fsync→rename→.ready`；IO 失败 `E_SYNC_TRANSPORT` | T0.6 | M |
-| T1.5b | **`InboxScanner` + `InboxLedger`（R-05/G-08）**：`__sync_inbox_ledger` 制品级幂等消费；启动/watcher/timer **三时机扫描**；缺主文件留待重扫；损坏→`quarantineDir`+`E_SYNC_PAYLOAD_CORRUPT` | T0.6,T1.1 | M |
+| T1.5b | **`InboxScanner` + `InboxLedger`（R-05/S-01/G-08）**：`__sync_inbox_ledger` 制品级幂等消费；启动/watcher/timer **三时机扫描**；每轮对 `status='seen'`（未 consumed）制品**重判**——解头取 `(origin,seq)`，命中 `seq==applied_seq+1` 则交 T1.6 应用并转 `consumed`，仍 `>applied_seq+1` 维持 `seen`（缺口 pending，S-01）；缺主文件留待重扫；损坏→`quarantineDir`+`E_SYNC_PAYLOAD_CORRUPT` | T0.6,T1.1 | M |
 | T1.5c | **`AckArtifactCodec` + typed ACK（Q-04/R-05）**：`ChangesetAck` / `PushChunkAck`（`push_id/chunk_seq/total_chunks/checksum`）制品 schema + `ackMaxDelayMs` 默认 + 超时落点 | T0.6 | S |
 | T1.9 | `TableStateStore` + 增量算法（顺序无关**模加**聚合，禁全表扫描，§6.2；**high_water 仅信息量不判等，R-08**） | T1.1 | M |
 | T1.10 | 最小 `SchemaGuard::verifyPayload`（同版本同指纹才写，否则拒绝 + 错误落点） | T1.1 | S |
@@ -95,20 +96,20 @@ M1b 经设计 v0.5 新增不变量后明显过载，**内部拆 b1/b2/b3**（R-1
 
 | 任务 | 描述 | 依赖 | 规模 |
 |---|---|---|---|
-| T1.7 | **`AppliedVectorStore` 严格连续应用（R-03/G-05）**：`seq==applied_seq+1` 才应用；`seq<=applied_seq` 幂等 no-op；`seq>applied_seq+1` 入 **pending** 缓冲；持续缺口 → `E_SYNC_GAP` 回退基线 | T1.1 | M |
+| T1.7 | **`AppliedVectorStore` 严格连续应用（R-03/S-01/G-05）**：`seq==applied_seq+1` 才应用；`seq<=applied_seq` 幂等 no-op；`seq>applied_seq+1` **缺口**→**不应用、不 ACK**，对应 inbox 制品**保持 `__sync_inbox_ledger.status='seen'`（未 consumed）作为 pending**（复用台账，不新建表，S-01）；缺口由 T1.5b 三时机扫描每轮重判、补齐即应用并转 `consumed`；缺口超 `gapTimeout/阈值` → `E_SYNC_GAP` 回退基线。**崩溃安全**：pending = 文件 + ledger 行，重启后重扫续判，不丢不重复消费 | T1.1,T1.5b | M |
 | T1.7b | **`RowWinnerStore`（R-01/G-01）**：维护 `__sync_row_winner`；`ChangesetApplier` 冲突回调读 `(winning_rank, winning_origin_seq)` → REPLACE/OMIT；**仅 changeset 路径维护**（上行 UPSERT 不叠 rank，C12） | T1.1 | M |
-| T1.6 | **`CapturedWriteTemplate` 三分支（R-02/G-03 核心改写）**：<br>**A 入站 changeset**：`WriteTxn.begin → 严格连续判(T1.7) → SchemaGuard → ChangesetApplier.apply_v2(冲突回调消费 RowWinner) → AppliedVector.update → RowWinner.applyMutations → TableState.applyMutations → ChangelogStore.appendForward(原 blob+origin 元数据，**不 fresh 捕获**) → commit`；<br>**B 入站 selectionpush 分片**：`push_chunk_progress` 幂等 → SchemaGuard → fresh `SessionRecorder.begin` → `SelectionPushApplier` → markChunk → TableState → `sealInto` → commit；<br>**C 本地写(import/save)**：fresh 捕获 → `UpsertExecutor` → TableState → `sealInto` → commit。<br>T2.0b/T2.12/T3.1/T4.3 复用 B/C 分支 | T1.2,T1.3,T1.7,T1.7b,T1.9,T1.10 | XL |
+| T1.6 | **`CapturedWriteTemplate` 三分支（R-02/G-03 核心改写）**：<br>**A 入站 changeset**：`WriteTxn.begin → 严格连续判(T1.7) → SchemaGuard → ChangesetApplier.apply_v2(冲突回调消费 RowWinner) → AppliedVector.update → RowWinner.applyMutations → TableState.applyMutations → ChangelogStore.appendForward(原 blob+origin 元数据，**不 fresh 捕获**) → commit`；<br>**B 入站 selectionpush 分片**：`push_chunk_progress` 幂等 → SchemaGuard → fresh `SessionRecorder.begin` → `SelectionPushApplier` → markChunk → TableState → `sealInto` → commit；<br>**C 本地写(import/save)**：fresh 捕获 → `UpsertExecutor` → TableState → `sealInto` → commit。<br>**M1 范围（S-04）：仅实跑分支 A**（M1 唯一被驱动的写路径）；**B/C 为模板接口占位**——B 由 `T2.12` 接入（M2）、C 由 `T3.1`/`T4.3` 在 `UpsertExecutor` 提取（T2.0b-2）后接入（M3/M4），故 M1 不依赖 `UpsertExecutor` | T1.2,T1.3,T1.7,T1.7b,T1.9,T1.10 | XL |
 | T1.8 | `OutboundAckStore`（发送端锚点，按 ACK 前移，不与 applied-vector 混用） | T1.1,T1.5c | M |
 
 ##### M1b-3 — 崩溃/缺口/乱序夹具（DoD 可断言）
 
-**M1b DoD**：入站 changeset 经分支 A 落库且 **origin 不被重铸**（`apply_v2` 后 changelog 记原 origin，转发可被对端识别，R-02）；**`table_state` 随写增量更新（无全扫）**；schema 不匹配被拒；**幂等去重 + 严格连续：乱序 `seq=2` 先到不推高水位致 `seq=1` 丢更、缺口超时 `E_SYNC_GAP`（R-03）**；**A↔B 单边冲突按 `__sync_row_winner` 裁决（多源跨批留 M2，R-01）**；**inbox 半截文件/重复 watcher/启动补扫/损坏 quarantine（R-05）**；**崩溃零窗口（T1.0a 夹具在提交前/seal 后/commit 后注入，重启断言业务+changelog+applied_vector+row_winner+ledger 原子一致，Q-02 扩展）**。
+**M1b DoD**：入站 changeset 经分支 A 落库且 **origin 不被重铸**（`apply_v2` 后 changelog 记原 origin，转发可被对端识别，R-02）；**`table_state` 随写增量更新（无全扫）**；schema 不匹配被拒；**幂等去重 + 严格连续：乱序 `seq=2` 先到不推高水位致 `seq=1` 丢更、缺口超时 `E_SYNC_GAP`（R-03）；缺口 pending（ledger `seen`）跨崩溃重启重扫续判，不丢不重复消费（S-01）**；**A↔B 单边冲突按 `__sync_row_winner` 裁决（多源跨批留 M2，R-01）**；**inbox 半截文件/重复 watcher/启动补扫/损坏 quarantine（R-05）**；**崩溃零窗口（T1.0a 夹具在提交前/seal 后/commit 后注入，重启断言业务+changelog+applied_vector+row_winner+ledger 原子一致，Q-02 扩展）**。
 
 #### M1c — 门面 / 状态机 / 观测 / 旧写收口
 
 | 任务 | 描述 | 依赖 | 规模 |
 |---|---|---|---|
-| T1.11 | `ISyncEngine` 8 方法 + `createSyncEngine(bridge)` + 最小可观测（state 快照 / error 环 / `bytesPacked·bytesApplied·changesApplied·conflicts·lastAckedSeq`） | M1b | L |
+| T1.11 | `ISyncEngine` 8 方法 + `createSyncEngine(bridge)` + 最小可观测（state 快照 / error 环 / `bytesPacked·bytesApplied·changesApplied·conflicts·lastAckedSeq`）；**`initialize()` 在 open `wconn` 后、session attach 前显式调 `SchemaEligibility::verify`(T1.0c)，不合格 → `E_SYNC_UNSUPPORTED_SCHEMA` 且不进入同步模式（S-02/R-04）** | M1b,T1.0c | L |
 | T1.12 | 双状态机：前台 `Exporting=等ACK/percent=-1`，足额 ACK 才 `Completed`，**超时→`Failed` 且落 `E_SYNC_ACK_TIMEOUT`（R-09/G-09，区别于泛 Failed）**；后台 Pipeline | T1.11 | M |
 | T1.13 | sync-aware 写边界：同步激活后同步表写仅经 `wconn`；**旧 `DataBridge::importExcel` 对同步表统一返回 `E_SYNC_WRITE_BLOCKED`（M1 选拒绝，不做改道；改道留 T3.3，Q-08）**；`db_` 对同步表只读 | T1.11 | M |
 
@@ -187,25 +188,34 @@ M1b 经设计 v0.5 新增不变量后明显过载，**内部拆 b1/b2/b3**（R-1
 graph TD
     M0{{阶段0(含row_winner原型)}} --> T10a["T1.0a 基础+全量码+崩溃夹具"] --> T10b["T1.0b 写线程+key加固"] --> T11["T1.1 DDL(含row_winner/ledger)"]
     T10a --> T10c["T1.0c eligibility"]
-    T11 --> T17["T1.7 AppliedVector(严格连续)"]
+    M0 --> T15a["T1.5a OutboxPublisher"]
+    M0 --> T15c["T1.5c AckCodec/typed ACK"]
+    T11 --> T17["T1.7 AppliedVector(严格连续/pending)"]
     T11 --> T17b["T1.7b RowWinnerStore"]
     T11 --> T19["T1.9 TableState"]
     T11 --> T110["T1.10 SchemaGuard"]
     T11 --> T12["T1.2 SessionRecorder"]
-    T11 --> T15b["T1.5b InboxLedger/扫描"]
-    T17 --> T16["T1.6 三分支模板"]
+    T11 --> T13["T1.3 ChangelogStore/appendForward"]
+    T11 --> T15b["T1.5b InboxScanner/Ledger"]
+    T15b --> T17
+    T17 --> T16["T1.6 三分支模板(M1:仅A)"]
     T17b --> T16
     T19 --> T16
     T110 --> T16
     T12 --> T16
-    T10c --> T16
-    T16 --> T111["T1.11 ISyncEngine8+观测"] --> T113["T1.13 旧写拒绝"] --> M1{{M1}}
+    T13 --> T16
+    T15c --> T18["T1.8 OutboundAckStore"]
+    T16 --> T111["T1.11 ISyncEngine8+观测+initialize调eligibility"]
+    T10c --> T111
+    T18 --> T112["T1.12 双状态机/ACK超时"]
+    T111 --> T112 --> T113["T1.13 旧写拒绝"] --> M1{{M1}}
     M1 --> T20a["T2.0a 回归扩充"] --> T20b1["T2.0b-1 契约冻结"] --> T20b2["T2.0b-2 提取"]
     T20b2 --> T212["T2.12 SelectionPushApplier"]
     M1 --> T29["T2.9 PushProgress"] --> T210["T2.10 ChunkStreamer"] --> T212
     T16 --> T212
     T212 --> T213["T2.13 syncSelected"]
-    M1 --> T22["T2.2 ConflictArbiter(配胜者)"] --> T23["T2.3 RebaseEngine"] --> T24["T2.4 攒批广播"]
+    T18 --> T21["T2.1 RoutingTable"] --> T24["T2.4 攒批广播"]
+    M1 --> T22["T2.2 ConflictArbiter(配胜者)"] --> T23["T2.3 RebaseEngine"] --> T24
     T17b --> T22
     T213 --> M2{{M2}}
     T24 --> M2
@@ -223,7 +233,7 @@ graph TD
 
 | 性质 | 断言 | 阶段 |
 |---|---|---|
-| 幂等 + 严格连续（C6/G-05） | 同 `(origin,epoch,seq)` 重投 → no-op；**乱序 `seq=2` 先到不致 `seq=1` 丢更；缺口超时 → `E_SYNC_GAP`** | M1b（R-03） |
+| 幂等 + 严格连续 + pending（C6/G-05） | 同 `(origin,epoch,seq)` 重投 → no-op；**乱序 `seq=2` 先到不致 `seq=1` 丢更；缺口 pending(ledger `seen`)崩溃重启续判不丢不重；缺口超时 → `E_SYNC_GAP`** | M1b（R-03/S-01） |
 | 逐行胜者到达序无关（FR-6/G-01） | **高 rank 先到提交、低 rank 跨批后到不覆盖**；B/D 反序到达终态一致 | M1b(A↔B)/M2(多源)（R-01） |
 | origin 不重铸（FR-9/G-03） | 入站 changeset 经分支 A apply 后 changelog 记**原 origin**、转发可被对端识别 | M1b（R-02） |
 | 同步表 eligibility（FR-2/G-04） | 无 PK 表/视图/影子表/不可用冲突目标 → `E_SYNC_UNSUPPORTED_SCHEMA`，拒绝初始化 | M1a（R-04） |

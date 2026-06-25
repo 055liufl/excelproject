@@ -1,8 +1,9 @@
 # SQLite 同步工具设计文档
 
-> 版本：v0.4（草案）
+> 版本：v0.5（草案）
 > 日期：2026-06-25
-> 本版回填：补齐实现计划阶段（plan 评审 Q-01/Q-04/Q-08）确立、但设计 v0.3 尚未体现的 3 处设计↔计划一致性缺口——统一 **`CapturedWriteTemplate`**（Q-01）、**typed ACK**（`ChangesetAck`/`PushChunkAck`，Q-04）、错误码 **`E_SYNC_WRITE_BLOCKED`**（Q-08）。
+> 本版整改：纳入第三轮 **Codex（gpt-5.5）设计评审 G-01~G-10**（1 Critical / 6 High / 3 Medium）——**逐行胜者状态**保证多源仲裁到达序无关（G-01，新增 `__sync_row_winner`，§5.6/§6.1）、**长推送撞迁移半截语义**与排空/再基线收口对齐（G-02，§5.5/§8.2 引用）、`CapturedWriteTemplate` **按载荷类型分支**（入站 changeset 挂起本地捕获、`origin` 仅元数据、rebaser 仅限 `apply_v2` 路径，G-03，§5.4/§5.6）、**同步表 eligibility 校验**（G-04，新增 `E_SYNC_UNSUPPORTED_SCHEMA`，§4.4/§5.1）、**入站严格连续应用** + 选择推送分片幂等分离（G-05，§5.4/§6）、**表级判等以校验和为准**（high_water 仅信息，G-06，§6.2）、**`SyncContext` 键加固**为 OS 文件标识（G-07，§2.4/§4.3）、**`TransportAdapter` 子设计**补全（G-08，§5.11）、补齐 `E_SYNC_ACK_TIMEOUT/REBASE_FAILED/BASELINE_FAILED` 触发点（G-09，§4.6）、**NFR 追溯**（G-10，§14.4）。
+> 上版回填（v0.4）：plan 评审 Q-01/Q-04/Q-08 确立的 3 处设计↔计划缺口——统一 **`CapturedWriteTemplate`**（Q-01）、**typed ACK**（`ChangesetAck`/`PushChunkAck`，Q-04）、错误码 **`E_SYNC_WRITE_BLOCKED`**（Q-08）。
 > 对应需求：`specs/SQLite-同步工具-需求文档.md` v0.4（FR-1~FR-17、共识 C1~C17、Codex 整改 F-01~F-20）
 > 本版整改：纳入第二轮 **Codex（gpt-5.5）设计评审 E-01~E-15**（3 Critical / 9 High / 3 Medium），修复 v0.2 引入的回归与未收口契约——**`Exporting` 完成条件回到"全片 ACK"**（E-02 回归修复）、sync-aware 写边界（E-01）、**可执行 DDL**（E-04）、apply 三件套同事务模板（E-05）、rebase 算法链路（E-06）、`RowMutation` 写入抽象（E-08）、长推送半截语义（E-10）、`sync_table_state` 增量维护算法（E-09）等。
 > 历史：v0.2 纳入第一轮设计评审 D-01~D-28（线程/连接模型、载荷二分、阶段 0 硬验收、双状态机），删除违反 FR-1 的"CDC 兜底"回退。
@@ -188,7 +189,7 @@ graph LR
 
 规则：
 
-1. **唯一写连接**：`SyncWorker` 在自身线程 `addDatabase`（独立 connName）打开**指向同一 `.db`** 的写连接 `wconn`，`SqliteHandle::of(wconn)` 取 `sqlite3*` 仅在本线程使用。**所有写**（changeset apply、上行 UPSERT、import/export、场景2 save、广播打包前的本地捕获）作为任务入**写队列**，在该线程串行执行 → 天然无写写冲突、无死锁。
+1. **唯一写连接**：`SyncWorker` 在自身线程 `addDatabase`（独立 connName）打开**指向同一 `.db`** 的写连接 `wconn`，`SqliteHandle::of(wconn)` 取 `sqlite3*` 仅在本线程使用。"同一 `.db`" 的唯一性由 **OS 文件标识**（非路径字符串）判定，规程见 §4.3（G-07）——否则路径别名会拆出第二个 `wconn`、破坏单写者。**所有写**（changeset apply、上行 UPSERT、import/export、场景2 save、广播打包前的本地捕获）作为任务入**写队列**，在该线程串行执行 → 天然无写写冲突、无死锁。
 2. **禁止移交 `db_`**：现有 `DataBridge::db_`（主线程）不交给后台线程；`IBatchTransfer` 后台导入复用的是 `wconn`（`ImportService::run` 无状态、连接参数化，传入 `wconn` 即可），元数据（`catalog_`/`profiles_`）为连接无关只读数据可共享。
 3. **读用独立连接**：WAL 下读者不阻塞写者；场景2 物化、闭包解析各自用只读连接（本线程创建）；getter 不读库，只返回加锁快照。
 4. **跨线程只传值**：线程间仅传递 `QByteArray` 载荷、值类型快照、任务描述；绝不传 `QSqlQuery`/`sqlite3*`。
@@ -320,13 +321,14 @@ graph LR
 | **ConflictArbiter / RebaseEngine** | 规范序仲裁（C7）；从 apply_v2 收集 rebase buffer 经 `sqlite3rebaser_*` 生成权威下行（D-13） | 不传输 |
 | **Anchor(=OutboundAckStore)** | **仅发送端** outbound ACK 水位（D-19）；裁剪/重发/截断依据 | 不表示接收端状态 |
 | **AppliedVectorStore** | **仅接收端** `(origin, stream_epoch)` 幂等去重 | 不发 ACK |
-| **TableStateStore** | 每表 schema 指纹/高水位/校验和增量维护（FR-12/F-17，D-11） | 不在比对时全表扫描 |
+| **TableStateStore** | 每表 schema 指纹/校验和/行数增量维护（FR-12/F-17，D-11）；high_water 仅信息（G-06） | 不在比对时全表扫描、不以 high_water 判等 |
+| **RowWinnerStore（G-01）** | 维护 `__sync_row_winner`，冲突回调据 `(rank,seq)` 裁决 REPLACE/OMIT，保证到达序无关 | 不参与 UPSERT/上行路径（C12 不叠 rank）、不传输 |
 | **SchemaGuard / QuarantineStore** | 版本比较、指纹兜底、隔离 + 重放 | 不传播 DDL |
 | **BaselineManager / DeadPeerEvictor / RoutingTable** | 基线构建；三维阈值逐出 + outbox 坍缩；防回声路由 | 不删对端业务数据 |
 | **SelectionResolver / FkClosureBuilder / ConsistencyCache / FrozenManifest / ChunkStreamer** | 解析选择集、外键闭包（读快照）、一致性剪枝、冻结清单、分片续传 | 不落库（交 UpsertExecutor）、不渲染 |
 | **InboundTableGate（D-16）** | 场景2 会话期暂停"被比对表"的 inbox 应用并排队，save/discard 后放行 | 不渲染、不仲裁 |
 | **DiffEngine / StagingBuffer** | 比对（依赖 TableStateStore，零全量拉取）、内存暂存合并 | 不落库（交 UpsertExecutor） |
-| **TransportAdapter（Outbox/Inbox/Ack）** | 写出/监听文件制品、收发 ACK | 不搬运文件、不解码业务语义 |
+| **TransportAdapter（Outbox/Inbox/Ack）** | 写出/监听文件制品、原子发布、维护 inbox 消费台账、三时机扫描、收发 typed ACK（§5.11，G-08） | 不搬运文件、不解码业务语义 |
 | **BatchTransfer（IBatchTransfer 实现）** | 在 `DataBridge` 上包非阻塞调度 + 轮询，导入跑在写线程的 `wconn` | 不重写 ETL、不用 `db_` 后台写 |
 
 ---
@@ -353,8 +355,9 @@ public:
     virtual SyncResult result() const = 0;                                           // ⑧ 结果
     virtual bool syncSelected(const SyncSelection& selection, QString* err = nullptr) = 0; // ⑨ 上行选择性推送
 };
-// 工厂绑定 DataBridge：以其 canonical db path 为 key 取/建共享 SyncContext（含 ForegroundGate、wconn 写线程），
-// 与 createBatchTransfer(bridge) 自动共享门控（E-07，细化需求 §5.3 无参工厂）。
+// 工厂绑定 DataBridge：以其库的 OS 文件标识（dev/inode 或 Windows FileIndex，见 §4.3 G-07）为 key
+// 取/建共享 SyncContext（含 ForegroundGate、wconn 写线程），与 createBatchTransfer(bridge) 自动共享门控
+// （E-07，细化需求 §5.3 无参工厂）。
 DBRIDGE_EXPORT std::unique_ptr<ISyncEngine> createSyncEngine(DataBridge& bridge);
 ```
 
@@ -389,13 +392,34 @@ public:
 DBRIDGE_EXPORT std::unique_ptr<IBatchTransfer> createBatchTransfer(DataBridge& bridge);
 ```
 
-**门控作用域（D-22 / E-07）**：进程内维护一张 **`SyncContext` 注册表**，key = **canonical db path**（同一 `.db` → 同一 context，含唯一 `ForegroundGate` 与 `wconn` 写线程）。`createBatchTransfer(bridge)` 与 `createSyncEngine(bridge)` 经各自 `bridge` 解析到同一 key → **共享同一门控**，保证"导入/导出/sync/syncSelected"在同库单活动互斥；不同 `.db` 互不影响。导入在 `wconn` 上跑 `ImportService::run`（复用元数据，不用 `db_`）。进度由 `onPrefetch` 同型钩子填充。**跨进程**对同一 `.db` 的并发同步**为非目标**：外进程的写按 FR-2 视为"外部写"（`data_version` 检测）；若部署上确有跨进程需求，用 OS lock file 互斥（留扩展，本期不实现）。
+**门控作用域（D-22 / E-07）**：进程内维护一张 **`SyncContext` 注册表**（同一 `.db` → 同一 context，含唯一 `ForegroundGate` 与 `wconn` 写线程）。`createBatchTransfer(bridge)` 与 `createSyncEngine(bridge)` 经各自 `bridge` 解析到同一 key → **共享同一门控**，保证"导入/导出/sync/syncSelected"在同库单活动互斥；不同 `.db` 互不影响。
+
+**注册表 key 加固（G-07）**：仅用 "canonical db path" 作 key **不足以**保证"唯一写连接"——SQLite URI（`file:foo.db?...`）、相对/绝对路径、符号链接、硬链接（不同路径同 inode）、Windows 大小写不敏感、文件尚未创建时 realpath 为空等，都可能把同一物理库解析成两个 key → 建出两个 `wconn` → **破坏 §2.4 单写者根基**。故 key 解析按以下规程（首次 open 后执行，后续以 OS 文件标识为权威）：
+
+1. 打开连接后 `PRAGMA database_list` 取 **main 库的已解析绝对路径**（消解 URI 与相对路径）。
+2. 对该路径 `stat`，取 **OS 文件标识**作为 key 主体：POSIX = `(st_dev, st_ino)`；Windows = 卷序列号 + `nFileIndexHigh/Low`（`BY_HANDLE_FILE_INFORMATION`）——天然消解符号链接/硬链接/大小写差异。
+3. 文件尚不存在（首次创建）时，先以 **归一化路径**（URI 解析 + 大小写折叠平台 casefold）临时占位，open/建库成功后立即改挂到 OS 文件标识 key，并校验无第二注册项抢先。
+4. 注册表读写由 **进程内 registry mutex** 保护，按 key 引用计数（refcount）；末位释放才析构 `SyncContext`。
+5. 兜底校验：在库内 `__sync_*` 元数据中写一个 **`context_uuid`**（首建时生成），同一 key 复用前比对，二次确认未把两个物理库误并为一。
+
+**跨进程**对同一 `.db` 的并发同步仍为非目标（见下）；OS 文件标识 key 仅解决**进程内**唯一性。导入在 `wconn` 上跑 `ImportService::run`（复用元数据，不用 `db_`）。进度由 `onPrefetch` 同型钩子填充。**跨进程**对同一 `.db` 的并发同步**为非目标**：外进程的写按 FR-2 视为"外部写"（`data_version` 检测）；若部署上确有跨进程需求，用 OS lock file 互斥（留扩展，本期不实现）。
 
 ### 4.4 配置装配（Builder · 字段以需求 §5.2/§5.6 为准，D-14）
 
 本设计实现**必须逐项包含**需求 §5.2 `SyncConfig::Builder` 全部字段（`nodeId/role/centerNodeId/addPeerNode/database/syncTables/outboxDir/inboxDir/quarantineDir/conflictPolicy/originPriority/peerLag{Soft,Hard}{Limit,Bytes,Ms}/outboxMax{Bytes,Artifacts}PerPeer/ackMaxDelayMs/baselineSizeWarnBytes/schemaVersion/changelogRetention/verifySchemaFingerprint/autoSyncAfterImport/broadcastIntervalMs/broadcastThreshold/maxSelectionSize/pushChunkBudgetBytes/consistencyCacheDurable`）与 §5.6 `SyncSelection::Builder`（`addRecord/addRecords/addWhere/includeFkDependencies/pruneConsistentDependencies`）。`build(QString*)` 做完整性校验，产出**不可变值对象**（线程安全跨线程传值）。
 
 **`addWhere` 安全（D-25，对齐需求 §13 开放项）**：MVP **仅实现"表 + 主键集合"**；`addWhere` 暂不接受原始 SQL 直通——开放项关闭前，只允许经参数绑定编译的**受限 DSL**（禁多语句/子查询/函数副作用），否则 `build` 拒绝。
+
+**同步表 eligibility 校验（G-04，`initialize` 硬前置）**：SQLite Session 对表有**硬性限制**——**无显式 PRIMARY KEY 的表 `attach` 不报错但变更被静默丢弃、虚表/视图不支持**（已核 SQLite 官方 Session 文档）。若放任 `syncTables` 配任意表，会出现"配置成功但变更从未被捕获"的**静默漏同步**。故 `initialize` 在 attach 前对每张同步表（空集合时为全部用户表）逐表校验，任一不合格 → `E_SYNC_UNSUPPORTED_SCHEMA` 并拒绝进入同步模式（不静默跳过）：
+
+| 校验项 | 要求 | 不合格后果 |
+|---|---|---|
+| 表类型 | 必须是普通 rowid 表或 `WITHOUT ROWID` 表 | 虚表/影子表/视图 → 拒绝 |
+| 主键 | 必须有**显式、非空** PRIMARY KEY（或配置声明的 sync key）；无 PK 表 Session 不记录 | 无显式 PK → 拒绝 |
+| 生成列 | 生成列（`GENERATED ALWAYS`）**不进入** INSERT/UPDATE 写列与指纹编码 | 仅排除该列，不拒整表 |
+| 冲突目标 | UPSERT 的 `ON CONFLICT` 目标须为**完整**唯一索引；**partial / 表达式唯一索引不得作冲突目标** | 选不出可用冲突目标 → 拒绝该表 |
+
+校验复用 `SchemaIntrospector`（`PRAGMA table_info`/`index_list`/`foreign_key_list`）；通过后记录每表的 PK 列与冲突目标，供 `UpsertExecutor`/`RowMutation.pkColumns` 复用。
 
 ### 4.5 公共类型与场景2 接口
 
@@ -425,6 +449,10 @@ namespace dbridge::err {
     inline constexpr const char* E_SYNC_PUSH_SCHEMA_MOVED    = "E_SYNC_PUSH_SCHEMA_MOVED";
     inline constexpr const char* E_BUSY                      = "E_BUSY";
     inline constexpr const char* E_SYNC_WRITE_BLOCKED        = "E_SYNC_WRITE_BLOCKED";
+    inline constexpr const char* E_SYNC_UNSUPPORTED_SCHEMA   = "E_SYNC_UNSUPPORTED_SCHEMA"; // G-04
+    inline constexpr const char* E_SYNC_ACK_TIMEOUT          = "E_SYNC_ACK_TIMEOUT";         // G-09
+    inline constexpr const char* E_SYNC_REBASE_FAILED        = "E_SYNC_REBASE_FAILED";       // G-09
+    inline constexpr const char* E_SYNC_BASELINE_FAILED      = "E_SYNC_BASELINE_FAILED";     // G-09
     // Warning
     inline constexpr const char* W_SYNC_CONFLICT_REPLACED      = "W_SYNC_CONFLICT_REPLACED";
     inline constexpr const char* W_SYNC_BASELINE_LARGE         = "W_SYNC_BASELINE_LARGE";
@@ -448,6 +476,10 @@ namespace dbridge::err {
 | `W_SYNC_CONCURRENT_MANUAL_PUSH` | 中心短窗口内同 PK 两次 DoUpdate | 末者胜，不自动裁决 | `warnings()` 留痕 | 两边缘并发推同 PK → 告警 |
 | `W_SYNC_UNTRACKED_CHANGE` | `data_version`/校验和检出外部写 | 进 re-baseline required，暂停发布 | `warnings()` + re-baseline | 带外改库 → 告警 + 重算 |
 | `E_SYNC_WRITE_BLOCKED` | 同步激活后旧 API（如 `db_` 上的 `importExcel`）对**同步表**写 | 拒绝该写、不进 session | 返回 false / `errors()` | 旧 importExcel 写同步表 → 被拒（M1 收口，plan Q-08） |
+| `E_SYNC_UNSUPPORTED_SCHEMA` | initialize：同步表无显式 PK / 为虚表/视图/影子表 / 无可用冲突目标（G-04） | 拒绝初始化、不 attach | `state` 不进同步；返回 false | 配无 PK 表 / 视图为同步表 → 必报 |
+| `E_SYNC_ACK_TIMEOUT` | `Exporting` 超 `ackMaxDelayMs` 容限仍未收足额 ACK（G-09，原仅落 Failed） | 释放前台门控 | `state=Failed` 且 `errors()` 标本码（区别于后台错误，提示"可重试 sync()"） | 不回 ACK → 超时落 `E_SYNC_ACK_TIMEOUT`（非泛 Failed） |
+| `E_SYNC_REBASE_FAILED` | `sqlite3rebaser_*` 链路失败 / rebase buffer 不可用（G-09） | 本轮广播作废、`WriteTxn.rollback` | 后台 `errors()`，下行不外发 | 注入 rebaser 失败 → 本轮不广播、报本码 |
+| `E_SYNC_BASELINE_FAILED` | `BaselineManager.exportBaseline/applyBaseline` 失败（G-09） | 基线事务回滚、保留旧锚点 | `errors()`；提示重试/换路 | 基线导出/应用失败 → 报本码、不污染锚点 |
 
 ---
 
@@ -461,8 +493,15 @@ public:
     static sqlite3* of(QSqlDatabase& db);     // 在 db 所属线程调用；driver()->handle()
     static bool sessionAvailable(sqlite3* h); // PRAGMA compile_options / 运行期探测
 };
+// 同步表 eligibility 校验（G-04，§4.4 表）：普通表 + 显式非空 PK + 可用冲突目标；拒虚表/视图/影子表。
+class SchemaEligibility {
+public:
+    // 逐表校验；不合格表名与原因经 errors 回填，整体不合格返回 false（→ E_SYNC_UNSUPPORTED_SCHEMA）。
+    static bool verify(QSqlDatabase& wconn, const QStringList& syncTables,
+                       SchemaIntrospector&, QStringList* rejected, QString* err);
+};
 ```
-`initialize` 在写线程探测；不可用 → `E_SYNC_SESSION_UNAVAILABLE`，拒绝同步，**不降级**（D-17）。
+`initialize` 在写线程探测：Session 不可用 → `E_SYNC_SESSION_UNAVAILABLE`（不降级，D-17）；同步表不合格 → `E_SYNC_UNSUPPORTED_SCHEMA`（G-04）；二者均**先于** attach/进入同步模式。
 
 ### 5.2 事务所有权 + 同事务收割（D-02 / F-01）
 
@@ -537,23 +576,46 @@ public:
 ```
 **职责切分（E-08）**：`ImportService` 只负责 Excel/Profile → `RowMutation`；`UpsertExecutor` 只负责 `RowMutation` → SQL（prepared 缓存 + 批量）+ 事务内落库。两通道仅共享 `WriteTxn` + `SchemaGuard` + `ErrorCollector`，**不共享行写实现**。`SqlBuilder::buildUpsert` 小幅扩展支持强制 `DO NOTHING`。
 
-**`CapturedWriteTemplate` —— 所有 `wconn` 本地写的统一模板（Q-01 回填，E-05 强化）**：
+**`CapturedWriteTemplate` —— 所有 `wconn` 本地写的统一模板（Q-01 回填，E-05 强化，G-03/G-05/G-01 分支化）**：
 
-不止"入站 apply"，而是**四类写都走同一模板**——入站 changeset 重放、上行 UPSERT、Excel 导入、场景2 save。模板保证每次写都被 session 捕获进 changelog 且 `table_state` 增量维护；其中**幂等判定 / SchemaGuard 校验 / applied-vector 推进仅对"入站"分支**（入站载荷才有远端 `(origin,epoch,seq)` 与 schema 版本；本地 import/save 无远端来源，跳过这三步，绝不被卡）。由 `SyncWorker` 在 `wconn` 包事务，固定编排：
+四类写共用同一**事务骨架与 `table_state` 维护**，但**捕获方式与前置校验按载荷类型分支**——统一不等于"无差别同一步骤"。错误在于把入站 changeset 也当成"需 fresh session 捕获"：SQLite changeset **blob 本身不承载 `origin`**（origin 只是 changelog/payload 的**元数据列**，见 §6.1 `__sync_changelog.origin`）；入站 changeset 重放必须**挂起本地捕获、原样保留 origin 元数据供转发**（需求 §4.9：不铸新 origin、挂起本地捕获），否则会被中心 session 重捕成"中心 origin"，破坏防回声与 rebase 来源。三分支：
+
+| 分支 | 触发 | 幂等键/校验 | 捕获方式 | changelog 写入 |
+|---|---|---|---|---|
+| **A 入站 changeset** | 下行/自动增量（远端 origin） | **严格连续**（G-05）+ SchemaGuard + **逐行胜者**（G-01） | **挂起 fresh 捕获**（§5.6） | **原 changeset blob** + origin 元数据（供转发/rebase） |
+| **B 入站 selectionpush 分片** | 上行 UPSERT（远端 origin=B） | `(origin,epoch,push_id,chunk_seq)` 经 `push_chunk_progress`（G-05）+ SchemaGuard | **fresh 捕获**（UPSERT 产物需变 changeset 转发） | session 捕获的 changeset + origin=B 元数据 |
+| **C 本地写** | import / 场景2 save（本地 origin） | 无（本地无远端来源，不卡） | **fresh 捕获** | session 捕获的 changeset + 本地 origin |
 
 ```
-WriteTxn.begin()                      // BEGIN IMMEDIATE（唯一写连接）
-if isInbound:                         // 仅入站：下面三步本地写跳过
-    if AppliedVectorStore.seen(origin,epoch,seq): WriteTxn.rollback(); return noop   // 幂等先判
-    SchemaGuard.verifyPayload(...)     // 版本/指纹不符 → 拒绝（E_SYNC_SCHEMA_MISMATCH）
-SessionRecorder.begin(h, syncTables)  // 捕获本次写（下行重放保留 origin 并挂起本地捕获，见 §5.6）
-业务写：ChangesetApplier.apply(...) | SelectionPushApplier.applyChunk(...) | UpsertExecutor.apply(RowMutation...)  // import/save 走 UpsertExecutor
-if isInbound: AppliedVectorStore.update(origin, epoch, seq)
-TableStateStore.applyMutations(...)   // 所有写都增量维护表态（§6 E-09；DiffEngine 可信前提）
-SessionRecorder.sealInto(h, ChangelogStore, txn, &localSeq)         // 同事务写 changelog
-WriteTxn.commit()                     // 单一 COMMIT：业务写 + (向量) + 表态 + changelog 原子
+WriteTxn.begin()                            // BEGIN IMMEDIATE（唯一写连接）
+
+# —— 分支 A：入站 changeset —— #
+if kind == InboundChangeset:
+    # G-05 严格连续：杜绝乱序高水位误判（单调高水位下 seq2 先到会让 seq1 被当成已见）
+    if seq <= applied_seq(origin,epoch):     WriteTxn.rollback(); return noop      # 已见，幂等 no-op
+    if seq >  applied_seq(origin,epoch)+1:   WriteTxn.rollback(); enqueuePending(); maybe E_SYNC_GAP→baseline   # 缺口，入 pending
+    SchemaGuard.verifyPayload(...)           # 版本/指纹不符 → E_SYNC_SCHEMA_MISMATCH
+    # 不调用 SessionRecorder.begin（挂起本地捕获，§5.6）
+    ChangesetApplier.apply_v2(h, blob, conflictCb)   # 冲突回调消费 __sync_row_winner（G-01，见 §5.6）
+    AppliedVectorStore.update(origin, epoch, seq)     # 高水位前移到 seq（连续保证下即 +1）
+    RowWinnerStore.applyMutations(...)        # G-01：逐行胜者随本次裁决推进（仅 changeset 路径）
+    TableStateStore.applyMutations(...)       # §6.2 增量表态
+    ChangelogStore.appendForward(origin, blob, ...)   # 存"原 blob + origin 元数据"，不 fresh 捕获
+
+# —— 分支 B/C：selectionpush 分片 / 本地写 —— #
+else:
+    if kind == InboundSelectionPush:
+        if PushProgress.chunkApplied(push_id, chunk_seq): WriteTxn.rollback(); return noop   # G-05 分片幂等
+        SchemaGuard.verifyPayload(...)
+    SessionRecorder.begin(h, syncTables)      # fresh 捕获（UPSERT/import/save 的行写需变 changeset 转发）
+    业务写：SelectionPushApplier.applyChunk(...) | UpsertExecutor.apply(RowMutation...)
+    if kind == InboundSelectionPush: PushProgress.markChunk(push_id, chunk_seq)
+    TableStateStore.applyMutations(...)        # §6.2 增量表态
+    SessionRecorder.sealInto(h, ChangelogStore, txn, &localSeq)   # 同事务写 changelog（origin=B 或本地）
+
+WriteTxn.commit()                             # 单一 COMMIT：业务写 + 向量/胜者/表态 + changelog 原子
 ```
-任一步失败 → `WriteTxn.rollback()`，向量/表态/changelog 一并回退，无半提交。`SelectionPushApplier`/`UpsertExecutor`/`ImportService` 与场景2 `StagingBuffer.save` 均**复用本模板**（不各自起事务），这是"所有写路径都维护 changelog+table_state"的落点。
+任一步失败 → `WriteTxn.rollback()`，向量/胜者/表态/changelog 一并回退，无半提交。三分支共享 `WriteTxn` + `SchemaGuard`（仅入站）+ `ErrorCollector` + `TableStateStore` 维护，**不各自起事务**——这是"所有写路径都维护 changelog+table_state"的落点；但**入站 changeset 走"原 blob 转发"而非 fresh 捕获**（G-03），**selectionpush 分片幂等独立于 changeset 高水位**（G-05）。
 
 **typed ACK（Q-04 回填）**：`AckChannel` 的 ACK 不是单一概念，分两型，经同一文件通道回送（`ackMaxDelayMs` 内以专用 ack 制品发出，捎带仅作优化）：
 
@@ -586,25 +648,54 @@ struct FrozenEntry { RecordRef ref; RecordKind kind; int topoIndex; QByteArray f
 
 **ReadSnapshot 契约（E-11）**：闭包解析在**读线程**的**只读连接**上进行——`BEGIN`（WAL 固定一致性快照）→ `resolvePk` + `build`（取行值、判悬挂父、算指纹、剪枝）→ 物化 `FrozenManifest` 后**立即 `COMMIT` 释放快照**（不长持读事务，护 WAL，C16）。`ConsistencyCache` 的读写与写线程的"权威盖章"用**独立 mutex** 或"写线程发布快照"方式同步，避免读/写线程竞态；剪枝判定读取的是发布后的一致视图。
 
-**长推送半截语义（E-10）**：分片在中心**直接落真实表**（依赖父 `DoNothing` 无害、直选子 `DoUpdate` 落地），但中心**推迟向 C/D 广播本 push 的直选变更，直到 `push_progress.status=done`（全片 ACK）**——故"最终全有"成立期间，半截状态**不外泄**到下游。中断 → 靠 `push_chunk_progress` + applied-vector 幂等**续传补齐**；`E_SYNC_PUSH_SCHEMA_MOVED` → `status=failed`，已落片由新 schema 下**重新快照整发重推**幂等覆盖/补齐（不跨片回滚，C17）。
+**长推送半截语义（E-10 / G-02 澄清）**：分片在中心**直接落真实表**（依赖父 `DoNothing` 无害、直选子 `DoUpdate` 落地）。需求 C13/§4.5-R2 明确选择性推送"**不要求所有片落同一事务**、语义为可续 + 幂等 + **FK 安全** + 最终全有、**不跨片回滚**"——故本设计**不引入 per-push staging 表**（那将违背"不跨片回滚/最终全有"并重新引入"一次性大事务"，与分片续传相悖）。半截状态的安全性由下列**三道边界**共同保证，而非靠暂存：
 
-### 5.6 冲突仲裁与 rebase（D-13 / E-06）
+1. **FK 安全（恒成立）**：分片按拓扑序"父片不晚于子片"，每片单原子事务。任意中断点：已落子行的父行必已在更早片落地 → **绝无 FK 悬挂**；半截 = "有效但不完整"，非"脏/坏"。
+2. **不外泄下游**：中心**推迟向 C/D 广播本 push 的直选变更，直到 `push_progress.status=done`（全片 ACK）**——半截**不外泄**。中心**本地**查询可见半截属**设计内**（中心是权威源，本地可见在途推送的已落片不破坏全域一致；下游只见"全有"）。
+3. **撞迁移的收口（与 §8.2 对齐）**：长推送横跨 schema 迁移时——
+   - **主路径**：迁移静默窗（§8.2 step-1）**先排空在途选择性推送**才允许 DDL：`等其 status=done` **或** 对在途 push `stop()`。无论哪种，DDL **不在 mid-push 半截上执行**。
+   - **被 `stop()` 取消的 push**：其已落片留作"有效但不完整"的本地行，由迁移强制的 **re-baseline（§8.2 step-4）整表重算收口**——迁移后该表基线即权威切面，残留片被基线覆盖对齐，不需逐片回滚。
+   - **竞态兜底**：若押旧 `schema_ver` 的片在迁移后才到达 → 中心按 `push_id` **整发拒收 `E_SYNC_PUSH_SCHEMA_MOVED`**（该 push **整体不落任何片**，故无新增半截）；B 在新 schema 下**重新快照整发重推**，对同批 PK 的 UPSERT 幂等自愈。
 
-`ConflictArbiter`：自动路径按 `(origin rank, seq)` 规范序应用（C7）。
+> 措辞统一（G-02）：§4.6 触发表"整发作废"**专指竞态兜底中被拒收的那一发**（整体不落片）；它与"先前已落片由 re-baseline 收口"不矛盾——前者是**被拒的新 push**，后者是**被取消/完成的旧 push** 的残留，二者由不同机制处理。普通中断（非迁移）则靠 `push_chunk_progress` + 分片幂等**续传补齐**，终态与不中断一致。
 
-**广播载荷的来源 —— 中心 changelog（E-06 关键澄清）**：下行广播**不是直接转发入站原始载荷**，而是以**中心自身 changelog 为源**。原因：
+### 5.6 冲突仲裁与 rebase（D-13 / E-06 / G-01 / G-03）
 
-- **下行 changeset 重放**（origin=B 的入站）：中心 `apply_v2` 时**挂起本地捕获、保留 origin=B**（不铸新 origin，C2/FR-9），但把 origin 标记的变更**追加进中心 changelog** 供转发。
-- **上行 UPSERT 推送**（origin=B 的选择性数据）：中心经 `SelectionPushApplier` 在 `wconn`（session 已 attach）写入 → **被中心 session 正常捕获为 changelog（保留 origin=B）** → 于是"上行 UPSERT 如何变下行 changeset"**自然解决**：它就是中心 changelog 的一条记录，按常规 changeset 广播给 C/D。
+`ConflictArbiter`：自动 changeset 路径按 `(origin rank, seq)` 规范序裁决（C7）。
 
-**rebase 算法步骤（中心侧）**：
+**逐行胜者状态 `__sync_row_winner`（G-01：到达序无关的真实落点）**：
 
-1. 中心本轮所有入站写（changeset 重放 + 上行 UPSERT）在事务内产生中心权威 changelog 区间。
-2. `apply_v2` 应用入站冲突时**收集 rebase buffer**（记录每个冲突的裁决：REPLACE/OMIT）。
-3. 多源冲突按 `ConflictArbiter` 规范序确定终值；用 `sqlite3rebaser_create/configure(rebase buffer)/rebase/delete` 将待广播 changeset **变基到中心已裁决状态**。
-4. 广播以**中心提交后的 changelog**为源，按 `RoutingTable` 防回声路由；下游 `AuthoritativeApply`（强制 REPLACE，不受 ConflictPolicy，F-04）。
+FR-6 要求"无论到达顺序，中心终态唯一可复现"。但 `(rank, seq)` 规范序**仅在"所有冲突变更同批一起仲裁"时成立**；现实是 B、D 的冲突变更**分批、隔时到达**。设 `rank(B) > rank(D)`：
 
-**阶段 0 必须验证**：两路冲突输入、反序到达、rebase 后重放在 C/D 收敛到中心终态（§13.1）。
+- B 先到 → 中心提交 `row=B_VAL`；D 后到 → `apply_v2` 见当前行 `B_VAL`≠D 的预期前像 → 触发 `SQLITE_CHANGESET_DATA` → **默认 REPLACE 会写成 `D_VAL`**。SQLite 冲突回调**只能看到当前行值与入站变更，看不到"当前值来自谁、rank 多少"** → 低 rank 的 D 覆盖了高 rank 的 B，**违反 FR-6**。
+
+根因：需要**持久化每行当前胜者的来源与规范序键**，冲突回调据此裁决。故新增同事务维护的 `__sync_row_winner(table_name, pk_hash, winning_origin, winning_rank, winning_origin_seq, content_hash)`（DDL 见 §6.1）。冲突回调（及非冲突的直接 apply）按下式裁决，使终态 = 该行所有来源中 `(rank, origin_seq)` 规范序的**极大元**，与到达顺序无关：
+
+```
+入站变更 (in_origin, in_rank, in_seq) 命中行 r：
+  cur = RowWinnerStore.get(table, pk_hash(r))          // 该行当前胜者；无则视为 (-∞)
+  if (in_rank, in_seq) >= (cur.rank, cur.seq):          // rank 全局唯一→比 rank；同源→比 seq
+        return REPLACE;  RowWinnerStore.put(table, pk, in_origin, in_rank, in_seq, H(after))
+  else: return OMIT      // 低规范序后到，丢弃；胜者不动 → 到达序无关
+```
+
+- **仅作用于 changeset 自动路径**：上行 selectionpush 按 C12/§4.5 **不叠 rank**（直选 `DO UPDATE`/依赖 `DO NOTHING`、不记 per-row owner），故**不维护也不查 `__sync_row_winner`**；本表只由 ChangesetApplier 路径写。这把 per-row 成本限定在自动增量冲突域内。
+- `rank` 全局唯一（需求 §4.6），故 `(rank, seq)` 是**全序**：跨源比 rank、同源比 seq，比较无歧义。
+- `content_hash` 供幂等/审计；基线重置时 `RowWinnerStore` 随 `applied_vector`/`table_state` 一并重置（§5.10）。
+
+**广播载荷的来源 —— 中心 changelog（E-06 关键澄清，origin 仅元数据 G-03）**：下行广播**不直接转发入站原始载荷字节**，而以**中心自身 changelog 为源**；`origin` 始终是 changelog/payload 的**元数据列**，**不在 changeset blob 内**：
+
+- **入站 changeset 重放**（origin=B）：中心 `apply_v2` 时**挂起 fresh 捕获**（§5.4 分支 A），把**原 changeset blob 连同 `origin=B` 元数据**追加进中心 changelog 供转发（不铸新 origin，C2/FR-9）。
+- **上行 UPSERT 推送**（origin=B）：中心经 `SelectionPushApplier` 在 `wconn`（session 已 attach）写入 → 被中心 session **fresh 捕获**为 changeset（§5.4 分支 B），**changelog 元数据列记 `origin=B`** → "上行 UPSERT 如何变下行 changeset"自然解决：它是中心 changelog 一条 `origin=B` 记录，按常规广播给 C/D。
+
+**rebase 算法步骤（中心侧，仅 `apply_v2` 路径 G-03）**：
+
+1. 中心本轮入站 changeset 重放在事务内、经 `__sync_row_winner` 裁决产生中心权威 changelog 区间。
+2. `apply_v2` 应用冲突时**收集 rebase buffer**（每个冲突的 REPLACE/OMIT 裁决）。
+3. 用 `sqlite3rebaser_create/configure(rebase buffer)/rebase/delete` 将**待广播 changeset** 变基到中心已裁决状态。**rebaser 仅用于由 `apply_v2` 产生 rebase buffer 的 changeset 路径**；上行 selectionpush 的 UPSERT **无 rebase buffer、不进 rebaser**，它以普通 `origin=B` changelog 记录广播。
+4. 广播以**中心提交后的 changelog**为源，按 `RoutingTable` 防回声路由；下游 `AuthoritativeApply`（强制 REPLACE，不受 ConflictPolicy，F-04）。rebaser 链路失败 → `E_SYNC_REBASE_FAILED`（G-09），本轮不外发、回滚。
+
+**阶段 0 必须验证**：两路冲突输入、**含"低 rank 后到"的跨批到达**、反序到达，经 `__sync_row_winner` + rebase 后在 C/D 收敛到中心终态（§13.1）。
 
 ### 5.7 位点分层（D-19 / F-05）
 
@@ -647,7 +738,28 @@ public:
     bool shouldFallbackToBaseline(const PeerState&) const;      // 缺锚点/E_SYNC_GAP/迁移后/强制
 };
 ```
-`BaselineManager` 应用基线后**重置** `applied_vector`/`table_state` 聚合（§6.2 允许的全扫场景），并喂养 `ConsistencyCache`（中心权威态）。
+`BaselineManager` 应用基线后**重置** `applied_vector`/`table_state` 聚合/`__sync_row_winner`（§6.2 允许的全扫场景；基线即权威切面，逐行胜者以基线 origin/rank 重置，G-01），并喂养 `ConsistencyCache`（中心权威态）。基线导出/应用失败 → `E_SYNC_BASELINE_FAILED`（G-09），事务回滚、不动旧锚点。
+
+### 5.11 TransportAdapter 子设计（G-08：制品发布/消费契约）
+
+§3 的 `OutboxWriter/InboxWatcher/AckChannel` 此前仅在时序图出现，未定义可靠性细节；本节补全 dbridge 边界内的契约（第三方搬运仍为黑盒，§0 非范围）。落实需求 FR-4 的"完成哨兵 + 三时机扫描 + 持久清单"。
+
+**制品命名与原子发布**：
+
+- 命名：`<origin>__<stream_epoch>__<kind>__<seq|push_id.chunk_seq>__<uuid>.payload` + 同名 `.ready` 哨兵；ACK 制品 `ack__<peer>__<...>.ack`。命名规范是与第三方的稳定契约（§13.1 阶段 0 锁定）。
+- **原子发布**：先把主文件写入**临时名 `*.tmp`** → `fsync` → **`rename` 到 `*.payload`**（同目录 rename 原子）→ 再落 `.ready` 哨兵。接收端**先见 `.ready` 再读主文件**，杜绝半截读（FR-4）。
+- IO 失败 → `E_SYNC_TRANSPORT`（可重试）。
+
+**消费台账（durable inbox ledger）**：
+
+- 持久表 `__sync_inbox_ledger(artifact_name PK, status, first_seen_ms, consumed_ms)`，`status ∈ {seen, consumed, corrupt}`。
+- 消费幂等：已 `consumed` 的制品名再次出现 → 跳过（防 watcher 重复事件 / 第三方重投造成的重复消费）；业务幂等仍由 applied_vector / push_chunk_progress 独立兜底（双保险）。
+- **缺主文件 / 哨兵先到**：见 `.ready` 但主文件缺失/未就绪 → 标 `seen`、留待下一轮扫描；超时仍缺 → `E_SYNC_TRANSPORT` 告警，不阻塞其它制品。
+- **损坏**：`PayloadCodec.decode` 失败 → 标 `corrupt` + `E_SYNC_PAYLOAD_CORRUPT`，移入 `quarantineDir`，不重复尝试。
+
+**三时机扫描（F-12，watcher 仅作唤醒优化）**：①进程**启动时**全量扫 inbox（补 watcher 漏掉的历史制品）；②`QFileSystemWatcher` **触发时**；③**周期 timer** 兜底（网络盘 watcher 易失效）。三者都以"`.ready` 哨兵 + `__sync_inbox_ledger`"为准消费，不以 watcher 事件为唯一来源。
+
+**ACK 制品 schema**：复用 §5.4 typed ACK——`ChangesetAck{origin, stream_epoch, applied_seq}` 与 `PushChunkAck{push_id, chunk_seq, total_chunks, checksum, ok}` 序列化为 `.ack` 制品，经对方 inbox/本方 outbox 往返；`ackMaxDelayMs` 内必发（F-14），捎带仅优化。ACK 超时落点 `E_SYNC_ACK_TIMEOUT`（G-09）。
 
 ---
 
@@ -698,6 +810,21 @@ erDiagram
         TEXT content_checksum
         INTEGER row_count
         INTEGER updated_ms
+    }
+    ROW_WINNER {
+        TEXT table_name PK
+        TEXT pk_hash PK
+        TEXT winning_origin
+        INTEGER winning_rank
+        INTEGER winning_origin_seq
+        BLOB content_hash
+        INTEGER updated_ms
+    }
+    INBOX_LEDGER {
+        TEXT artifact_name PK
+        TEXT status
+        INTEGER first_seen_ms
+        INTEGER consumed_ms
     }
     CONSISTENCY_CACHE {
         TEXT table_name PK
@@ -750,8 +877,10 @@ erDiagram
 
 - `sync_changelog`：索引 `(origin, seq)`、`(stream_epoch, seq)`；防回声/审计/2Mbps 体积测试依赖 `kind/authoritative/source_peer/byte_size`。
 - **epoch 规则（F-13）**：应用前比对 `stream_epoch`；**低于当前 epoch 的载荷直接隔离/丢弃且不推进 `applied_vector`**。
+- **applied_vector 严格连续应用（G-05）**：`applied_seq` 是单调高水位，**仅当 `seq == applied_seq+1` 才应用**；`seq <= applied_seq` → 幂等 no-op；`seq > applied_seq+1` → **缺口**：入 pending 缓冲等待补齐，持续缺口触发 `E_SYNC_GAP` → 回退基线（FR-8）。**杜绝乱序到达下"seq2 先到推高水位、seq1 后到被误判已见"的丢更**。此规则**只管 changeset 流**。
+- **selectionpush 分片幂等独立（G-05）**：上行选择推送分片**不靠 changeset 单高水位去重**（一发多片可能共享 origin_seq，会让首片推高水位后续片被误判已见 no-op）；其幂等键为 **`(origin, stream_epoch, push_id, chunk_seq)`**，由 `push_chunk_progress` 承载。两套幂等机制分账，互不干扰。
 - `outbound_ack`（D-09）：`last_ack_ms` 支撑 FR-10 时长阈值；`pending_baseline`/`last_push_id`/`last_chunk_seq` 支撑坍缩与多片 ACK；截断水位 = `min(活跃 peer 的 acked_seq)`，死对端退出计算。
-- `push_chunk_progress`（D-10）：中心按 `chunk_seq` 顺序应用；重复 chunk **checksum 相同 = no-op**，不同 = `E_SYNC_PAYLOAD_CORRUPT`；`E_SYNC_PUSH_SCHEMA_MOVED` 时 `push_progress.status=failed`。`applied_chunks` 计数不可靠，以本表逐片 `status` 为准。
+- `push_chunk_progress`（D-10）：中心按 `chunk_seq` 顺序应用；幂等键 `(push_id, chunk_seq)`（G-05），重复 chunk **checksum 相同 = no-op**，不同 = `E_SYNC_PAYLOAD_CORRUPT`；`E_SYNC_PUSH_SCHEMA_MOVED` 时 `push_progress.status=failed`。`applied_chunks` 计数不可靠，以本表逐片 `status` 为准。
 - `sync_table_state`：由 apply/import/save 路径**增量维护**，场景2 表级差异零全量扫描（F-17，算法见 §6.2）。
 
 > 上方 ER 为概念示意；**键/索引/外键以 §6.1 可执行 DDL 为权威**（E-04）。
@@ -793,10 +922,22 @@ CREATE TABLE __sync_outbound_ack (
 -- 每表同步状态（增量维护，零全量扫描）
 CREATE TABLE __sync_table_state (
   table_name TEXT NOT NULL, stream_epoch INTEGER NOT NULL,
-  schema_fingerprint TEXT NOT NULL, high_water_seq INTEGER NOT NULL DEFAULT 0,
-  content_checksum TEXT NOT NULL,    -- 顺序无关聚合，见 §6.2
+  schema_fingerprint TEXT NOT NULL,
+  high_water_seq INTEGER NOT NULL DEFAULT 0,  -- 仅本地信息量，跨节点不可比，不参与判等（G-06，见 §6.2）
+  content_checksum TEXT NOT NULL,    -- 顺序无关聚合，判等权威依据，见 §6.2
   row_count INTEGER NOT NULL DEFAULT 0, updated_ms INTEGER NOT NULL,
   PRIMARY KEY(table_name, stream_epoch)
+);
+
+-- 逐行胜者（G-01：仅 changeset 自动路径维护；保证多源仲裁到达序无关）
+-- pk_hash = 主键规范编码的强哈希；(winning_rank, winning_origin_seq) 为该行当前规范序极大元
+CREATE TABLE __sync_row_winner (
+  table_name TEXT NOT NULL, pk_hash TEXT NOT NULL,
+  winning_origin TEXT NOT NULL,
+  winning_rank INTEGER NOT NULL,
+  winning_origin_seq INTEGER NOT NULL,
+  content_hash BLOB NOT NULL, updated_ms INTEGER NOT NULL,
+  PRIMARY KEY(table_name, pk_hash)
 );
 
 CREATE TABLE __sync_consistency_cache (
@@ -809,6 +950,13 @@ CREATE TABLE __sync_quarantine (
   id INTEGER PRIMARY KEY AUTOINCREMENT, origin TEXT NOT NULL,
   origin_seq INTEGER NOT NULL, stream_epoch INTEGER NOT NULL,
   payload_schema_ver INTEGER NOT NULL, payload BLOB NOT NULL, created_ms INTEGER NOT NULL
+);
+
+-- inbox 消费台账（G-08：制品级幂等消费，防 watcher 重复事件/第三方重投）
+CREATE TABLE __sync_inbox_ledger (
+  artifact_name TEXT PRIMARY KEY,
+  status TEXT NOT NULL,              -- 'seen' | 'consumed' | 'corrupt'
+  first_seen_ms INTEGER NOT NULL, consumed_ms INTEGER
 );
 
 CREATE TABLE __sync_push_progress (
@@ -840,15 +988,19 @@ CREATE TABLE __sync_frozen_manifest (
 
 ### 6.2 `sync_table_state` 增量维护算法（E-09，禁全表扫描）
 
-`content_checksum` 取**顺序无关聚合**——所有行哈希的 XOR（或模加）。每次写从 changeset 的 before/after 像（或 `RowMutation`）增量更新，**不重扫全表**：
+`content_checksum` 取**顺序无关聚合**——所有行哈希的**模加**（优于 XOR：避免同哈希偶数次出现自相抵消）。每次写从 changeset 的 before/after 像（或 `RowMutation`）增量更新，**不重扫全表**：
 
-| 行变更 | content_checksum | row_count |
+| 行变更 | content_checksum（模加） | row_count |
 |---|---|---|
-| INSERT(new) | `^= H(new)` | `+1` |
-| DELETE(old) | `^= H(old)` | `-1` |
-| UPDATE(old→new) | `^= H(old) ^ H(new)` | 不变 |
+| INSERT(new) | `+= H(new)` | `+1` |
+| DELETE(old) | `-= H(old)` | `-1` |
+| UPDATE(old→new) | `+= H(new) - H(old)` | 不变 |
 
-`high_water_seq` = 该表已应用的最大 `origin_seq`；`H(row)` 为按列序的规范编码强哈希（与 §5/C11 指纹同族）。**仅 re-baseline 允许一次全表扫描**重置聚合值；常规路径恒为 O(变更行数)。场景2 表级 Identical 判定 = 比对双方 `content_checksum`/`high_water_seq`，零全量拉取（FR-12/F-17）。
+`H(row)` 为按列序的规范编码强哈希（与 §5/C11 指纹同族）。**仅 re-baseline 允许一次全表扫描**重置聚合值；常规路径恒为 O(变更行数)。
+
+**表级 Identical 判等以校验和为准（G-06，修正 FR-12 措辞）**：判等 = 比对双方 **`schema_fingerprint` + `row_count` + `content_checksum` 三者全等**；**`high_water_seq` 不参与判等**。原因：`high_water_seq` 是"已应用的最大 `origin_seq`"，而**不同 origin 的 seq 空间相互独立、本地 import/save 又无远端 origin_seq**——两节点即便内容完全一致（校验和相等），其 high_water 也可能不同（应用历史不同）；用它判等会造成**假红（内容同但水位不同）/假绿**。故 `high_water_seq` 仅作**本地信息量/审计**（如"本表自某点是否有新应用"），跨节点比较一律以内容派生的 `content_checksum`（+ `row_count` 防平凡抵消 + `schema_fingerprint` 防结构差异）为权威。零全量拉取不变（FR-12/F-17）。
+
+> 注：需求 §4.12 原文"指纹/高水位完全匹配"中的"高水位"在本设计降级为信息量、不作判等门，属设计侧对 FR-12 的技术性修正；建议需求文档后续同步该措辞。
 
 > 阶段 1 即落上述表的**最小列与状态字段**（D-28），策略（基线/逐出/隔离重放）阶段 5 补，但不推迟持久化基础。
 
@@ -1180,11 +1332,11 @@ src/
 | FR | 设计落点（章节 / 组件 / 接口） | 测试断言 |
 |---|---|---|
 | FR-1 捕获/changelog | §5.2 SessionRecorder.sealInto（同事务）；§6 SYNC_CHANGELOG | 崩溃后无"已提交未捕获" |
-| FR-2 同步表/外部写 | §2.4 SqliteHandle；TableStateStore；`data_version` | 外部写 → W_SYNC_UNTRACKED_CHANGE |
+| FR-2 同步表/外部写 | §2.4 SqliteHandle；§4.4/§5.1 eligibility 校验（G-04）；TableStateStore；`data_version` | 外部写 → W_SYNC_UNTRACKED_CHANGE；无 PK/视图表 → E_SYNC_UNSUPPORTED_SCHEMA |
 | FR-3 载荷 | §5.3 PayloadCodec（二分） | 缺头字段 → E_SYNC_PAYLOAD_CORRUPT |
 | FR-4 传输/ACK | §3 TransportAdapter；§4.6 E_SYNC_TRANSPORT；ackMaxDelayMs | ACK 最迟发送 |
 | FR-5 应用/冲突 | §5.4 ChangesetApplier（native）；E_SYNC_APPLY_FK/CONSTRAINT | 冲突映射正确 |
-| FR-6 多源仲裁 | §5.6 ConflictArbiter（rank,seq） | 两序终态一致 |
+| FR-6 多源仲裁 | §5.6 ConflictArbiter（rank,seq）+ `__sync_row_winner` 逐行胜者（G-01） | 两序终态一致；**含"低 rank 后到/跨批"用例**仍收敛高 rank 终态 |
 | FR-7 schema 隔离 | §5/§6 SchemaGuard/QuarantineStore | 版本不符 → 隔离重放 |
 | FR-8 基线/增量 | §5.10 BaselineManager；epoch | 缺口 → 基线 |
 | FR-9 广播/rebase | §5.6 RebaseEngine；§7.4 | 静默后无新载荷 |
@@ -1224,4 +1376,18 @@ src/
 | F-09 阈值补齐 | §4.4 Builder 字段 | F-19 术语 | 需求 §2（设计沿用） |
 | F-10 syncSelected 入接口 | §4.2 ⑨ | F-20 接口"8+3" | §4.3 |
 
-> 本设计文档 v0.3 已将两轮 Codex 设计评审 **D-01~D-28 + E-01~E-15** 逐条整改：v0.2 引入的 `Exporting` 完成条件回归已修复（E-02），sync-aware 写边界（E-01/§2.5）、可执行 DDL（E-04/§6.1）、apply 同事务模板（E-05）、rebase 算法（E-06）、`RowMutation` 抽象（E-08）、`table_state` 增量算法（E-09/§6.2）、长推送半截不外泄（E-10）均落实；与需求 v0.4 一致。实现以阶段 0 硬验收为先决条件，若阶段 0 调整 SQLite 构建路径，§2.4 / §5.1 / §13.1 需同步修订。
+### 14.4 NFR 追溯（G-10）
+
+| NFR | 设计落点（章节 / 组件） | 测试断言 / 边界 |
+|---|---|---|
+| NFR-1 架构最佳实践（DIP/纯抽象+工厂+PImpl、E_BUSY 单活动） | §4.2/§4.3 纯抽象+`createXxx`；§3.2 SRP 表；§5.9 ForegroundGate | 公开面仅抽象+工厂可编译替换；前台重入 → `E_BUSY` |
+| NFR-2 KISS/YAGNI（文件制品、不引 MQ/共识/CRDT、扩展点仅预留） | §0 非范围；§5.11 文件传输；§10 扩展点仅接口 | 无 MQ/共识依赖；扩展点无落地实现 |
+| NFR-3 DRY/SOLID（落库收敛单通道、策略点可注入） | §5.4 `UpsertExecutor` 三路共用；§9 复用映射；策略点 ConflictPolicy/TransportAdapter | 四写路径共用 `UpsertExecutor`/`CapturedWriteTemplate`；新增策略不改调用方 |
+| NFR-4 编码硬约束（函数≤150 行/参数≤7/Builder/clang-format） | §1 函数拆分约束（D-27）；§4.4 Builder | 超长流程按 §1 表拆分；多参走 Builder；pre-commit 校验 |
+| NFR-5 性能与低带宽（载荷字节体积，不承诺在途时延） | §5.3 压缩；§5.5 剪枝/分片；§7.4 攒批；§6.2 表级零拉取 | `bytesPacked`/`bytesApplied` ≤ 预算（§14 测试映射"载荷字节预算"）；**不承诺黑盒在途时延** |
+| NFR-6 并发与线程模型（QSqlDatabase/sqlite3* 不跨线程、单写者、getter 线程安全） | §2.4/§8 单写线程 + wconn 独占；§4.3 `SyncContext` 键加固（G-07）；getter 加锁快照 | 跨线程仅传值；单写者无写写并发；OS 文件标识唯一键 |
+| NFR-7 可观测与可审计（结构化日志、`W_SYNC_CONFLICT_REPLACED` 留痕、限定可观测量） | §4.2 logs/errors/progress；§4.6 警告码；§5.11 ACK | 每条日志含 时间/阶段/源/目标/条数/冲突处置；REPLACE 留痕 |
+| NFR-8 可靠性与隔离（应用全程事务、场景2 内存隔离、哨兵、apply 三件套同事务） | §5.2/§5.4 `CapturedWriteTemplate` 同事务；§5.8 场景2 暂存；§5.11 哨兵 | FK/约束破裂整事务回滚；save 前 `.db` 写=0；崩溃零窗口 |
+| NFR-9 可扩展性（多域路由/CDC 后端/传输适配预留，不阻断后续） | §10 扩展点表；`RoutingTable`/`TransportAdapter`/CDC 抽象 | 扩展点以接口定义；新增后端不改既有调用方 |
+
+> 本设计文档 v0.5 在 v0.4（D-01~D-28 + E-01~E-15 + plan Q-01/Q-04/Q-08）基础上，逐条整改第三轮 Codex 设计评审 **G-01~G-10**：逐行胜者 `__sync_row_winner` 保证多源仲裁到达序无关（G-01/§5.6/§6.1）、长推送撞迁移半截语义与排空/再基线收口对齐（G-02/§5.5）、`CapturedWriteTemplate` 按载荷分支并澄清 origin 仅元数据/rebaser 仅 apply_v2（G-03/§5.4/§5.6）、同步表 eligibility（G-04/§4.4，新增 `E_SYNC_UNSUPPORTED_SCHEMA`）、严格连续应用 + 分片幂等分离（G-05/§5.4/§6）、表级判等以校验和为准（G-06/§6.2）、`SyncContext` 键加固（G-07/§4.3）、`TransportAdapter` 子设计（G-08/§5.11）、失败分支错误码补齐（G-09/§4.6）、NFR 追溯（G-10/本节）；与需求 v0.4 一致（§4.12"高水位"与 FR-12 措辞修正、eligibility 校验建议回填需求）。实现以阶段 0 硬验收为先决条件，若阶段 0 调整 SQLite 构建路径，§2.4 / §5.1 / §13.1 需同步修订。

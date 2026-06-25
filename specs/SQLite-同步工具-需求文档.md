@@ -1,7 +1,8 @@
 # SQLite 同步工具需求文档
 
-> 版本：v0.4（草案）
+> 版本：v0.5（草案）
 > 日期：2026-06-16
+> 本版（v0.5）：回填设计文档**第三轮 Codex 评审 G-01~G-10**确立、需在需求侧对齐的条款——FR-6 可测断言补"低 rank 跨批后到"用例并要求逐行胜者状态（G-01）、FR-2 新增**同步表 eligibility** 与 `E_SYNC_UNSUPPORTED_SCHEMA`（G-04）、FR-5 R2 **入站严格连续应用**与分片幂等分离（G-05）、FR-12 **表级判等以校验和为准**（高水位退为信息量，G-06）、§7 错误码补 `E_SYNC_WRITE_BLOCKED/UNSUPPORTED_SCHEMA/ACK_TIMEOUT/REBASE_FAILED/BASELINE_FAILED`（Q-08/G-04/G-09）。设计↔需求两文一致。
 > 本版在 v0.3 基础上，纳入 **Codex（gpt-5.5）评审整改 F-01~F-20**（3 Critical / 8 High / 7 Medium / 2 Low）：统一载荷模型（changeset vs 选择性推送）、修正 FR-1 收割原子性、权威下行豁免 ConflictPolicy、锚点/applied-vector 分层、传输职责分层、FK 环边界、`syncSelected` 入正式接口、补齐对端阈值/对比合并接口等。逐条对应见正文内联 `(F-xx)` 标注与 §13。
 > v0.3 在 v0.2 基础上纳入第二轮质询共识 **C10–C17**（上行选择性推送/依赖一致性剪枝/下行自动触发/前后台并发/长推送快照与迁移交叉），消解 5 条内部矛盾、3 处不可实现条款与多处灾难边界。
 > v0.2 在 v0.1 的 4 项决策基线上纳入 9 条质询共识（C1–C9），并新增上行人工选择性推送（含外键依赖闭包、依赖一致性剪枝，UPSERT）与下行自动广播两条触发模型需求，重点强化灾难恢复/防回声/确定性仲裁/可测试性。
@@ -244,6 +245,7 @@ v0.2 已将 9 条质询共识与上行选择性推送 / 下行自动广播需求
 要点列表:
 
 - **表级粒度**:同步配置以表为最小单位;空集合语义等价于"全表纳入"。同步表集合的变更会影响 session 的 attach 行为(见 FR-1 生命周期表)。
+- **同步表 eligibility(G-04)**:SQLite Session 对可捕获表有**硬性前提**——**无显式 PRIMARY KEY 的表 attach 不报错但变更被静默丢弃,虚表/视图不支持**。故同步表必须为**普通表(rowid 或 `WITHOUT ROWID`)且具显式非空主键(或配置声明的 sync key)**;生成列不进入写列与指纹编码;UPSERT 冲突目标须为**完整唯一索引**(partial / 表达式唯一索引不可作冲突目标)。`initialize` 在 attach 前**逐表校验**,任一不合格报 **`E_SYNC_UNSUPPORTED_SCHEMA`** 并拒绝进入同步模式,**绝不静默跳过**——否则"配置成功却从不捕获"即为静默漏同步。
 - **sync-aware 连接强制**:业务层对同步表的所有写路径都必须走 sync-aware 连接,否则变更将绕过 session 而不被捕获。
 - **外部写检测**:工具必须能检测到未经 sync-aware 连接的"外部写"(如其他进程、外部工具直接改库)。检测手段:
 
@@ -337,7 +339,7 @@ v0.2 已将 9 条质询共识与上行选择性推送 / 下行自动广播需求
 **原子事务边界(R2)**:单次接收应用必须将以下三项操作置于**同一原子事务**内,任一失败则整体回滚,无部分提交。**R2 的"原子"作用域为单个 apply 单元（单 changeset / 单分片，C13）**,而非一发多片选择性推送的整体——多片推送的整体语义是"可续 + 幂等 + FK 安全 + 最终全有"(见 FR-17),不要求所有片落在同一事务:
 
 1. **apply**:通过 `sqlite3changeset_apply_v2` 落库业务数据(含冲突回调裁决结果);
-2. **applied-vector 推进**:按 `(origin, seq)` 推进已应用向量,实现幂等去重——已应用过的 `(origin, seq)` 重复到达时整体跳过,不重复落库;
+2. **applied-vector 推进**:按 `(origin, seq)` 推进已应用向量,实现幂等去重——已应用过的 `(origin, seq)` 重复到达时整体跳过,不重复落库;**严格连续应用(G-05)**:changeset 流仅当 `seq == applied_seq+1` 才应用,`seq <= applied_seq` 为幂等 no-op,`seq > applied_seq+1`(乱序/缺口)入 pending 缓冲待补齐、持续缺口触发 `E_SYNC_GAP` 回退基线——杜绝乱序到达下"高 seq 先到推进水位、低 seq 后到被误判已见"的丢更;**选择性推送分片**幂等另以 `(origin, stream_epoch, push-id, chunk-seq)` 计(经 `push_chunk_progress`),不与 changeset 单高水位混用;
 3. **转发副本落 changelog**:将本次变更以转发副本形式写入本端 changelog,供下游继续传播。
 
 三者共享同一事务句柄,提交点唯一。若 apply 阶段触发 `ABORT`(FK/CONSTRAINT),则 applied-vector 不推进、changelog 不落,事务回滚至应用前状态。
@@ -378,6 +380,8 @@ v0.2 已将 9 条质询共识与上行选择性推送 / 下行自动广播需求
 **可测断言**:仲裁的确定性必须可测——
 
 > 给定同一冲突变更集 `{B:row1001=B_VAL, D:row1001=D_VAL}`,以两种相反的到达顺序(B 先 / D 先)分别喂入中心 A,断言两次运行后 `row1001` 的终态**完全相同**(均为高优先级 origin 之值),且全网 rebase 广播后各源节点收敛至该同一终态。
+>
+> **跨批/晚到强化(G-01)**:可测断言必须覆盖**高 rank 先到并提交、低 rank 后到且分属不同 apply 批次**的场景——断言低 rank 后到**不得覆盖**已提交的高 rank 值("到达序无关"不止于"同批同时仲裁",更要在隔时分批到达时成立)。实现侧据此须**持久化逐行胜者状态**(每行当前胜者的 `origin/rank/seq`),冲突回调凭此裁决 REPLACE/OMIT,而非依赖 `apply_v2` 默认 REPLACE(默认 REPLACE 看不到当前行胜者来源,会让低 rank 后到者覆盖高 rank,违反本 FR)。
 
 ### 4.7 Schema 版本校验与隔离
 
@@ -632,7 +636,7 @@ E_SYNC_PEER_DEAD(逐出,带回归标记)
 
 | 状态 | 标签色 | 含义 |
 | --- | --- | --- |
-| Identical | 绿 | 本地与中心该表内容一致(指纹/高水位完全匹配) |
+| Identical | 绿 | 本地与中心该表内容一致(schema 指纹 + 行数 + 内容校验和全等;高水位不参与判等,G-06) |
 | Different | 红 | 两侧均存在该表但内容有差异 |
 | OnlyLocal | 红 | 仅本地存在(中心无对应或从未同步) |
 | OnlyRemote | 红 | 仅中心存在(本地缺该表) |
@@ -641,10 +645,10 @@ E_SYNC_PEER_DEAD(逐出,带回归标记)
 
 | 维度 | 约定 |
 | --- | --- |
-| 零全量拉取 | 表级判定**绝不拉取任一侧整表数据**;仅依赖 schema 指纹 + 高水位/校验和等轻量元数据 |
-| 中心侧来源 | 中心仅回传极小的"元数据字典"(每表:schema 指纹、行高水位、内容校验和),本地在内存中逐表比对得出状态 |
-| 校验和来源(F-17) | 每表 `schema 指纹/高水位/校验和` 为**中心同步状态表中随 changeset 增量维护的元数据**,**不允许**在比对请求时扫描业务全表;中心侧应答的 SELECT 行数同样有界(可经 onPrefetch 式钩子断言) |
-| 判定逻辑 | schema 指纹 + 高水位 + 校验和三者全等 → Identical(绿);任一不等 → Different(红);单侧缺失 → OnlyLocal/OnlyRemote(红) |
+| 零全量拉取 | 表级判定**绝不拉取任一侧整表数据**;仅依赖 schema 指纹 + 行数 + 内容校验和等轻量元数据(高水位仅信息量) |
+| 中心侧来源 | 中心仅回传极小的"元数据字典"(每表:schema 指纹、行数、内容校验和;高水位附带但不判等),本地在内存中逐表比对得出状态 |
+| 校验和来源(F-17) | 每表 `schema 指纹/行数/内容校验和` 为**中心同步状态表中随 changeset 增量维护的元数据**,**不允许**在比对请求时扫描业务全表;中心侧应答的 SELECT 行数同样有界(可经 onPrefetch 式钩子断言) |
+| 判定逻辑(G-06) | **schema 指纹 + 行数 + 内容校验和三者全等 → Identical(绿)**;任一不等 → Different(红);单侧缺失 → OnlyLocal/OnlyRemote(红)。**高水位(已应用最大 origin_seq)不参与判等**——不同 origin 的 seq 空间相互独立、本地写无远端 origin_seq,两节点内容相同时高水位仍可不同,用其判等会假红/假绿;高水位仅作本地信息量/审计 |
 | 快照一致性 | 概览所读本地侧数据须取自 FR-14 钉定的一致性读快照,避免与后续行级视图错位 |
 | 结果非落盘 | 概览结果为内存计算产物,不写持久库;会话结束即可丢弃 |
 | 双击下钻 | 任一红状态表可双击进入 FR-13 行级双屏差异视图;Identical 表亦允许进入(行级全部呈 Same) |
@@ -1298,6 +1302,11 @@ public:
 | `E_SYNC_SELECTION_TOO_LARGE` | 单发选择集+闭包超硬上限 | Error | 拒绝本次推送，提示人工缩小范围（C13） |
 | `E_SYNC_PUSH_SCHEMA_MOVED` | 推送跨中心 schema 迁移、押旧版本 | Error | 按 push-id 整发作废；新 schema 重新快照重推（C17） |
 | `E_SYNC_FK_CYCLE_UNSUPPORTED` | 外键闭包存在环/自引用、无法拓扑定序 | Error | 拒绝本次推送；本期仅支持无环 FK 闭包（F-08） |
+| `E_SYNC_WRITE_BLOCKED` | 同步激活后旧 API（如主线程 `db_` 上的 `importExcel`）对**同步表**写 | Error | 拒绝该写、不进 session（设计 §2.5，Q-08） |
+| `E_SYNC_UNSUPPORTED_SCHEMA` | 同步表无显式主键 / 为虚表/视图/影子表 / 无可用 UPSERT 冲突目标 | Fatal | initialize 拒绝进入同步模式、不 attach（G-04） |
+| `E_SYNC_ACK_TIMEOUT` | `Exporting` 超 `ackMaxDelayMs` 容限仍未收足额 ACK | Error | 前台落 `Failed` 并释放门控；可重试 `sync()`（G-09） |
+| `E_SYNC_REBASE_FAILED` | `sqlite3rebaser_*` 链路失败 / rebase buffer 不可用 | Error | 本轮广播作废、回滚，不外发（G-09） |
+| `E_SYNC_BASELINE_FAILED` | 基线导出/应用失败 | Error | 基线事务回滚、保留旧锚点；提示重试/换路（G-09） |
 
 ### 7.2 警告码（Warning）
 
@@ -1512,6 +1521,7 @@ DDL 变更不属于同步载荷目标(C4):同步通道只搬运数据载荷,sche
 10. **【已解决】并发人工推同 PK** —— 中心短窗口内检测同 PK 两次 `DO UPDATE` 即 `W_SYNC_CONCURRENT_MANUAL_PUSH`，**仅留痕、末者胜、不自动裁决**，转人工协调（C12 → FR-17 / §7.2）。
 11. **【开放｜TBD】C13/C16 量化阈值** —— `maxSelectionSize`、`pushChunkBudgetBytes`、`broadcastIntervalMs` / `broadcastThreshold`、`ackMaxDelayMs`、`peerLag*Bytes/Ms`、`outboxMax*PerPeer` 的具体取值随 R5 一并定（阻塞实测达标）。责任人：TBD。
 12. **【已解决】Codex（gpt-5.5）评审整改 F-01~F-20** —— v0.4 已逐条整改：F-01 收割同事务原子性、F-02 载荷二分（Changeset/SelectionPush）、F-03 场景 2 有界远端取行、F-04 权威下行豁免 ConflictPolicy、F-05 锚点/applied-vector 分层、F-06 重试职责分层、F-07 删除连带→整发失败、F-08 FK 环 `E_SYNC_FK_CYCLE_UNSUPPORTED`、F-09 对端阈值补齐、F-10 `syncSelected` 入正式接口、F-11 对比合并裁决接口、F-12 watcher 扫描兜底、F-13 坍缩 epoch、F-14 ACK 最迟发送、F-15 错误码触发点、F-16 去"解密"、F-17 校验和增量元数据、F-18 §14 措辞、F-19 术语补全、F-20 接口"8+3"表述。逐条落点见正文内联 `(F-xx)`。
+13. **【已解决】设计文档第三轮 Codex 评审 G-01~G-10 的需求侧对齐** —— v0.5 已回填两文一致所需的需求条款：G-01 FR-6 可测断言补"低 rank 跨批后到"+ 要求逐行胜者状态（设计 §5.6/§6.1 `__sync_row_winner`）；G-04 FR-2 同步表 eligibility + `E_SYNC_UNSUPPORTED_SCHEMA`（设计 §4.4/§5.1）；G-05 FR-5 R2 入站严格连续应用 + 分片幂等分离（设计 §5.4/§6）；G-06 FR-12 判等以校验和为准、高水位退为信息量（设计 §6.2）；G-09 §7 补 `E_SYNC_ACK_TIMEOUT/REBASE_FAILED/BASELINE_FAILED`、并补登设计已用的 `E_SYNC_WRITE_BLOCKED`（设计 §4.6）。G-02/G-03/G-07/G-08/G-10 属设计内部澄清或实现 HOW，与既有需求（C13/C17、§4.9、NFR-6、FR-4、NFR 各条）已一致，无需改需求。
 
 ## 14. 需求→来源映射核对
 

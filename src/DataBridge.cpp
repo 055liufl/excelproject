@@ -173,8 +173,20 @@ QString DataBridge::generateAutoProfileJson(const QString& table, QString* err) 
     return d_->autoBuilder_.toJson(spec);
 }
 
+void DataBridge::setSyncActive(bool active) {
+    d_->syncActive_ = active;
+}
+
 ImportResult DataBridge::importExcel(const QString& xlsxPath, const ImportOptions& options) {
     ImportResult result;
+    // J-09: Block direct imports while sync is active; callers must use IBatchTransfer instead.
+    if (d_->syncActive_) {
+        RowError e;
+        e.code = QString::fromLatin1(err::E_SYNC_WRITE_BLOCKED);
+        e.message = QStringLiteral("Sync is active; use IBatchTransfer for imports");
+        result.errors.append(e);
+        return result;
+    }
     if (!d_->dbOpen_) {
         RowError e;
         e.code = QString::fromLatin1(err::E_OPEN_DB);

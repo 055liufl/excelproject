@@ -83,21 +83,20 @@ bool BatchTransfer::startExport(const ExportOptions& options, QString* err) {
 // ---------------------------------------------------------------------------
 
 void BatchTransfer::runImport(const ImportOptions& opts) {
-    // I-04: Route import through SyncWorker if sync is active for this database.
-    // Check SyncContextRegistry for an active context; if importFn is set, the engine
-    // has wired up a worker-thread import path with session capture.
+    // I-04 / J-10: Route import through SyncWorker if sync is active for this database.
+    // J-10: Use getExisting() (no refCount increment, no context creation) so we never
+    // create an empty context and never leak a reference if importFn is not set.
     {
         const QString dbPath = bridge_.dbPath();
         if (!dbPath.isEmpty()) {
-            QString ctxKey;
-            auto ctx = sync::SyncContextRegistry::instance().getOrCreate(dbPath, &ctxKey, nullptr);
+            auto ctx = sync::SyncContextRegistry::instance().getExisting(dbPath);
             if (ctx && ctx->importFn) {
                 // Sync is active: run import on SyncWorker thread with session capture.
                 // xlsxPath is carried in opts.profileName (design limitation; M3 adds dedicated
                 // field).
                 const QString xlsxPath = opts.profileName;
                 ImportResult result = ctx->importFn(xlsxPath, opts);
-                sync::SyncContextRegistry::instance().release(ctxKey);
+                // No release() — getExisting() does not increment refCount.
                 // Commit result and finish
                 if (importStopRequested_.load()) {
                     QMutexLocker lock(&mutex_);
@@ -115,8 +114,7 @@ void BatchTransfer::runImport(const ImportOptions& opts) {
                 }
                 return;
             }
-            if (ctx)
-                sync::SyncContextRegistry::instance().release(ctxKey);
+            // ctx is nullptr or importFn not set — no release needed.
         }
     }
     // Sync not active: fall back to direct DataBridge call (no session capture).

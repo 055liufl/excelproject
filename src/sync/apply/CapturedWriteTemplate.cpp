@@ -6,6 +6,7 @@
 #include <QDateTime>
 #include <QSqlError>
 #include <QSqlQuery>
+#include <QSqlRecord>
 #include <QStringList>
 
 #include <sqlite3.h>
@@ -242,7 +243,25 @@ WriteResult CapturedWriteTemplate::branchBC(const WriteParams& p) {
     for (const RowMutation& m : p.mutations) {
         TableMutation tm;
         tm.table = m.table;
-        tm.isInsert = (m.mode == UpsertMode::DoUpdate);
+        // J-16: Determine insert vs update by querying whether the row exists before UPSERT.
+        // For DoNothing mode, treat as potential insert (safe: no-op if row exists).
+        // For DoUpdate mode, check if PK already exists to distinguish insert from update.
+        bool rowExists = false;
+        if (!m.pkColumns.isEmpty() && !m.table.isEmpty()) {
+            QStringList whereParts;
+            for (const QString& pk : m.pkColumns)
+                whereParts << QStringLiteral("\"%1\"=?").arg(pk);
+            QSqlQuery existQ(wconn_);
+            existQ.prepare(QStringLiteral("SELECT 1 FROM \"%1\" WHERE %2 LIMIT 1")
+                               .arg(m.table, whereParts.join(QLatin1String(" AND "))));
+            for (const QString& pk : m.pkColumns) {
+                int idx = m.columns.indexOf(pk);
+                if (idx >= 0)
+                    existQ.addBindValue(m.values[idx]);
+            }
+            rowExists = existQ.exec() && existQ.next();
+        }
+        tm.isInsert = !rowExists;
         tm.isDelete = false;
 
         // Build pkHash from PK columns.
@@ -263,6 +282,31 @@ WriteResult CapturedWriteTemplate::branchBC(const WriteParams& p) {
             contentMat.append('\0');
         }
         tm.afterHash = QCryptographicHash::hash(contentMat, QCryptographicHash::Sha256).left(16);
+
+        // For update: fetch old row hash to enable correct checksum delta.
+        if (rowExists && !m.pkColumns.isEmpty() && !tm.isInsert) {
+            QStringList whereParts;
+            for (const QString& pk : m.pkColumns)
+                whereParts << QStringLiteral("\"%1\"=?").arg(pk);
+            QSqlQuery oldQ(wconn_);
+            oldQ.prepare(QStringLiteral("SELECT * FROM \"%1\" WHERE %2 LIMIT 1")
+                             .arg(m.table, whereParts.join(QLatin1String(" AND "))));
+            for (const QString& pk : m.pkColumns) {
+                int idx = m.columns.indexOf(pk);
+                if (idx >= 0)
+                    oldQ.addBindValue(m.values[idx]);
+            }
+            if (oldQ.exec() && oldQ.next()) {
+                QByteArray oldMat;
+                QSqlRecord rec = oldQ.record();
+                for (int ci = 0; ci < rec.count(); ++ci) {
+                    oldMat.append(oldQ.value(ci).toString().toUtf8());
+                    oldMat.append('\0');
+                }
+                tm.beforeHash =
+                    QCryptographicHash::hash(oldMat, QCryptographicHash::Sha256).left(16);
+            }
+        }
         tmuts.append(tm);
     }
 

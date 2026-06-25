@@ -112,6 +112,7 @@ struct ChangesetAck {
     QString origin;
     qint64 streamEpoch = 0;
     qint64 appliedSeq = 0;
+    QString toPeer;  // target peer this ACK is addressed to (J-01 fix)
 };
 
 struct PushChunkAck {

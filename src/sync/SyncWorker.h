@@ -23,6 +23,7 @@
 #include "transport/InboxLedger.h"
 #include "transport/InboxWatcher.h"
 #include "transport/OutboxWriter.h"
+#include <atomic>
 #include <functional>
 #include <future>
 #include <memory>
@@ -135,11 +136,14 @@ class SyncWorker : public QThread {
     qint64 localOriginSeq_ = 0;  // next seq for local node
 
     // I-16: Rebase buffers keyed by "origin/originSeq"; populated after each apply_v2.
+    // J-13: Use insertion-ordered queue for correct LRU eviction.
     QHash<QString, QByteArray> rebaseBuffers_;
+    QList<QString> rebaseBufferOrder_;  // tracks insertion order for eviction
 
-    // I-19: ACK timeout tracking (foreground sync() waits for ACK).
-    bool ackWaiting_ = false;
-    qint64 ackDeadlineMs_ = 0;
+    // J-02: ACK timeout tracking — atomic so startAckWait() (called from calling thread)
+    // and the worker-thread main loop both access it safely without a mutex.
+    std::atomic<bool> ackWaiting_{false};
+    std::atomic<qint64> ackDeadlineMs_{0};
 };
 
 }  // namespace dbridge::sync

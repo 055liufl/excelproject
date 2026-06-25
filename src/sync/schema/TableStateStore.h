@@ -28,8 +28,12 @@ class TableStateStore {
                         const QString& schemaFp, qint64 originSeq, QString* err);
 
     // Read current state for a table.
+    // J-12: Returns true on success (query executed without error), false on query error.
+    // *found is set to true iff a state row exists; false means the table has never been
+    // synced (no row in __sync_table_state). Output pointers fp/checksum/rowCount are only
+    // populated when *found is true.
     bool readState(QSqlDatabase& db, const QString& table, qint64 streamEpoch, QString* fp,
-                   QString* checksum, qint64* rowCount, QString* err);
+                   QString* checksum, qint64* rowCount, bool* found, QString* err);
 
     // Full baseline reset: scan all rows and recompute from scratch.
     bool resetFromBaseline(QSqlDatabase& db, const QStringList& tables, qint64 streamEpoch,

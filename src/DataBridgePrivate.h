@@ -32,6 +32,7 @@ class DataBridgePrivate {
     QSqlDatabase db_;
     QString connName_;
     bool dbOpen_ = false;
+    bool syncActive_ = false;  // J-09: set by SyncEngine; blocks importExcel() direct writes
     SchemaCatalog catalog_;
     QHash<QString, ProfileSpec> profiles_;
 

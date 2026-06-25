@@ -6,8 +6,8 @@
 
 namespace dbridge::sync {
 
-AckChannel::AckChannel(OutboxWriter& writer, qint64 ackMaxDelayMs)
-    : writer_(writer), ackMaxDelayMs_(ackMaxDelayMs) {
+AckChannel::AckChannel(OutboxWriter& writer, const QString& nodeId, qint64 ackMaxDelayMs)
+    : writer_(writer), nodeId_(nodeId), ackMaxDelayMs_(ackMaxDelayMs) {
     lastFlushMs_ = QDateTime::currentMSecsSinceEpoch();
 }
 
@@ -26,14 +26,17 @@ void AckChannel::flush(PayloadCodec& codec) {
 
     for (const ChangesetAck& ack : qAsConst(pendingChangeset_)) {
         QByteArray data = codec.encodeChangesetAck(ack);
-        const QString name = ddl::ackArtifactName(QStringLiteral("self"), ack.origin, nowMs);
+        // fromPeer = nodeId_ (this node), toPeer = ack.toPeer (J-01 fix: was hardcoded "self")
+        const QString name = ddl::ackArtifactName(nodeId_, ack.toPeer, nowMs);
         writer_.writeAck(name, data, nullptr);
     }
     pendingChangeset_.clear();
 
     for (const PushChunkAck& ack : qAsConst(pendingChunk_)) {
         QByteArray data = codec.encodeChunkAck(ack);
-        const QString name = ddl::ackArtifactName(QStringLiteral("self"), ack.pushId, nowMs);
+        // PushChunkAck does not carry a toPeer yet; keep existing routing tag.
+        // TODO(J-01): extend PushChunkAck with toPeer when push fan-out is implemented.
+        const QString name = ddl::ackArtifactName(nodeId_, ack.pushId, nowMs);
         writer_.writeAck(name, data, nullptr);
     }
     pendingChunk_.clear();

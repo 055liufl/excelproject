@@ -12,7 +12,9 @@ namespace dbridge::sync {
 // or flush() is called explicitly.
 class AckChannel {
    public:
-    explicit AckChannel(OutboxWriter& writer, qint64 ackMaxDelayMs = 5000);
+    // nodeId: this node's own identifier, used as the "fromPeer" in ACK artifact
+    // names so that receivers can parse the sender correctly (J-01 fix).
+    explicit AckChannel(OutboxWriter& writer, const QString& nodeId, qint64 ackMaxDelayMs = 5000);
 
     // Queue a changeset ACK.  May trigger an automatic flush.
     void scheduleChangesetAck(const ChangesetAck& ack, PayloadCodec& codec);
@@ -27,6 +29,7 @@ class AckChannel {
     void maybeFlush(PayloadCodec& codec);
 
     OutboxWriter& writer_;
+    QString nodeId_;
     qint64 ackMaxDelayMs_;
     QList<ChangesetAck> pendingChangeset_;
     QList<PushChunkAck> pendingChunk_;

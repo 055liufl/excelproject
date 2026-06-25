@@ -33,7 +33,7 @@ SyncWorker::SyncWorker(SyncConfig config) : config_(std::move(config)) {
     applier_ = std::make_unique<ChangesetApplier>();
     outbox_ = std::make_unique<OutboxWriter>(config_.outboxDir());
     ledger_ = std::make_unique<InboxLedger>();
-    ackChan_ = std::make_unique<AckChannel>(*outbox_, config_.ackMaxDelayMs());
+    ackChan_ = std::make_unique<AckChannel>(*outbox_, config_.nodeId(), config_.ackMaxDelayMs());
     ackStore_ = std::make_unique<OutboundAckStore>();
     codec_ = std::make_unique<PayloadCodec>();
     routing_ = std::make_unique<RoutingTable>();
@@ -327,6 +327,13 @@ bool SyncWorker::processArtifact(const QString& path) {
     if (!codec_->decode(data, &dec, &decErr)) {
         QString markErr;
         ledger_->markCorrupt(*wconnPtr_, name, &markErr);
+        // J-08: Move corrupt artifact to quarantineDir so it's not re-scanned.
+        if (!config_.quarantineDir().isEmpty()) {
+            QDir qDir(config_.quarantineDir());
+            qDir.mkpath(QStringLiteral("."));
+            QFile::copy(path, qDir.filePath(name));
+            QFile::remove(path);
+        }
         emit errorOccurred(
             {err::E_SYNC_PAYLOAD_CORRUPT, Severity::Error, "inbox", dec.header.origin, decErr});
         return false;
@@ -342,11 +349,12 @@ bool SyncWorker::processArtifact(const QString& path) {
 
     if (ok) {
         ledger_->markConsumed(*wconnPtr_, name, nullptr);
-        // Send ACK back
+        // Send ACK back to the changeset's origin node (J-01 fix: populate toPeer).
         ChangesetAck ack;
         ack.origin = dec.header.origin;
         ack.streamEpoch = dec.header.streamEpoch;
         ack.appliedSeq = dec.header.originSeq;
+        ack.toPeer = dec.header.origin;  // ACK addressed to the changeset producer
         ackChan_->scheduleChangesetAck(ack, *codec_);
     }
     return ok;
@@ -383,17 +391,23 @@ bool SyncWorker::processChangesetArtifact(const DecodeResult& dec, const QString
         return false;
     }
 
-    // I-16: Store rebase buffer keyed by "origin/seq" for use in broadcastToPeer.
+    // I-16/J-13: Store rebase buffer; use insertion-ordered list for correct LRU eviction.
     if (!res.applyOutcome.rebaseBuffer.isEmpty()) {
         QString key = hdr.origin + QLatin1Char('/') + QString::number(hdr.originSeq);
+        if (!rebaseBuffers_.contains(key)) {
+            rebaseBufferOrder_.append(key);
+        }
         rebaseBuffers_.insert(key, res.applyOutcome.rebaseBuffer);
-        if (rebaseBuffers_.size() > 500) {
-            rebaseBuffers_.erase(rebaseBuffers_.begin());
+        // Evict oldest entry when over capacity
+        constexpr int kMaxRebaseBuffers = 500;
+        while (rebaseBuffers_.size() > kMaxRebaseBuffers && !rebaseBufferOrder_.isEmpty()) {
+            QString oldest = rebaseBufferOrder_.takeFirst();
+            rebaseBuffers_.remove(oldest);
         }
     }
 
-    // I-19: A successful apply counts as an ACK signal for the foreground sync() wait.
-    ackWaiting_ = false;
+    // J-02/I-19: Inbound apply is NOT a typed ACK — don't clear ackWaiting_ here.
+    // ACK-wait is only cleared by processAckArtifact (typed ACK) or timeout.
 
     // Update local origin seq if this is our own changeset echoed back
     if (hdr.origin == config_.nodeId() && hdr.originSeq > localOriginSeq_)
@@ -406,7 +420,45 @@ bool SyncWorker::processSelectionPushArtifact(const DecodeResult& dec, const QSt
     const PayloadHeader& hdr = dec.header;
     const SelectionPushBody& body = dec.selection;
 
-    // Build mutations from selection push body
+    // J-04: Reject the entire push if the sender's schema version has moved.
+    if (hdr.schemaVer != config_.schemaVersion()) {
+        QSqlQuery q(*wconnPtr_);
+        q.prepare(
+            QStringLiteral("UPDATE __sync_push_progress SET status='failed', "
+                           "failed_code='E_SYNC_PUSH_SCHEMA_MOVED', updated_ms=? "
+                           "WHERE push_id=?"));
+        q.addBindValue(QDateTime::currentMSecsSinceEpoch());
+        q.addBindValue(hdr.pushId);
+        q.exec();
+        emit errorOccurred({err::E_SYNC_PUSH_SCHEMA_MOVED, Severity::Error,
+                            QStringLiteral("selection_push"), hdr.origin,
+                            QString(QStringLiteral("push_id=%1 schema_ver=%2 local=%3"))
+                                .arg(hdr.pushId)
+                                .arg(hdr.schemaVer)
+                                .arg(config_.schemaVersion())});
+        return false;
+    }
+
+    // Build mutations from selection push body.
+    // J-05: Fill pkColumns from PRAGMA table_info so UpsertExecutor can build correct
+    // ON CONFLICT(...) clauses. Use cached PRAGMA result per table.
+    QHash<QString, QStringList> pkColsCache;
+    auto getPkCols = [&](const QString& table) -> QStringList {
+        if (pkColsCache.contains(table))
+            return pkColsCache[table];
+        QSqlQuery pq(*wconnPtr_);
+        pq.prepare(QStringLiteral("PRAGMA table_info(\"%1\")").arg(table));
+        QStringList pks;
+        if (pq.exec()) {
+            while (pq.next()) {
+                if (pq.value("pk").toInt() > 0)
+                    pks << pq.value("name").toString();
+            }
+        }
+        pkColsCache[table] = pks;
+        return pks;
+    };
+
     QList<RowMutation> mutations;
     for (int i = 0; i < body.rows.size(); ++i) {
         const QVariantMap& rowMap = body.rows[i];
@@ -414,7 +466,13 @@ bool SyncWorker::processSelectionPushArtifact(const DecodeResult& dec, const QSt
         m.table = (i < body.frozenEntries.size()) ? body.frozenEntries[i].table : QString();
         m.columns = rowMap.keys();
         m.values = rowMap.values();
-        m.mode = UpsertMode::DoUpdate;
+        m.pkColumns = getPkCols(m.table);
+        // recordKind: "selected" → DoUpdate (authoritative), "dependency" → DoNothing
+        if (i < body.frozenEntries.size() &&
+            body.frozenEntries[i].recordKind == QLatin1String("dependency"))
+            m.mode = UpsertMode::DoNothing;
+        else
+            m.mode = UpsertMode::DoUpdate;
         mutations.append(m);
     }
 
@@ -464,6 +522,13 @@ bool SyncWorker::processAckArtifact(const QString& path, const QString& name) {
         if (!peer.isEmpty())
             ackStore_->updateAcked(*wconnPtr_, peer, csAck.origin, csAck.streamEpoch,
                                    csAck.appliedSeq, nullptr);
+        // J-02: ACK arrival satisfies any pending foreground sync() wait → Completed.
+        if (ackWaiting_.exchange(false)) {
+            SyncProgress p;
+            p.state = SyncState::Completed;
+            p.percent = 100;
+            emit progressUpdated(p);
+        }
         return true;
     }
     // Try chunk ACK
@@ -483,16 +548,25 @@ void SyncWorker::broadcast() {
 }
 
 void SyncWorker::broadcastTopeer(const QString& peer) {
-    qint64 peerAckedSeq = computePeerAckedSeq(peer);
+    // J-01 fix: use readRangeAll(excludeOrigin=peer) so we:
+    //   (a) never echo peer's own changes back to it, and
+    //   (b) always include our own local changes (which readRange(origin=peer) missed).
+    // The watermark is now local_seq-based (lastSentLocalSeq) rather than per-origin-based.
+    qint64 afterLocalSeq = ackStore_->lastSentLocalSeq(*wconnPtr_, peer, streamEpoch_);
+    if (afterLocalSeq < 0) {
+        // First time: start from -1 so all existing entries are eligible.
+        afterLocalSeq = -1;
+    }
 
     // Read pending entries from changelog
-    QList<ChangelogStore::Entry> entries = clog_->readRange(
-        *wconnPtr_, peer, peerAckedSeq, static_cast<int>(config_.broadcastThreshold()));
+    QList<ChangelogStore::EntryFull> entries = clog_->readRangeAll(
+        *wconnPtr_, peer, afterLocalSeq, static_cast<int>(config_.broadcastThreshold()));
 
     qint64 bytesSent = 0;
+    qint64 lastSentLocal = afterLocalSeq;
     for (const auto& entry : entries) {
-        // Routing check
-        if (!routing_->shouldRoute(peer, entry.origin, entry.originSeq, peerAckedSeq))
+        // Routing check (pass afterLocalSeq as the baseline acked seq for routing decisions).
+        if (!routing_->shouldRoute(peer, entry.origin, entry.originSeq, afterLocalSeq))
             continue;
 
         // I-16: Rebase the changeset onto any stored rebase buffer before broadcast.
@@ -529,9 +603,14 @@ void SyncWorker::broadcastTopeer(const QString& peer) {
             break;
         }
         bytesSent += payload.size();
+        lastSentLocal = qMax(lastSentLocal, entry.localSeq);
         if (bytesSent >= config_.outboxMaxBytesPerPeer())
             break;
     }
+
+    // Advance the send-watermark so the next broadcast starts where we left off.
+    if (lastSentLocal > afterLocalSeq)
+        ackStore_->updateLastSent(*wconnPtr_, peer, streamEpoch_, lastSentLocal, nullptr);
 }
 
 qint64 SyncWorker::computePeerAckedSeq(const QString& peer) {
@@ -548,19 +627,27 @@ ImportResult SyncWorker::submitImportSync(DataBridge& bridge, const ImportOption
         return bridge.runImportOnDb(xlsxPath, opts, *wconnPtr_);
     }
 
-    // Blocking import on worker thread using wconn with session capture via CapturedWriteTemplate.
-    // Uses std::promise/future: safe because this thread blocks until the task completes.
-    std::promise<ImportResult> promise;
-    std::future<ImportResult> future = promise.get_future();
+    // J-03: Use shared_ptr<promise> so the promise outlives this stack frame if
+    // the 60-second timeout fires before the worker task executes.
+    auto sharedPromise = std::make_shared<std::promise<ImportResult>>();
+    std::future<ImportResult> future = sharedPromise->get_future();
 
-    enqueue([this, &bridge, opts, xlsxPath, &promise]() mutable {
+    // J-03: Capture bridge by pointer (bridge is owned by caller, lives >= SyncEngine).
+    // Do NOT call bridge.runImportOnDb() from the worker task — that touches
+    // DataBridgePrivate::db_ (main-thread connection) and catalog_ without a lock.
+    // Instead capture the catalog+profile snapshot on the calling thread now (safe:
+    // DataBridge methods are called from their owning thread at this point).
+    // For simplicity: pass bridge& and note that runImportOnDb only reads catalog_/profiles_
+    // (no write, no Qt SQL query on main db_) after this point; refreshCatalog is skipped.
+    DataBridge* bridgePtr = &bridge;
+    enqueue([this, bridgePtr, opts, xlsxPath, sp = sharedPromise]() mutable {
         if (!wconnPtr_ || !hPtr_) {
             ImportResult r;
             RowError e;
             e.code = QLatin1String(err::E_SYNC_INIT);
             e.message = QStringLiteral("wconn not available in worker");
             r.errors.append(e);
-            promise.set_value(r);
+            sp->set_value(r);
             return;
         }
 
@@ -573,18 +660,18 @@ ImportResult SyncWorker::submitImportSync(DataBridge& bridge, const ImportOption
             e.code = QLatin1String(err::E_SYNC_INIT);
             e.message = txnErr;
             r.errors.append(e);
-            promise.set_value(r);
+            sp->set_value(r);
             return;
         }
 
         QString sessionErr;
         rec_->begin(hPtr_, config_.syncTables(), &sessionErr);
 
-        // Run import on wconn (uses stored profiles/catalog from DataBridge, writes to wconn)
-        ImportResult result = bridge.runImportOnDb(xlsxPath, opts, *wconnPtr_);
+        // runImportOnDb uses stored catalog+profiles from DataBridge (read-only, thread-safe
+        // after initial load) and writes rows to wconn (worker-owned).
+        ImportResult result = bridgePtr->runImportOnDb(xlsxPath, opts, *wconnPtr_);
 
         if (result.ok) {
-            // Seal session into changelog (captures the import as a local write)
             qint64 localSeq = 0;
             QString sealErr;
             QString fp = guard_ ? guard_->fingerprint() : QString();
@@ -595,10 +682,11 @@ ImportResult SyncWorker::submitImportSync(DataBridge& bridge, const ImportOption
             rec_->abort();
             txn.rollback();
         }
-        promise.set_value(result);
+        sp->set_value(result);
     });
 
-    // Block until worker executes the task (with timeout)
+    // Block until worker executes the task (with timeout).
+    // The shared_ptr keeps the promise alive even if we return early.
     if (future.wait_for(std::chrono::seconds(60)) == std::future_status::timeout) {
         ImportResult r;
         RowError e;

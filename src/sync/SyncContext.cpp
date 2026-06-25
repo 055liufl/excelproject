@@ -75,6 +75,22 @@ std::shared_ptr<SyncContext> SyncContextRegistry::getOrCreate(const QString& sql
     return ctx;
 }
 
+std::shared_ptr<SyncContext> SyncContextRegistry::getExisting(const QString& sqlitePath) {
+    // J-10: Look up an existing context without creating one and without touching refCount.
+    QString key = canonicalKey(sqlitePath, nullptr);
+    if (key.isEmpty())
+        return nullptr;
+
+    QMutexLocker lk(&mutex_);
+    auto it = registry_.find(key);
+    if (it == registry_.end())
+        return nullptr;
+    // Return a copy of the shared_ptr — shared ownership keeps the object alive for the
+    // duration of the caller's inspection, but we do NOT increment refCount (the internal
+    // counter used by release()). The caller must not call release() for this pointer.
+    return it.value();
+}
+
 void SyncContextRegistry::release(const QString& canonicalKey_) {
     QMutexLocker lk(&mutex_);
     auto it = registry_.find(canonicalKey_);

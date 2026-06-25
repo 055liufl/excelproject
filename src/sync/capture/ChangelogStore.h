@@ -34,6 +34,26 @@ class ChangelogStore {
     QList<Entry> readRange(QSqlDatabase& db, const QString& peer, qint64 afterOriginSeq,
                            int limit = 1000);
 
+    // Full entry including origin, used for broadcast fan-out (J-01 fix).
+    struct EntryFull {
+        qint64 localSeq = 0;
+        QString origin;
+        qint64 originSeq = 0;
+        QByteArray changeset;
+        qint64 byteSize = 0;
+    };
+
+    // Read all entries with local_seq > afterLocalSeq whose origin != excludeOrigin.
+    // Ordered by local_seq ASC (FIFO send order).  Used for broadcasting to a peer
+    // so that we never echo a peer's own changes back to it, and always include our
+    // own local changes (J-01 fix).
+    QList<EntryFull> readRangeAll(QSqlDatabase& db, const QString& excludeOrigin,
+                                  qint64 afterLocalSeq, int limit = 1000);
+
+    // Return the maximum local_seq in the changelog, or -1 if empty.
+    // Used to initialise last_sent watermarks (J-01 fix).
+    qint64 maxLocalSeq(QSqlDatabase& db);
+
     // Delete entries with local_seq < beforeLocalSeq (GC / compaction).
     bool truncate(QSqlDatabase& db, qint64 beforeLocalSeq, QString* err);
 

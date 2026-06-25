@@ -41,6 +41,11 @@ class SyncContextRegistry {
     std::shared_ptr<SyncContext> getOrCreate(const QString& sqlitePath, QString* canonicalKeyOut,
                                              QString* err = nullptr);
 
+    // J-10: Returns the existing context for path without incrementing refCount and without
+    // creating a new entry. Returns nullptr if no context is registered for this path.
+    // Caller must NOT call release() for a pointer obtained via getExisting().
+    std::shared_ptr<SyncContext> getExisting(const QString& sqlitePath);
+
     // Decrement ref; destroys context if refCount reaches 0.
     void release(const QString& canonicalKey);
 

@@ -62,7 +62,12 @@ bool TableStateStore::applyMutations(QSqlDatabase& db, const QList<TableMutation
 }
 
 bool TableStateStore::readState(QSqlDatabase& db, const QString& table, qint64 streamEpoch,
-                                QString* fp, QString* checksum, qint64* rowCount, QString* err) {
+                                QString* fp, QString* checksum, qint64* rowCount, bool* found,
+                                QString* err) {
+    // J-12: Distinguish "not found" (table never synced) from "query error".
+    if (found)
+        *found = false;
+
     QSqlQuery q(db);
     q.prepare(
         QStringLiteral("SELECT schema_fingerprint, content_checksum, row_count "
@@ -73,17 +78,14 @@ bool TableStateStore::readState(QSqlDatabase& db, const QString& table, qint64 s
     if (!q.exec()) {
         if (err)
             *err = q.lastError().text();
-        return false;
+        return false;  // genuine query error
     }
     if (!q.next()) {
-        if (fp)
-            *fp = QString();
-        if (checksum)
-            *checksum = QStringLiteral("0");
-        if (rowCount)
-            *rowCount = 0;
+        // Row does not exist — not an error; *found remains false.
         return true;
     }
+    if (found)
+        *found = true;
     if (fp)
         *fp = q.value(0).toString();
     if (checksum)

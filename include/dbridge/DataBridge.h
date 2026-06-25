@@ -40,6 +40,10 @@ class DBRIDGE_EXPORT DataBridge {
     ImportResult runImportOnDb(const QString& xlsxPath, const ImportOptions& options,
                                QSqlDatabase& db);
 
+    // J-09: Called by SyncEngine::initialize() / ~SyncEngine() to guard importExcel()
+    // against direct writes while sync is active.
+    void setSyncActive(bool active);
+
    private:
     std::unique_ptr<detail::DataBridgePrivate> d_;
 };

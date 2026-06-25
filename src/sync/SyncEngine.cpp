@@ -12,6 +12,8 @@ SyncEngine::SyncEngine(DataBridge& bridge) : bridge_(bridge) {
 }
 
 SyncEngine::~SyncEngine() {
+    // J-09: Unblock direct imports before tearing down.
+    bridge_.setSyncActive(false);
     if (worker_) {
         worker_->requestStop();
         worker_->wait(5000);
@@ -61,11 +63,19 @@ bool SyncEngine::initialize(const SyncConfig& config, QString* err) {
 
     // Block until worker finishes initialisation (or times out / fails).
     if (!worker_->waitForInit(10000)) {
-        QString workerErr = worker_->initError();
+        const QString rawErr = worker_->initError();
+        const QString displayErr =
+            rawErr.isEmpty() ? QStringLiteral("Worker init timeout") : rawErr;
         if (err)
-            *err = workerErr.isEmpty() ? QStringLiteral("Worker init timeout") : workerErr;
-        appendError({err::E_SYNC_INIT, Severity::Fatal, "init", configPtr_->nodeId(),
-                     err ? *err : QString()});
+            *err = displayErr;
+        // J-14: Propagate precise error code from worker initError prefix.
+        QString errCode = QLatin1String(err::E_SYNC_INIT);
+        if (rawErr.startsWith(QLatin1String("E_SYNC_SESSION_UNAVAILABLE")))
+            errCode = QLatin1String(err::E_SYNC_SESSION_UNAVAILABLE);
+        else if (rawErr.startsWith(QLatin1String("E_SYNC_UNSUPPORTED_SCHEMA")))
+            errCode = QLatin1String(err::E_SYNC_UNSUPPORTED_SCHEMA);
+        appendError(
+            {errCode, Severity::Fatal, QStringLiteral("init"), configPtr_->nodeId(), displayErr});
         worker_->requestStop();
         worker_->wait(3000);
         worker_.reset();
@@ -74,10 +84,17 @@ bool SyncEngine::initialize(const SyncConfig& config, QString* err) {
         return false;
     }
     if (!worker_->initError().isEmpty()) {
+        const QString rawErr = worker_->initError();
         if (err)
-            *err = worker_->initError();
-        appendError({err::E_SYNC_INIT, Severity::Fatal, "init", configPtr_->nodeId(),
-                     worker_->initError()});
+            *err = rawErr;
+        // J-14: Propagate precise error code from worker initError prefix.
+        QString errCode = QLatin1String(err::E_SYNC_INIT);
+        if (rawErr.startsWith(QLatin1String("E_SYNC_SESSION_UNAVAILABLE")))
+            errCode = QLatin1String(err::E_SYNC_SESSION_UNAVAILABLE);
+        else if (rawErr.startsWith(QLatin1String("E_SYNC_UNSUPPORTED_SCHEMA")))
+            errCode = QLatin1String(err::E_SYNC_UNSUPPORTED_SCHEMA);
+        appendError(
+            {errCode, Severity::Fatal, QStringLiteral("init"), configPtr_->nodeId(), rawErr});
         worker_->requestStop();
         worker_->wait(3000);
         worker_.reset();
@@ -90,6 +107,9 @@ bool SyncEngine::initialize(const SyncConfig& config, QString* err) {
     ctx_->importFn = [this](const QString& xlsxPath, const ImportOptions& opts) -> ImportResult {
         return worker_->submitImportSync(bridge_, opts, xlsxPath);
     };
+
+    // J-09: Block direct DataBridge::importExcel() while sync is active.
+    bridge_.setSyncActive(true);
 
     initialized_ = true;
     appendLog(Severity::Info, QStringLiteral("init"),
@@ -112,17 +132,19 @@ bool SyncEngine::sync(QString* err) {
     // Enqueue a full scan+broadcast task on the worker.
     // I-14 fix: gate is released inside the worker task.
     // I-19: Start ACK deadline timer so worker emits E_SYNC_ACK_TIMEOUT if no ACK arrives.
+    // J-02: Stay in Exporting (percent=-1) until ACK arrives or timeout.
+    // The worker task triggers a broadcast cycle; ACK arrival or timeout drives state to
+    // Completed/Failed via onWorkerError (E_SYNC_ACK_TIMEOUT) in the main loop.
+    setProgress(SyncState::Exporting, -1);
     worker_->startAckWait();
     worker_->enqueue([this]() {
-        // The worker loop calls scanInbox + broadcast each iteration;
-        // this task also explicitly triggers a broadcast cycle right now.
+        // Trigger an immediate broadcast cycle (worker loop would do it on next interval).
+        // Do NOT set Completed here — that happens when ACK arrives.
+        // DO release gate here so the calling thread is unblocked; state stays Exporting.
         ctx_->gate.release();
-        setProgress(SyncState::Completed, 100);
-        QMutexLocker lk(&snapMutex_);
-        result_.ok = true;
-        result_.finalState = SyncState::Completed;
+        // No Completed yet: caller polls state() and waits for ACK-driven transition.
     });
-    // Note: gate is released inside the enqueued task above; do NOT release here.
+    // Note: gate released inside worker task; do NOT release here.
     return true;
 }
 

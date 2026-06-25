@@ -21,12 +21,12 @@ QList<TableDiff> DiffEngine::tableDiffs(QSqlDatabase& rconn, const QStringList& 
 
         QString localFp, localChecksum;
         qint64 localRowCount = 0;
+        bool localFound = false;
         QString err;
-        // I-13 fix: readState() returns false either when no row exists in table_state
-        // (the normal "we have never synced this table" case) or on a query error.
-        // Both cases are treated as "local has no state record for this table".
-        bool localFound = localTs.readState(rconn, table, streamEpoch, &localFp, &localChecksum,
-                                            &localRowCount, &err);
+        // J-12: readState() now uses bool* found to distinguish "not found" (table never synced)
+        // from a genuine query error. On error we treat state as not found to stay conservative.
+        localTs.readState(rconn, table, streamEpoch, &localFp, &localChecksum, &localRowCount,
+                          &localFound, &err);
 
         bool remoteFound = remote.contains(table);
 

@@ -22,6 +22,17 @@ class OutboundAckStore {
 
     // Toggle the pending_baseline flag for a peer.
     bool setPendingBaseline(QSqlDatabase& db, const QString& peer, bool pending, QString* err);
+
+    // Return the last local_seq successfully sent to peer in the given epoch.
+    // Uses a dedicated sentinel row (origin == "__broadcast__") to track the
+    // broadcast send-watermark independently of per-origin acked_seq (J-01 fix).
+    // Returns -1 if no record exists yet.
+    qint64 lastSentLocalSeq(QSqlDatabase& db, const QString& peer, qint64 epoch);
+
+    // Advance the broadcast send-watermark for peer.  Only moves forward
+    // (MAX semantics).  Creates the sentinel row if absent (J-01 fix).
+    bool updateLastSent(QSqlDatabase& db, const QString& peer, qint64 epoch,
+                        qint64 lastSentLocalSeq, QString* err);
 };
 
 }  // namespace dbridge::sync

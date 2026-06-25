@@ -1,7 +1,8 @@
 # SQLite 同步工具设计文档
 
-> 版本：v0.3（草案）
-> 日期：2026-06-24
+> 版本：v0.4（草案）
+> 日期：2026-06-25
+> 本版回填：补齐实现计划阶段（plan 评审 Q-01/Q-04/Q-08）确立、但设计 v0.3 尚未体现的 3 处设计↔计划一致性缺口——统一 **`CapturedWriteTemplate`**（Q-01）、**typed ACK**（`ChangesetAck`/`PushChunkAck`，Q-04）、错误码 **`E_SYNC_WRITE_BLOCKED`**（Q-08）。
 > 对应需求：`specs/SQLite-同步工具-需求文档.md` v0.4（FR-1~FR-17、共识 C1~C17、Codex 整改 F-01~F-20）
 > 本版整改：纳入第二轮 **Codex（gpt-5.5）设计评审 E-01~E-15**（3 Critical / 9 High / 3 Medium），修复 v0.2 引入的回归与未收口契约——**`Exporting` 完成条件回到"全片 ACK"**（E-02 回归修复）、sync-aware 写边界（E-01）、**可执行 DDL**（E-04）、apply 三件套同事务模板（E-05）、rebase 算法链路（E-06）、`RowMutation` 写入抽象（E-08）、长推送半截语义（E-10）、`sync_table_state` 增量维护算法（E-09）等。
 > 历史：v0.2 纳入第一轮设计评审 D-01~D-28（线程/连接模型、载荷二分、阶段 0 硬验收、双状态机），删除违反 FR-1 的"CDC 兜底"回退。
@@ -200,7 +201,7 @@ graph LR
 |---|---|
 | 新 `IBatchTransfer` 导入 | 入 `SyncWorker` 写队列，在 `wconn`（session 已 attach）执行 `ImportService::run` |
 | 场景2 `save` / 上行 UPSERT / changeset apply | 同样入写队列，经 `WriteTxn` + `UpsertExecutor`/`ChangesetApplier` |
-| **既有阻塞式 `DataBridge::importExcel`（主线程 `db_`）** | 同步激活后，对**同步表**：要么**重定向到写队列**，要么**拒绝并报 `E_BUSY`/提示**；`db_` 对同步表降为**只读**。非同步表（不在 `syncTables`）不受限。 |
+| **既有阻塞式 `DataBridge::importExcel`（主线程 `db_`）** | 同步激活后，对**同步表**：M1 阶段统一**拒绝并报 `E_SYNC_WRITE_BLOCKED`**（不做改道，改道适配留实现计划 T3.3）；`db_` 对同步表降为**只读**。非同步表（不在 `syncTables`）不受限。 |
 | 宿主直连 / 外部进程 / 带外 SQL | 属"外部写"，靠 FR-2 `data_version`/校验和检测 → `W_SYNC_UNTRACKED_CHANGE` + re-baseline |
 
 要点：**`wconn` 是同步表的唯一受控写者**；`DataBridge.db_` 与 `wconn` 指向同一 `.db`，但 `db_` 在同步模式下不写同步表。实现时由 `ForegroundGate` + 写队列统一收口，旧 API 在同步上下文中走改道适配（保留非同步用法向后兼容）。
@@ -423,6 +424,7 @@ namespace dbridge::err {
     inline constexpr const char* E_SYNC_SELECTION_TOO_LARGE  = "E_SYNC_SELECTION_TOO_LARGE";
     inline constexpr const char* E_SYNC_PUSH_SCHEMA_MOVED    = "E_SYNC_PUSH_SCHEMA_MOVED";
     inline constexpr const char* E_BUSY                      = "E_BUSY";
+    inline constexpr const char* E_SYNC_WRITE_BLOCKED        = "E_SYNC_WRITE_BLOCKED";
     // Warning
     inline constexpr const char* W_SYNC_CONFLICT_REPLACED      = "W_SYNC_CONFLICT_REPLACED";
     inline constexpr const char* W_SYNC_BASELINE_LARGE         = "W_SYNC_BASELINE_LARGE";
@@ -445,6 +447,7 @@ namespace dbridge::err {
 | `W_SYNC_PUSH_ROW_DRIFTED` | 打包时行内容与冻结指纹不符 | 取最新值/剔除，不回滚 | `warnings()` 留痕，继续 | 推送期改/删选中行 → 告警 |
 | `W_SYNC_CONCURRENT_MANUAL_PUSH` | 中心短窗口内同 PK 两次 DoUpdate | 末者胜，不自动裁决 | `warnings()` 留痕 | 两边缘并发推同 PK → 告警 |
 | `W_SYNC_UNTRACKED_CHANGE` | `data_version`/校验和检出外部写 | 进 re-baseline required，暂停发布 | `warnings()` + re-baseline | 带外改库 → 告警 + 重算 |
+| `E_SYNC_WRITE_BLOCKED` | 同步激活后旧 API（如 `db_` 上的 `importExcel`）对**同步表**写 | 拒绝该写、不进 session | 返回 false / `errors()` | 旧 importExcel 写同步表 → 被拒（M1 收口，plan Q-08） |
 
 ---
 
@@ -534,19 +537,32 @@ public:
 ```
 **职责切分（E-08）**：`ImportService` 只负责 Excel/Profile → `RowMutation`；`UpsertExecutor` 只负责 `RowMutation` → SQL（prepared 缓存 + 批量）+ 事务内落库。两通道仅共享 `WriteTxn` + `SchemaGuard` + `ErrorCollector`，**不共享行写实现**。`SqlBuilder::buildUpsert` 小幅扩展支持强制 `DO NOTHING`。
 
-**apply 三件套同事务模板（E-05，固定编排，由 `SyncWorker` 在 `wconn` 包事务）**：
+**`CapturedWriteTemplate` —— 所有 `wconn` 本地写的统一模板（Q-01 回填，E-05 强化）**：
+
+不止"入站 apply"，而是**四类写都走同一模板**——入站 changeset 重放、上行 UPSERT、Excel 导入、场景2 save。模板保证每次写都被 session 捕获进 changelog 且 `table_state` 增量维护；其中**幂等判定 / SchemaGuard 校验 / applied-vector 推进仅对"入站"分支**（入站载荷才有远端 `(origin,epoch,seq)` 与 schema 版本；本地 import/save 无远端来源，跳过这三步，绝不被卡）。由 `SyncWorker` 在 `wconn` 包事务，固定编排：
 
 ```
 WriteTxn.begin()                      // BEGIN IMMEDIATE（唯一写连接）
-if AppliedVectorStore.seen(origin,epoch,seq): WriteTxn.rollback(); return noop   // 幂等先判
-SessionRecorder.begin(h, syncTables)  // 转发副本捕获（上行 origin 保留；下行重放挂起捕获，见 §5.6）
-ChangesetApplier.apply(...) | SelectionPushApplier.applyChunk(...)   // 二选一
-AppliedVectorStore.update(origin, epoch, seq)
-TableStateStore.applyMutations(...)   // 增量维护（§6 E-09）
+if isInbound:                         // 仅入站：下面三步本地写跳过
+    if AppliedVectorStore.seen(origin,epoch,seq): WriteTxn.rollback(); return noop   // 幂等先判
+    SchemaGuard.verifyPayload(...)     // 版本/指纹不符 → 拒绝（E_SYNC_SCHEMA_MISMATCH）
+SessionRecorder.begin(h, syncTables)  // 捕获本次写（下行重放保留 origin 并挂起本地捕获，见 §5.6）
+业务写：ChangesetApplier.apply(...) | SelectionPushApplier.applyChunk(...) | UpsertExecutor.apply(RowMutation...)  // import/save 走 UpsertExecutor
+if isInbound: AppliedVectorStore.update(origin, epoch, seq)
+TableStateStore.applyMutations(...)   // 所有写都增量维护表态（§6 E-09；DiffEngine 可信前提）
 SessionRecorder.sealInto(h, ChangelogStore, txn, &localSeq)         // 同事务写 changelog
-WriteTxn.commit()                     // 单一 COMMIT：业务写 + 向量 + 表态 + changelog 原子
+WriteTxn.commit()                     // 单一 COMMIT：业务写 + (向量) + 表态 + changelog 原子
 ```
-任一步失败 → `WriteTxn.rollback()`，向量/表态/changelog 一并回退，无半提交。
+任一步失败 → `WriteTxn.rollback()`，向量/表态/changelog 一并回退，无半提交。`SelectionPushApplier`/`UpsertExecutor`/`ImportService` 与场景2 `StagingBuffer.save` 均**复用本模板**（不各自起事务），这是"所有写路径都维护 changelog+table_state"的落点。
+
+**typed ACK（Q-04 回填）**：`AckChannel` 的 ACK 不是单一概念，分两型，经同一文件通道回送（`ackMaxDelayMs` 内以专用 ack 制品发出，捎带仅作优化）：
+
+| 型 | 字段 | 用途 / 完成判定 |
+|---|---|---|
+| `ChangesetAck` | `origin, stream_epoch, applied_seq` | 推进 `OutboundAckStore` 锚点；驱动 4.10 存活性/截断 |
+| `PushChunkAck` | `push_id, chunk_seq, total_chunks, checksum, ok` | 记 `push_chunk_progress`；**全 `total_chunks` 片 ok → `push_progress=done` → `syncSelected` 前台 `Completed`**（与 FR-11/§7.1 的"全片 ACK 才完成"对齐） |
+
+发送端凭 `PushChunkAck` 判定整发完成（半截不外泄，§5.5）；`ChangesetAck` 与 `PushChunkAck` 均只前移**发送端** `OutboundAckStore`（接收端幂等仍由 applied-vector 独立承担，F-05 分层不变）。
 
 ### 5.5 上行选择链路（D-15）
 

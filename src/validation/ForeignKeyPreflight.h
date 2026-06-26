@@ -18,8 +18,11 @@ class ForeignKeyPreflight {
 
     // Check that referenced parent rows exist in DB for payloads that have fkInject.
     // Parent rows that are present in the same batch are considered OK.
-    bool check(const QVector<RowContext>& contexts, const QVector<RouteSpec>& allRoutes,
-               QSqlDatabase& db, const QString& sheet, ErrorCollector* errors);
+    // H-02 fix: contexts is non-const so that failed route indices can be written back into
+    // ctx.failedRouteIndices, enabling the write phase to skip only affected payloads instead
+    // of the entire row.
+    bool check(QVector<RowContext>& contexts, const QVector<RouteSpec>& allRoutes, QSqlDatabase& db,
+               const QString& sheet, ErrorCollector* errors);
 
    private:
     bool checkPayload(const RoutePayload& payload, const RouteSpec& routeSpec,

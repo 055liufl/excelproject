@@ -101,7 +101,8 @@ class TstFkPreflight : public QObject {
 
         ErrorCollector errors;
         ForeignKeyPreflight fk;
-        QVERIFY(fk.check({ctx}, routes, db, QStringLiteral("Orders"), &errors));
+        QVector<RowContext> ctxList = {ctx};
+        QVERIFY(fk.check(ctxList, routes, db, QStringLiteral("Orders"), &errors));
         QVERIFY(errors.empty());
     }
 
@@ -121,7 +122,8 @@ class TstFkPreflight : public QObject {
 
         ErrorCollector errors;
         ForeignKeyPreflight fk;
-        QVERIFY(fk.check({ctx}, routes, db, QStringLiteral("Mixed"), &errors));
+        QVector<RowContext> ctxList = {ctx};
+        QVERIFY(fk.check(ctxList, routes, db, QStringLiteral("Mixed"), &errors));
         QVERIFY2(errors.empty(), errors.list().isEmpty()
                                      ? "no errors"
                                      : errors.list().first().message.toUtf8().constData());
@@ -143,7 +145,8 @@ class TstFkPreflight : public QObject {
 
         ErrorCollector errors;
         ForeignKeyPreflight fk;
-        QVERIFY(fk.check({ctx}, routes, db, QStringLiteral("Orders"), &errors));
+        QVector<RowContext> ctxList = {ctx};
+        QVERIFY(fk.check(ctxList, routes, db, QStringLiteral("Orders"), &errors));
         QVERIFY(errors.empty());
     }
 
@@ -161,7 +164,8 @@ class TstFkPreflight : public QObject {
 
         ErrorCollector errors;
         ForeignKeyPreflight fk;
-        QVERIFY(!fk.check({ctx}, routes, db, QStringLiteral("Orders"), &errors));
+        QVector<RowContext> ctxList = {ctx};
+        QVERIFY(!fk.check(ctxList, routes, db, QStringLiteral("Orders"), &errors));
         QVERIFY(!errors.empty());
         QCOMPARE(errors.list().first().code, QStringLiteral("E_VALIDATE_FK"));
         QCOMPARE(errors.list().first().row, 4);
@@ -186,7 +190,8 @@ class TstFkPreflight : public QObject {
         ErrorCollector errors;
         ForeignKeyPreflight fk;
         fk.onProbe = [&](const QString&) { ++probeCount; };
-        QVERIFY(fk.check({ctx}, routes, db, QStringLiteral("Orders"), &errors));
+        QVector<RowContext> ctxList = {ctx};
+        QVERIFY(fk.check(ctxList, routes, db, QStringLiteral("Orders"), &errors));
         QCOMPARE(probeCount, 0);  // in-batch → no DB probe
     }
 
@@ -208,7 +213,8 @@ class TstFkPreflight : public QObject {
         ErrorCollector errors;
         ForeignKeyPreflight fk;
         fk.onProbe = [&](const QString&) { ++probeCount; };
-        QVERIFY(fk.check({ctx}, routes, db, QStringLiteral("Orders"), &errors));
+        QVector<RowContext> ctxList = {ctx};
+        QVERIFY(fk.check(ctxList, routes, db, QStringLiteral("Orders"), &errors));
         QCOMPARE(probeCount, 1);  // not in batch → 1 DB probe
         QVERIFY(errors.empty());
     }
@@ -245,7 +251,8 @@ class TstFkPreflight : public QObject {
         ForeignKeyPreflight fk;
         fk.onProbe = [&](const QString&) { ++probeCount; };
         // Result: group is lookup-derived → skip → check returns true, no error
-        QVERIFY(fk.check({ctx}, routes, db, QStringLiteral("Orders"), &errors));
+        QVector<RowContext> ctxList = {ctx};
+        QVERIFY(fk.check(ctxList, routes, db, QStringLiteral("Orders"), &errors));
         QCOMPARE(probeCount, 0);  // §7.5: lookup-derived skip
         QVERIFY(errors.empty());
     }

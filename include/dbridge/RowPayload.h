@@ -31,6 +31,10 @@ struct RowContext {
     // H-04 fix: indices into payloads[] that failed FK injection; their descendants are also
     // skipped in the write phase, while unaffected siblings still proceed.
     QSet<int> failedRouteIndices;
+    // M-04 fix: true when the row has a non-route-local error (structural/type/non-binding error).
+    // When this flag is set, the entire row is skipped in the write phase even if
+    // failedRouteIndices is non-empty, because the payload data itself is unusable.
+    bool hasNonRouteError = false;
 };
 
 }  // namespace dbridge::detail

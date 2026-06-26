@@ -544,9 +544,18 @@ ImportResult ImportService::run(const ProfileSpec& profile, const SchemaCatalog&
         }
 
         // Map Excel columns to payloads
+        // M-04 fix: snapshot error count before mapping so we can detect non-route-local errors
+        // (structural/type errors from Mapper) that render the entire row unusable regardless of
+        // which routes succeeded.
+        const int errCountBeforeMap = errors.list().size();
         // M-06 fix: pass sheetName so Mapper error entries carry the correct sheet location.
         ctx.payloads = mapper.map(*routesPtr, r, ctx.classId, reader, validatorMap, profile,
                                   &errors, sheetName);
+        // M-04 fix: if Mapper added any errors for this row, the payload data is structurally
+        // invalid (e.g. type mismatch, required column missing) — mark hasNonRouteError so the
+        // write phase skips the entire row even when failedRouteIndices is also non-empty.
+        if (errors.list().size() > errCountBeforeMap)
+            ctx.hasNonRouteError = true;
 
         // Apply lookups (Phase A.5 cache → row payload); failures seed cascade suppression (§D11)
         QSet<int> lookupFailed = applyLookups(ctx.payloads, *routesPtr, lookupCache, catalog,
@@ -660,17 +669,16 @@ ImportResult ImportService::run(const ProfileSpec& profile, const SchemaCatalog&
 
     bool writeOk = true;
     for (const auto& ctx : contexts) {
-        // H-02 fix: only skip the entire Excel row when it has mapping/validation errors that
-        // make its payload data fundamentally invalid.  If the row's errors are all FK-inject
-        // failures (tracked per-route in ctx.failedRouteIndices), do NOT skip the whole row —
-        // sibling routes whose FK injection succeeded must still be written.
-        // Strategy: if failedExcelRows contains this row but the row also has failedRouteIndices
-        // that can account for all the errors, proceed to route-level filtering below.
-        // If failedExcelRows contains this row with NO failedRouteIndices (pure mapping/validation
-        // failure), skip entirely — the payload data itself is unusable.
-        if (failedExcelRows.contains(ctx.excelRow) && ctx.failedRouteIndices.isEmpty())
+        // H-02 / M-04 fix: skip the entire Excel row only when the row has a non-route-local error
+        // (structural/type/mapping failure that renders payload data unusable).  If the row only
+        // has route-local errors (tracked in failedRouteIndices), proceed to route-level filtering
+        // below so that sibling routes whose payloads are valid can still be written.
+        // M-04: hasNonRouteError covers the case where both kinds of errors coexist — the
+        // presence of non-route errors means the whole row must be skipped.
+        if (failedExcelRows.contains(ctx.excelRow) &&
+            (ctx.hasNonRouteError || ctx.failedRouteIndices.isEmpty()))
             continue;
-        // Rows with failedRouteIndices fall through; skipPayloadIndices below handles them.
+        // Rows with only failedRouteIndices fall through; skipPayloadIndices below handles them.
 
         // H-04 fix: determine the routes for this context.
         const QVector<RouteSpec>* routesForCtx = nullptr;

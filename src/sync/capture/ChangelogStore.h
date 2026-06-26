@@ -45,6 +45,8 @@ class ChangelogStore {
         qint64 streamEpoch = 0;  // C-04 fix: preserve original stream_epoch per origin
         QByteArray changeset;
         qint64 byteSize = 0;
+        QString pushId;  // H-01 fix: non-empty for selection-push changesets; used by broadcast
+                         // barrier to skip entries only when their specific push is still pending
     };
 
     // Read all entries with local_seq > afterLocalSeq whose origin != excludeOrigin.

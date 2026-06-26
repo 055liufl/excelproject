@@ -31,7 +31,11 @@ class PayloadCodec {
 
    private:
     static constexpr quint32 kMagic = 0x44425359u;  // "DBSY"
-    static constexpr quint16 kVersion = 1;
+    // M-03 fix: bump wire format version to 2 to signal that senderPeer is present in the header.
+    // version=1 payloads (old nodes) do NOT contain senderPeer; readHeader reads it only for v>=2.
+    // New nodes write version=2; they can still decode version=1 for backward compatibility.
+    static constexpr quint16 kVersion = 2;
+    static constexpr quint16 kVersionMin = 1;  // minimum accepted version (for backward compat)
 
     enum KindByte : quint8 {
         KChangeset = 0,
@@ -43,7 +47,8 @@ class PayloadCodec {
     };
 
     void writeHeader(QDataStream& ds, const PayloadHeader& h);
-    bool readHeader(QDataStream& ds, PayloadHeader* h, QString* err);
+    // M-03 fix: version parameter determines which optional fields are present in the stream.
+    bool readHeader(QDataStream& ds, PayloadHeader* h, quint16 version, QString* err);
 };
 
 }  // namespace dbridge::sync

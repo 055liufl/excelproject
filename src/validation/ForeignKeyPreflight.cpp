@@ -11,9 +11,8 @@
 
 namespace dbridge::detail {
 
-bool ForeignKeyPreflight::check(const QVector<RowContext>& contexts,
-                                const QVector<RouteSpec>& allRoutes, QSqlDatabase& db,
-                                const QString& sheet, ErrorCollector* errors) {
+bool ForeignKeyPreflight::check(QVector<RowContext>& contexts, const QVector<RouteSpec>& allRoutes,
+                                QSqlDatabase& db, const QString& sheet, ErrorCollector* errors) {
     QHash<QString, QVector<RoutePayload>> batchParentPayloads;
     for (const auto& ctx : contexts) {
         for (const auto& payload : ctx.payloads) {
@@ -26,14 +25,19 @@ bool ForeignKeyPreflight::check(const QVector<RowContext>& contexts,
         routeByTable[r.table] = &r;
 
     bool allOk = true;
-    for (const auto& ctx : contexts) {
-        for (const auto& payload : ctx.payloads) {
+    // H-02 fix: iterate with index so we can write back to ctx.failedRouteIndices.
+    for (auto& ctx : contexts) {
+        for (int pi = 0; pi < ctx.payloads.size(); ++pi) {
+            const RoutePayload& payload = ctx.payloads[pi];
             const RouteSpec* rs = routeByTable.value(payload.table, nullptr);
             if (!rs || rs->fkInject.isEmpty())
                 continue;
             if (!checkPayload(payload, *rs, batchParentPayloads, routeByTable, db, sheet,
                               ctx.excelRow, errors)) {
                 allOk = false;
+                // H-02 fix: record which payload (route index) failed FK preflight so the write
+                // phase skips only that route (and its descendants), not the entire Excel row.
+                ctx.failedRouteIndices.insert(pi);
             }
         }
     }

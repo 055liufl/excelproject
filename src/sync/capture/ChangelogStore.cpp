@@ -74,12 +74,14 @@ QList<ChangelogStore::EntryFull> ChangelogStore::readRangeAll(QSqlDatabase& db,
     QSqlQuery q(db);
     // C-04 fix: also SELECT stream_epoch so broadcastToPeer can use each entry's original epoch
     // rather than overwriting every forwarded origin with the local node's epoch.
-    q.prepare(
-        QStringLiteral("SELECT local_seq, origin, origin_seq, stream_epoch, changeset, byte_size "
-                       "FROM __sync_changelog "
-                       "WHERE origin != ? AND local_seq > ? "
-                       "ORDER BY local_seq ASC "
-                       "LIMIT ?"));
+    // H-01 fix: also SELECT push_id so the broadcast barrier can filter by the specific push_id
+    // rather than blocking all entries for the origin (coarse over-blocking).
+    q.prepare(QStringLiteral(
+        "SELECT local_seq, origin, origin_seq, stream_epoch, changeset, byte_size, push_id "
+        "FROM __sync_changelog "
+        "WHERE origin != ? AND local_seq > ? "
+        "ORDER BY local_seq ASC "
+        "LIMIT ?"));
     q.addBindValue(excludeOrigin);
     q.addBindValue(afterLocalSeq);
     q.addBindValue(limit);
@@ -95,6 +97,7 @@ QList<ChangelogStore::EntryFull> ChangelogStore::readRangeAll(QSqlDatabase& db,
         e.streamEpoch = q.value(3).toLongLong();
         e.changeset = q.value(4).toByteArray();
         e.byteSize = q.value(5).toLongLong();
+        e.pushId = q.value(6).toString();  // H-01 fix: NULL → empty string via toString()
         result.append(e);
     }
     return result;

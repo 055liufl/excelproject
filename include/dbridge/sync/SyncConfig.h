@@ -384,6 +384,43 @@ class DBRIDGE_EXPORT SyncConfig::Builder {
                 *err = QStringLiteral("schemaVersion must be >= 1");
             return {};
         }
+        // M-01 fix: validate soft <= hard threshold relationships and positive-only fields.
+        if (cfg_.peerLagSoftSeq_ > cfg_.peerLagHardSeq_) {
+            if (err)
+                *err = QStringLiteral("peerLagSoftSeq (%1) must be <= peerLagHardSeq (%2)")
+                           .arg(cfg_.peerLagSoftSeq_)
+                           .arg(cfg_.peerLagHardSeq_);
+            return {};
+        }
+        if (cfg_.peerLagSoftBytes_ > cfg_.peerLagHardBytes_) {
+            if (err)
+                *err = QStringLiteral("peerLagSoftBytes (%1) must be <= peerLagHardBytes (%2)")
+                           .arg(cfg_.peerLagSoftBytes_)
+                           .arg(cfg_.peerLagHardBytes_);
+            return {};
+        }
+        if (cfg_.peerLagSoftMs_ > cfg_.peerLagHardMs_) {
+            if (err)
+                *err = QStringLiteral("peerLagSoftMs (%1) must be <= peerLagHardMs (%2)")
+                           .arg(cfg_.peerLagSoftMs_)
+                           .arg(cfg_.peerLagHardMs_);
+            return {};
+        }
+        if (cfg_.outboxMaxArtifactsPerPeer_ <= 0) {
+            if (err)
+                *err = QStringLiteral("outboxMaxArtifactsPerPeer must be > 0");
+            return {};
+        }
+        if (cfg_.baselineSizeWarnBytes_ != 0 && cfg_.baselineSizeWarnBytes_ <= 0) {
+            if (err)
+                *err = QStringLiteral("baselineSizeWarnBytes must be > 0 when set");
+            return {};
+        }
+        if (cfg_.changelogRetention_ != 0 && cfg_.changelogRetention_ <= 0) {
+            if (err)
+                *err = QStringLiteral("changelogRetention must be > 0 when set");
+            return {};
+        }
         cfg_.valid_ = true;
         return cfg_;
     }

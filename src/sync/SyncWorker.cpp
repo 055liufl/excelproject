@@ -819,6 +819,32 @@ bool SyncWorker::processBaselineRequestArtifact(const DecodeResult& dec,
         return false;
     }
 
+    // C-01 fix: merge the source node's own local origin cut into the baseline.
+    // queryOriginCuts() only reads __sync_applied_vector; the source node's own writes
+    // never advance its own applied_vector, so the cut for (nodeId, streamEpoch_) is absent.
+    // Without this cut, the receiver resets the source node's applied_seq to 0 and replays
+    // old changesets. We merge it here (take max if the entry already exists from a
+    // self-echo that did advance applied_vector).
+    {
+        const QString& selfOrigin = config_.nodeId();
+        bool found = false;
+        for (BaselineOriginCut& cut : art.originCuts) {
+            if (cut.origin == selfOrigin && cut.streamEpoch == streamEpoch_) {
+                if (localOriginSeq_ > cut.appliedSeq)
+                    cut.appliedSeq = localOriginSeq_;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            BaselineOriginCut selfCut;
+            selfCut.origin = selfOrigin;
+            selfCut.streamEpoch = streamEpoch_;
+            selfCut.appliedSeq = localOriginSeq_;
+            art.originCuts.append(selfCut);
+        }
+    }
+
     BaselineResponsePayload resp;
     resp.origin = config_.nodeId();
     resp.requestOrigin = dec.header.origin;  // send back to requester
@@ -1091,21 +1117,26 @@ bool SyncWorker::broadcastTopeer(const QString& peer, QString* outErr,
         // H-02 fix: shouldRoute must compare entry.originSeq against the per-(peer,origin)
         // acked_seq, NOT against afterLocalSeq which is a local_seq watermark in a different
         // sequence namespace.  Mixing them causes phantom misses and double-sends.
+        // C-02 fix: use entry.streamEpoch (the epoch under which this origin's ACK was stored)
+        // rather than streamEpoch_ (local node epoch). When forwarding a remote-origin changeset,
+        // the receiver ACKs under entry.streamEpoch, so querying with streamEpoch_ returns -1
+        // and causes infinite re-sends.
+        const qint64 entryEpoch = entry.streamEpoch > 0 ? entry.streamEpoch : streamEpoch_;
         const qint64 peerOriginAcked =
-            ackStore_->ackedSeq(*wconnPtr_, peer, entry.origin, streamEpoch_);
+            ackStore_->ackedSeq(*wconnPtr_, peer, entry.origin, entryEpoch);
         if (!routing_->shouldRoute(peer, entry.origin, entry.originSeq, peerOriginAcked))
             continue;
 
-        // C-04 fix: skip changelog entries produced by a selection push that has not yet
-        // been fully ACKed by all recipients.  Entries whose origin is a remote peer and
-        // whose push_progress row is still streaming/pending must not be broadcast until the
-        // push is marked 'done'.
-        if (entry.origin != config_.nodeId()) {
+        // C-04 / H-01 fix: skip changelog entries produced by a selection push that has not yet
+        // been fully ACKed by all recipients.  Only skip when the entry's own push_id is
+        // still streaming/pending — not all pushes from the same origin (H-01: coarse filter bug).
+        // Entries without a push_id (plain changesets) are never blocked.
+        if (entry.origin != config_.nodeId() && !entry.pushId.isEmpty()) {
             QSqlQuery pushQ(*wconnPtr_);
             pushQ.prepare(
                 QStringLiteral("SELECT COUNT(*) FROM __sync_push_progress "
-                               "WHERE origin = ? AND status != 'done' AND status != 'failed'"));
-            pushQ.addBindValue(entry.origin);
+                               "WHERE push_id = ? AND status != 'done' AND status != 'failed'"));
+            pushQ.addBindValue(entry.pushId);
             if (pushQ.exec() && pushQ.next() && pushQ.value(0).toInt() > 0)
                 continue;
         }

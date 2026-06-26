@@ -487,14 +487,12 @@ QHash<QString, QVariant> resolveAHeaders(const QVector<RouteSpec>& routes,
                                 ctx + QStringLiteral("route '") + route.table +
                                     QStringLiteral("' lookup '") + lk.name +
                                     QStringLiteral("': H column is NULL — treating as no match"));
-                    // H-04 fix: mark only the A-headers from this lookup as failed.
-                    // The row continues to be written; only the affected columns are cleared.
-                    if (failedAHeaders) {
-                        for (const auto& mp : lk.match)
-                            failedAHeaders->insert(mp.second);
-                    }
+                    // H-03 fix: exportOnMissing=="error" skips the entire row (rowSkip=true).
+                    // "null" and "skip" write empty A-columns but do not skip the row.
+                    *rowSkip = true;
+                    return aVals;
                 }
-                // null/skip/error: leave A-headers absent (will write NULL)
+                // null/skip: leave A-headers absent (will write NULL), no error
                 continue;
             }
 
@@ -518,15 +516,12 @@ QHash<QString, QVariant> resolveAHeaders(const QVector<RouteSpec>& routes,
                                     QStringLiteral("': no match in '") + lk.fromTable +
                                     QStringLiteral("' for (") + hDesc.join(QStringLiteral(", ")) +
                                     QStringLiteral(")"));
-                    // H-04 fix: mark only the A-headers from this lookup as failed.
-                    // The row continues to be written; only the affected columns are cleared.
-                    // (Previously any NOT_FOUND + "error" would skip the entire row.)
-                    if (failedAHeaders) {
-                        for (const auto& mp : lk.match)
-                            failedAHeaders->insert(mp.second);
-                    }
+                    // H-03 fix: exportOnMissing=="error" skips the entire row (rowSkip=true),
+                    // matching the OpenSpec contract. "null" and "skip" write empty A-columns.
+                    *rowSkip = true;
+                    return aVals;
                 }
-                // null/skip/error: leave A-headers absent (will write NULL), no error
+                // null/skip: leave A-headers absent (will write NULL), no error
                 continue;
             }
 

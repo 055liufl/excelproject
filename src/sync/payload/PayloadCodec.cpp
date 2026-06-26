@@ -19,25 +19,29 @@ void PayloadCodec::writeHeader(QDataStream& ds, const PayloadHeader& h) {
        << h.senderPeer;  // C-05 fix: physical sender so receivers can ACK back to the right node
 }
 
-bool PayloadCodec::readHeader(QDataStream& ds, PayloadHeader* h, QString* err) {
+bool PayloadCodec::readHeader(QDataStream& ds, PayloadHeader* h, quint16 version, QString* err) {
     qint32 cs = 0, tc = 0;
     ds >> h->origin >> h->originSeq >> h->parentSeq >> h->schemaFingerprint >> h->schemaVer >>
         h->streamEpoch >> h->routeTag >> h->pushId >> cs >> tc;
     h->chunkSeq = cs;
     h->totalChunks = tc;
-    // C-05 fix: senderPeer was added after the original fields; read it gracefully.
-    // If the stream is already at end (old payload), senderPeer remains empty — that is fine
-    // because old payloads always had origin == sender (no forwarding).
-    if (ds.status() == QDataStream::Ok)
-        ds >> h->senderPeer;
-    if (ds.status() != QDataStream::Ok && ds.status() != QDataStream::ReadPastEnd) {
+    if (ds.status() != QDataStream::Ok) {
         if (err)
             *err = QStringLiteral("payload header read error");
         return false;
     }
-    // Reset status so callers see Ok after optional field read.
-    if (ds.status() == QDataStream::ReadPastEnd) {
-        // Tolerate old payloads that lack senderPeer.
+    // M-03 fix: senderPeer is only present in wire format version >= 2.
+    // Old payloads (version=1) do not contain senderPeer; reading it would consume body bytes
+    // and corrupt the changeset. Check version explicitly instead of relying on ReadPastEnd.
+    if (version >= 2) {
+        ds >> h->senderPeer;
+        if (ds.status() != QDataStream::Ok) {
+            if (err)
+                *err = QStringLiteral("payload header senderPeer read error");
+            return false;
+        }
+    } else {
+        // version=1: no senderPeer in the wire format; default to empty (= origin == sender).
         h->senderPeer.clear();
     }
     return true;
@@ -171,12 +175,19 @@ bool PayloadCodec::decode(const QByteArray& data, DecodeResult* out, QString* er
             *err = QStringLiteral("bad magic number");
         return false;
     }
-    if (ver != kVersion) {
+    // C-03 fix: store the full raw payload immediately after verifying the magic number.
+    // This ensures rawPayload is always populated so quarantine can replay via codec->decode().
+    // Previously rawPayload was never assigned, causing empty-BLOB quarantine entries that
+    // permanently lost the payload on schema-mismatch quarantine.
+    out->rawPayload = data;
+    // M-03 fix: accept version=1 (old nodes without senderPeer) and version=2 (new nodes with
+    // senderPeer). Reject anything outside [kVersionMin, kVersion] as truly unsupported.
+    if (ver < kVersionMin || ver > kVersion) {
         if (err)
             *err = QStringLiteral("unsupported codec version %1").arg(ver);
         return false;
     }
-    if (!readHeader(ds, &out->header, err))
+    if (!readHeader(ds, &out->header, ver, err))
         return false;
 
     QByteArray compressed;

@@ -1,5 +1,7 @@
 #include "ComparisonSession.h"
 
+#include "dbridge/Errors.h"
+
 #include <QSqlDatabase>
 #include <QSqlError>
 #include <QSqlQuery>
@@ -18,14 +20,16 @@ namespace dbridge::sync {
 
 ComparisonSession::ComparisonSession(QSqlDatabase& rconn, QSqlDatabase& wconn, TableStateStore& ts,
                                      DiffEngine& diff, InboundTableGate& gate,
-                                     UpsertExecutor& upsert, qint64 streamEpoch)
+                                     UpsertExecutor& upsert, qint64 streamEpoch,
+                                     std::shared_ptr<SyncContext> context)
     : rconn_(rconn),
       wconn_(wconn),
       ts_(ts),
       diff_(diff),
       gate_(gate),
       upsert_(upsert),
-      streamEpoch_(streamEpoch) {
+      streamEpoch_(streamEpoch),
+      context_(std::move(context)) {
 }
 
 // ---------------------------------------------------------------------------
@@ -46,7 +50,9 @@ bool ComparisonSession::initialize(const QStringList& tables,
             return false;
         }
     }
-    pinnedDataVersion_ = 1;  // non-zero means initialized
+    pinnedDataVersion_ = readDataVersion(err);
+    if (pinnedDataVersion_ <= 0)
+        return false;
 
     // Build remoteData_ cache.
     for (const QString& t : tables) {
@@ -208,7 +214,17 @@ QList<RowDiff> ComparisonSession::fetchRemoteRows(const QString& table,
 bool ComparisonSession::save(QString* err) {
     if (staging_.isEmpty()) {
         gate_.releaseAll();
+        if (context_ && context_->rescanFn)
+            context_->rescanFn();
         return true;
+    }
+
+    if (!checkStale(err)) {
+        staging_.discard();
+        gate_.releaseAll();
+        if (context_ && context_->rescanFn)
+            context_->rescanFn();
+        return false;
     }
 
     // Gather pk columns for all staged tables (use first table's PK as simplification;
@@ -231,31 +247,31 @@ bool ComparisonSession::save(QString* err) {
             allPkCols.append(pkCol);
     }
 
-    // C-07 fix: wrap save in a write transaction (BEGIN IMMEDIATE) so it participates in the
-    // single-writer protocol.  Full SyncWorker queue integration is the next step.
-    WriteTxn txn(wconn_);
-    QString txnErr;
-    if (!txn.begin(&txnErr)) {
+    if (!context_ || !context_->workerWriteFn) {
         if (err)
-            *err = txnErr;
+            *err = QStringLiteral("%1: comparison session has no worker write queue")
+                       .arg(QLatin1String(err::E_SYNC_INIT));
         return false;
     }
 
+    StagingBuffer staged = staging_;
     QString saveErr;
-    if (!staging_.save(wconn_, upsert_, allPkCols, &saveErr)) {
-        txn.rollback();
+    const bool ok = context_->workerWriteFn(
+        [staged, allPkCols](QSqlDatabase& wconn, QString* taskErr) mutable {
+            UpsertExecutor upsert;
+            return staged.save(wconn, upsert, allPkCols, taskErr);
+        },
+        &saveErr);
+    if (!ok) {
         if (err)
             *err = saveErr;
         return false;
     }
 
-    if (!txn.commit(&txnErr)) {
-        if (err)
-            *err = txnErr;
-        return false;
-    }
-
+    staging_.discard();
     gate_.releaseAll();
+    if (context_ && context_->rescanFn)
+        context_->rescanFn();
     return true;
 }
 
@@ -268,10 +284,31 @@ void ComparisonSession::discard() {
 // Private helpers
 // ---------------------------------------------------------------------------
 
-bool ComparisonSession::checkStale(QString* /*err*/) {
-    // Simplified: assume not stale. Full implementation would compare
-    // the pinned data_version against current sqlite3_total_changes.
+bool ComparisonSession::checkStale(QString* err) {
+    const qint64 current = readDataVersion(err);
+    if (current <= 0)
+        return false;
+    if (pinnedDataVersion_ != 0 && current != pinnedDataVersion_) {
+        if (err)
+            *err = QStringLiteral(
+                       "%1: staged comparison is stale (pinned data_version=%2, "
+                       "current data_version=%3)")
+                       .arg(QLatin1String(err::E_SYNC_STAGE_STALE))
+                       .arg(pinnedDataVersion_)
+                       .arg(current);
+        return false;
+    }
     return true;
+}
+
+qint64 ComparisonSession::readDataVersion(QString* err) const {
+    QSqlQuery q(rconn_);
+    if (!q.exec(QStringLiteral("PRAGMA data_version")) || !q.next()) {
+        if (err)
+            *err = q.lastError().text();
+        return -1;
+    }
+    return q.value(0).toLongLong();
 }
 
 QVariantMap ComparisonSession::findRemoteRow(const QString& table, const QString& pk) const {
@@ -343,13 +380,11 @@ namespace {
 // objects alive for the full lifetime of the session.
 struct OwnedDeps {
     QString connName;
-    QString wConnName;  // C-07: separate write connection for save()
     QSqlDatabase rconn;
-    QSqlDatabase wconn;
     TableStateStore ts;
     DiffEngine diff;
-    InboundTableGate gate;
     UpsertExecutor upsert;
+    std::shared_ptr<SyncContext> ctx;
 };
 
 class OwningComparisonSession : public IComparisonSession {
@@ -363,10 +398,6 @@ class OwningComparisonSession : public IComparisonSession {
         inner_.reset();
         deps_->rconn.close();
         QSqlDatabase::removeDatabase(deps_->connName);
-        if (deps_->wconn.isOpen()) {
-            deps_->wconn.close();
-            QSqlDatabase::removeDatabase(deps_->wConnName);
-        }
     }
 
     QList<TableDiff> tableDiffs() const override {
@@ -415,6 +446,12 @@ class OwningComparisonSession : public IComparisonSession {
 std::unique_ptr<IComparisonSession> createComparisonSession(const SyncConfig& config,
                                                             QString* err) {
     auto deps = std::make_unique<OwnedDeps>();
+    deps->ctx = SyncContextRegistry::instance().getExisting(config.sqlitePath());
+    if (!deps->ctx || !deps->ctx->inboundTableGate) {
+        if (err)
+            *err = QStringLiteral("SyncContext not initialized for comparison session");
+        return nullptr;
+    }
 
     // Open a read-only connection for diff operations.
     deps->connName =
@@ -430,31 +467,15 @@ std::unique_ptr<IComparisonSession> createComparisonSession(const SyncConfig& co
         return nullptr;
     }
 
-    // C-07 fix: open a dedicated write connection so save() doesn't attempt writes on the
-    // read-only rconn.  Full wiring to SyncWorker's write queue (single-writer guarantee) is
-    // the long-term target; this gives the correct connection type in the interim.
-    deps->wConnName =
-        QStringLiteral("dbridge_cs_rw_") + QUuid::createUuid().toString(QUuid::WithoutBraces);
-    deps->wconn = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), deps->wConnName);
-    deps->wconn.setDatabaseName(config.sqlitePath());
-    deps->wconn.setConnectOptions(QStringLiteral("QSQLITE_BUSY_TIMEOUT=5000"));
-    if (!deps->wconn.open()) {
-        if (err)
-            *err = deps->wconn.lastError().text();
-        deps->rconn.close();
-        QSqlDatabase::removeDatabase(deps->connName);
-        QSqlDatabase::removeDatabase(deps->wConnName);
-        return nullptr;
-    }
-
     // streamEpoch is not known here at factory time (it is owned by SyncWorker);
     // use 0 as a placeholder — the caller can call initialize() to set up diffs.
     constexpr qint64 kPlaceholderEpoch = 0;
 
     auto session = std::make_unique<ComparisonSession>(
         deps->rconn,  // rconn: read-only diff queries
-        deps->wconn,  // wconn: C-07 fix — proper write connection for save()
-        deps->ts, deps->diff, deps->gate, deps->upsert, kPlaceholderEpoch);
+        deps->rconn,  // unused write reference; writes are marshalled to SyncWorker
+        deps->ts, deps->diff, *deps->ctx->inboundTableGate, deps->upsert, kPlaceholderEpoch,
+        deps->ctx);
 
     return std::make_unique<OwningComparisonSession>(std::move(deps), std::move(session));
 }

@@ -22,7 +22,8 @@ bool RowWinnerStore::init(QSqlDatabase& db, QString* err) {
 RowWinner RowWinnerStore::get(QSqlDatabase& db, const QString& table, const QString& pkHash_) {
     QSqlQuery q(db);
     q.prepare(
-        QStringLiteral("SELECT winning_origin, winning_rank, winning_origin_seq, content_hash "
+        QStringLiteral("SELECT winning_origin, winning_rank, winning_origin_seq, "
+                       "content_hash, winning_content "
                        "FROM __sync_row_winner "
                        "WHERE table_name = ? AND pk_hash = ?"));
     q.addBindValue(table);
@@ -37,6 +38,7 @@ RowWinner RowWinnerStore::get(QSqlDatabase& db, const QString& table, const QStr
     w.rank = q.value(1).toInt();
     w.originSeq = q.value(2).toLongLong();
     w.contentHash = q.value(3).toByteArray();
+    w.winningContent = q.value(4).toString();
     return w;
 }
 
@@ -52,13 +54,14 @@ bool RowWinnerStore::put(QSqlDatabase& db, const QString& table, const QString& 
     q.prepare(
         QStringLiteral("INSERT INTO __sync_row_winner "
                        "(table_name, pk_hash, winning_origin, winning_rank, "
-                       " winning_origin_seq, content_hash, updated_ms) "
-                       "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                       " winning_origin_seq, content_hash, winning_content, updated_ms) "
+                       "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
                        "ON CONFLICT(table_name, pk_hash) DO UPDATE SET "
                        "  winning_origin     = excluded.winning_origin, "
                        "  winning_rank       = excluded.winning_rank, "
                        "  winning_origin_seq = excluded.winning_origin_seq, "
                        "  content_hash       = excluded.content_hash, "
+                       "  winning_content    = excluded.winning_content, "
                        "  updated_ms         = excluded.updated_ms"));
     q.addBindValue(table);
     q.addBindValue(pkHash_);
@@ -66,6 +69,7 @@ bool RowWinnerStore::put(QSqlDatabase& db, const QString& table, const QString& 
     q.addBindValue(winner.rank);
     q.addBindValue(winner.originSeq);
     q.addBindValue(winner.contentHash);
+    q.addBindValue(winner.winningContent);
     q.addBindValue(nowMs);
     if (!q.exec()) {
         if (err)

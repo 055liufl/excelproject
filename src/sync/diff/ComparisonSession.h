@@ -6,6 +6,7 @@
 #include <QSqlDatabase>
 #include <QString>
 
+#include "../SyncContext.h"
 #include "../apply/UpsertExecutor.h"
 #include "../schema/TableStateStore.h"
 #include "DiffEngine.h"
@@ -23,7 +24,7 @@ class ComparisonSession : public IComparisonSession {
    public:
     ComparisonSession(QSqlDatabase& rconn, QSqlDatabase& wconn, TableStateStore& ts,
                       DiffEngine& diff, InboundTableGate& gate, UpsertExecutor& upsert,
-                      qint64 streamEpoch);
+                      qint64 streamEpoch, std::shared_ptr<SyncContext> context = nullptr);
 
     // Initialize: compute diffs against remote, open gate.
     // remoteMetas: table->RemoteMeta. remoteRows: table->rows.
@@ -48,6 +49,7 @@ class ComparisonSession : public IComparisonSession {
 
    private:
     bool checkStale(QString* err);
+    qint64 readDataVersion(QString* err) const;
     QVariantMap findRemoteRow(const QString& table, const QString& pk) const;
     QVariantMap findLocalRow(const QString& table, const QString& pk) const;
     QString getPkColumn(const QString& table) const;
@@ -60,6 +62,7 @@ class ComparisonSession : public IComparisonSession {
     UpsertExecutor& upsert_;
     StagingBuffer staging_;
     qint64 streamEpoch_;
+    std::shared_ptr<SyncContext> context_;
     qint64 pinnedDataVersion_ = 0;
     QList<TableDiff> diffs_;
     QHash<QString, RemoteTableData> remoteData_;

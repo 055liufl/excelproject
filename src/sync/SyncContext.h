@@ -7,6 +7,7 @@
 #include <QString>
 
 #include "ForegroundGate.h"
+#include "diff/InboundTableGate.h"
 #include "profile/ProfileSpec.h"
 #include "schema/SchemaCatalog.h"
 #include <functional>
@@ -21,6 +22,7 @@ namespace dbridge::sync {
 struct SyncContext {
     std::optional<SyncConfig> config;  // set by SyncEngine::initialize()
     ForegroundGate gate;
+    std::shared_ptr<InboundTableGate> inboundTableGate = std::make_shared<InboundTableGate>();
     QString contextUuid;  // stored in __sync_context_uuid for double-checking
 
     // Reference count; context is destroyed when refCount reaches 0.
@@ -35,6 +37,17 @@ struct SyncContext {
                                const dbridge::detail::ProfileSpec&,
                                const dbridge::detail::SchemaCatalog&)>
         importFn;
+
+    // Runs a synchronous write task on SyncWorker's single writer thread.
+    std::function<bool(const std::function<bool(QSqlDatabase&, QString*)>&, QString*)>
+        workerWriteFn;
+
+    // Requests an inbox rescan after a comparison gate is released.
+    std::function<void()> rescanFn;
+
+    // L-01 fix: canonical sync table list (expanded from empty = all user tables).
+    // Populated by SyncWorker after initialization so all modules share the same set.
+    QStringList canonicalSyncTables;
 };
 
 // Process-wide singleton registry of SyncContext objects.

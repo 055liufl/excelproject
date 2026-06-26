@@ -2,6 +2,8 @@
 
 #include <QSqlError>
 
+#include "sql/SqlBuilder.h"
+
 namespace dbridge::sync {
 
 // ---------------------------------------------------------------------------
@@ -93,8 +95,8 @@ void UpsertExecutor::clearPreparedCache() {
 
 QString UpsertExecutor::buildUpsertSql(const QString& table, const QStringList& cols,
                                        const QStringList& pkCols, UpsertMode mode) {
-    // Quote identifiers with double-quotes.
-    auto quote = [](const QString& s) { return QStringLiteral("\"") + s + QStringLiteral("\""); };
+    // M-05 fix: use SqlBuilder::quoteIdent so embedded double-quotes are properly escaped.
+    auto quote = [](const QString& s) { return detail::SqlBuilder::quoteIdent(s); };
 
     // Build column list: "c1","c2",...
     QStringList quotedCols;

@@ -302,21 +302,27 @@ static bool buildLookupCache(const ProfileSpec& profile, const SchemaCatalog& ca
             int batchSize = end - start;
 
             // §4.6/4.7 Single column: use IN; multi-column: OR-join AND-clauses
-            QString sql = QStringLiteral("SELECT ") + selectColNames.join(QStringLiteral(", ")) +
-                          QStringLiteral(" FROM ") + lk.fromTable + QStringLiteral(" WHERE ");
+            // H-04 fix: quote all identifiers using SqlBuilder::quoteIdent.
+            QStringList quotedSelectCols;
+            for (const auto& c : selectColNames)
+                quotedSelectCols.append(SqlBuilder::quoteIdent(c));
+            QString sql = QStringLiteral("SELECT ") + quotedSelectCols.join(QStringLiteral(", ")) +
+                          QStringLiteral(" FROM ") + SqlBuilder::quoteIdent(lk.fromTable) +
+                          QStringLiteral(" WHERE ");
 
             if (numMatchCols == 1) {
                 QStringList placeholders;
                 for (int i = 0; i < batchSize; ++i)
                     placeholders.append(QStringLiteral("?"));
-                sql += lk.match[0].first + QStringLiteral(" IN (") +
+                sql += SqlBuilder::quoteIdent(lk.match[0].first) + QStringLiteral(" IN (") +
                        placeholders.join(QStringLiteral(", ")) + QStringLiteral(")");
             } else {
                 QStringList orClauses;
                 for (int i = 0; i < batchSize; ++i) {
                     QStringList andClauses;
                     for (const auto& mp : lk.match)
-                        andClauses.append(mp.first + QStringLiteral(" = ?"));
+                        andClauses.append(SqlBuilder::quoteIdent(mp.first) +
+                                          QStringLiteral(" = ?"));
                     orClauses.append(QStringLiteral("(") +
                                      andClauses.join(QStringLiteral(" AND ")) +
                                      QStringLiteral(")"));

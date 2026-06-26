@@ -14,6 +14,11 @@ SyncEngine::SyncEngine(DataBridge& bridge) : bridge_(bridge) {
 SyncEngine::~SyncEngine() {
     // J-09: Unblock direct imports before tearing down.
     bridge_.setSyncActive(false);
+    if (ctx_) {
+        ctx_->importFn = nullptr;
+        ctx_->workerWriteFn = nullptr;
+        ctx_->rescanFn = nullptr;
+    }
     if (worker_) {
         worker_->requestStop();
         worker_->wait(5000);
@@ -54,7 +59,7 @@ bool SyncEngine::initialize(const SyncConfig& config, QString* err) {
     ctx_->config = *configPtr_;
 
     // Start SyncWorker — it creates its own write connection in run() (I-01 / I-02 fix).
-    worker_ = std::make_unique<SyncWorker>(*configPtr_);
+    worker_ = std::make_unique<SyncWorker>(*configPtr_, ctx_->inboundTableGate);
     QObject::connect(worker_.get(), &SyncWorker::progressUpdated,
                      [this](SyncProgress p) { onWorkerProgress(p); });
     QObject::connect(worker_.get(), &SyncWorker::errorOccurred,
@@ -79,6 +84,9 @@ bool SyncEngine::initialize(const SyncConfig& config, QString* err) {
         worker_->requestStop();
         worker_->wait(3000);
         worker_.reset();
+        ctx_->importFn = nullptr;
+        ctx_->workerWriteFn = nullptr;
+        ctx_->rescanFn = nullptr;
         SyncContextRegistry::instance().release(canonicalKey_);
         ctx_.reset();
         return false;
@@ -98,6 +106,9 @@ bool SyncEngine::initialize(const SyncConfig& config, QString* err) {
         worker_->requestStop();
         worker_->wait(3000);
         worker_.reset();
+        ctx_->importFn = nullptr;
+        ctx_->workerWriteFn = nullptr;
+        ctx_->rescanFn = nullptr;
         SyncContextRegistry::instance().release(canonicalKey_);
         ctx_.reset();
         return false;
@@ -110,6 +121,14 @@ bool SyncEngine::initialize(const SyncConfig& config, QString* err) {
                             const detail::ProfileSpec& profile,
                             const detail::SchemaCatalog& catalog) -> ImportResult {
         return worker_->submitImportSync(opts, xlsxPath, profile, catalog);
+    };
+    ctx_->workerWriteFn = [this](const std::function<bool(QSqlDatabase&, QString*)>& task,
+                                 QString* taskErr) {
+        return worker_ && worker_->submitWriteSync(task, taskErr);
+    };
+    ctx_->rescanFn = [this]() {
+        if (worker_)
+            worker_->requestRescan();
     };
 
     // J-09: Block direct DataBridge::importExcel() while sync is active.

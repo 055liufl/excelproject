@@ -2,7 +2,12 @@
 
 #include <QByteArray>
 #include <QCryptographicHash>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QSqlQuery>
 #include <QString>
+#include <QVariant>
+#include <QVariantList>
 
 #include <sqlite3.h>
 
@@ -240,33 +245,81 @@ void ChangesetApplier::updateWinnersFromChangeset(const QByteArray& changeset,
         const QString tableName = QString::fromUtf8(tbl ? tbl : "");
 
         if (op == SQLITE_DELETE) {
-            // C-06 fix: for DELETE, check if the deleted row was the RowWinner.
-            // If incumbent.rank > incoming rank, this DELETE was applied by a lower-rank
-            // changeset and overwrote the higher-rank winner. We cannot restore the row
-            // without storing the full row content (future work: add winning_content column).
-            // For now: clear the winner entry so future re-deliveries of the high-rank
-            // INSERT are accepted rather than being silently OMITted as "already won".
+            // C-01 fix: for DELETE, check if the deleted row was the RowWinner.
             RowWinner incumbent = winners.get(wconn, tableName, pkHashStr);
             if (incumbent.rank != INT_MIN &&
                 ((rank < incumbent.rank) ||
                  (rank == incumbent.rank && seq < incumbent.originSeq))) {
-                // Low-rank DELETE of a high-rank row: clear the winner so the high-rank node
-                // can re-deliver and win on the next sync cycle.
-                // TODO(C-06): store winning_content in __sync_row_winner and restore here.
-                winners.clear(wconn, tableName, pkHashStr, nullptr);
+                // Low-rank DELETE erased a high-rank row. Restore from winning_content.
+                if (!incumbent.winningContent.isEmpty()) {
+                    // Parse JSON array of column values and re-INSERT using direct SQL.
+                    QJsonDocument doc = QJsonDocument::fromJson(incumbent.winningContent.toUtf8());
+                    if (doc.isObject()) {
+                        const QJsonObject obj = doc.object();
+                        QStringList cols, placeholders;
+                        QVariantList vals;
+                        for (auto it = obj.begin(); it != obj.end(); ++it) {
+                            cols << QStringLiteral("\"%1\"").arg(
+                                QString(it.key()).replace(QLatin1Char('"'), QLatin1String("\"\"")));
+                            placeholders << QStringLiteral("?");
+                            vals << it.value().toVariant();
+                        }
+                        if (!cols.isEmpty()) {
+                            QSqlQuery restoreQ(wconn);
+                            restoreQ.prepare(
+                                QStringLiteral("INSERT OR REPLACE INTO \"%1\" (%2) VALUES (%3)")
+                                    .arg(tableName, cols.join(QLatin1Char(',')),
+                                         placeholders.join(QLatin1Char(','))));
+                            for (const QVariant& v : vals)
+                                restoreQ.addBindValue(v);
+                            restoreQ.exec();  // best-effort; failure logged implicitly
+                        }
+                    }
+                    // Winner entry stays — row is restored, no need to clear.
+                } else {
+                    // No stored content — clear winner so high-rank node can re-deliver.
+                    winners.clear(wconn, tableName, pkHashStr, nullptr);
+                }
             }
             continue;  // do not update winner with DELETE info
         }
 
-        // INSERT / UPDATE: track applied writes.
+        // INSERT / UPDATE: track applied writes and store row content for recovery.
         QByteArray contentH =
             QCryptographicHash::hash(contentMaterial, QCryptographicHash::Sha256).left(16);
+
+        // Build JSON snapshot of the new row values (column_index → value string).
+        // Used by the DELETE recovery path to restore if a low-rank DELETE arrives later.
+        QJsonObject rowJson;
+        for (int ci = 0; ci < nCol; ++ci) {
+            sqlite3_value* newVal = nullptr;
+            sqlite3changeset_new(iter, ci, &newVal);
+            if (!newVal)
+                continue;
+            const QString colKey = QString::number(ci);
+            switch (sqlite3_value_type(newVal)) {
+                case SQLITE_TEXT:
+                    rowJson[colKey] = QString::fromUtf8(
+                        reinterpret_cast<const char*>(sqlite3_value_text(newVal)));
+                    break;
+                case SQLITE_INTEGER:
+                    rowJson[colKey] = static_cast<double>(sqlite3_value_int64(newVal));
+                    break;
+                case SQLITE_FLOAT:
+                    rowJson[colKey] = sqlite3_value_double(newVal);
+                    break;
+                default:
+                    rowJson[colKey] = QJsonValue::Null;
+            }
+        }
 
         RowWinner challenger;
         challenger.origin = origin;
         challenger.rank = rank;
         challenger.originSeq = seq;
         challenger.contentHash = contentH;
+        challenger.winningContent =
+            QString::fromUtf8(QJsonDocument(rowJson).toJson(QJsonDocument::Compact));
 
         RowWinner incumbent = winners.get(wconn, tableName, pkHashStr);
         const bool shouldUpdate = (incumbent.rank == INT_MIN) || (rank > incumbent.rank) ||

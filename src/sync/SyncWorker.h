@@ -38,6 +38,8 @@ namespace dbridge::sync {
 class RoutingTable;
 class ConflictArbiter;
 class RebaseEngine;
+class DeadPeerEvictor;
+class InboundTableGate;
 
 // Single writer thread: processes a serialized task queue, scans inbox
 // artifacts, and broadcasts packed outbox payloads to peers.
@@ -45,13 +47,16 @@ class RebaseEngine;
 class SyncWorker : public QThread {
     Q_OBJECT
    public:
-    explicit SyncWorker(SyncConfig config);
+    explicit SyncWorker(SyncConfig config, std::shared_ptr<InboundTableGate> inboundGate = nullptr);
     ~SyncWorker() override;
 
     using WriteTask = std::function<void()>;
 
     // Enqueue a write task (thread-safe). The task runs on the worker thread.
     void enqueue(WriteTask task);
+    bool submitWriteSync(const std::function<bool(QSqlDatabase&, QString*)>& task,
+                         QString* err = nullptr);
+    void requestRescan();
 
     // Ask the worker to stop after draining remaining tasks.
     void requestStop();
@@ -108,6 +113,11 @@ class SyncWorker : public QThread {
     bool broadcastTopeer(const QString& peer, QString* outErr = nullptr);
     qint64 computePeerAckedSeq(const QString& peer);
     qint64 nextLocalOriginSeq();
+    bool isPeerEvicted(const QString& peer);
+    qint64 peerLastAckMs(const QString& peer);
+    qint64 peerLagBytes(const QString& peer, qint64 afterLocalSeq);
+    void evaluatePeers();
+    bool runBaselineFallbackFor(const QString& artifactName);
 
     // --- Data members ---
     SyncConfig config_;
@@ -146,6 +156,8 @@ class SyncWorker : public QThread {
     std::unique_ptr<ConflictArbiter> arbiter_;
     std::unique_ptr<RebaseEngine> rebaser_;
     std::unique_ptr<QuarantineStore> quarantine_;
+    std::unique_ptr<DeadPeerEvictor> evictor_;
+    std::shared_ptr<InboundTableGate> inboundGate_;
 
     qint64 streamEpoch_ = 0;
     qint64 localOriginSeq_ = 0;  // next seq for local node

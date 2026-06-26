@@ -142,6 +142,7 @@ CREATE TABLE IF NOT EXISTS __sync_row_winner (
   winning_rank    INTEGER NOT NULL,
   winning_origin_seq INTEGER NOT NULL,
   content_hash    BLOB    NOT NULL,
+  winning_content TEXT    NOT NULL DEFAULT '',  -- C-01: JSON-encoded row for low-rank DELETE recovery
   updated_ms      INTEGER NOT NULL,
   PRIMARY KEY(table_name, pk_hash)
 ))"),

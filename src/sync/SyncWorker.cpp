@@ -14,12 +14,16 @@
 #include <QUuid>
 
 #include "service/ImportService.h"
+#include "sync/SyncContext.h"
 #include "sync/SyncDDL.h"
 #include "sync/WriteTxn.h"
+#include "sync/baseline/BaselineManager.h"
 #include "sync/capture/SqliteHandle.h"
 #include "sync/conflict/ConflictArbiter.h"
 #include "sync/conflict/RebaseEngine.h"
 #include "sync/conflict/RoutingTable.h"
+#include "sync/diff/InboundTableGate.h"
+#include "sync/peer/DeadPeerEvictor.h"
 #include "sync/schema/SchemaEligibility.h"
 #include "sync/selection/ChunkStreamer.h"
 #include "sync/selection/ConsistencyCache.h"
@@ -29,7 +33,40 @@
 
 namespace dbridge::sync {
 
-SyncWorker::SyncWorker(SyncConfig config) : config_(std::move(config)) {
+namespace {
+QSet<QString> payloadTables(const DecodeResult& dec) {
+    QSet<QString> tables;
+    if (dec.kind == PayloadKind::SelectionPush) {
+        for (const FrozenEntry& entry : dec.selection.frozenEntries) {
+            if (!entry.table.isEmpty())
+                tables.insert(entry.table);
+        }
+        return tables;
+    }
+
+    sqlite3_changeset_iter* it = nullptr;
+    if (sqlite3changeset_start(
+            &it, dec.changeset.size(),
+            const_cast<void*>(static_cast<const void*>(dec.changeset.constData()))) != SQLITE_OK)
+        return tables;
+
+    while (sqlite3changeset_next(it) == SQLITE_ROW) {
+        const char* tableName = nullptr;
+        int columns = 0;
+        int op = 0;
+        int indirect = 0;
+        if (sqlite3changeset_op(it, &tableName, &columns, &op, &indirect) == SQLITE_OK &&
+            tableName) {
+            tables.insert(QString::fromUtf8(tableName));
+        }
+    }
+    sqlite3changeset_finalize(it);
+    return tables;
+}
+}  // namespace
+
+SyncWorker::SyncWorker(SyncConfig config, std::shared_ptr<InboundTableGate> inboundGate)
+    : config_(std::move(config)), inboundGate_(std::move(inboundGate)) {
     av_ = std::make_unique<AppliedVectorStore>();
     rw_ = std::make_unique<RowWinnerStore>();
     ts_ = std::make_unique<TableStateStore>();
@@ -46,6 +83,12 @@ SyncWorker::SyncWorker(SyncConfig config) : config_(std::move(config)) {
     arbiter_ = std::make_unique<ConflictArbiter>();
     rebaser_ = std::make_unique<RebaseEngine>();
     quarantine_ = std::make_unique<QuarantineStore>();
+    evictor_ = std::make_unique<DeadPeerEvictor>();
+    evictor_->configure(config_.peerLagSoftSeq(), config_.peerLagHardSeq(),
+                        config_.peerLagSoftBytes(), config_.peerLagHardBytes(),
+                        config_.peerLagSoftMs(), config_.peerLagHardMs());
+    if (!inboundGate_)
+        inboundGate_ = std::make_shared<InboundTableGate>();
     // InboxWatcher is created in run() so it lives on the worker thread
 }
 
@@ -58,6 +101,46 @@ void SyncWorker::enqueue(WriteTask task) {
     QMutexLocker lk(&queueMutex_);
     taskQueue_.append(std::move(task));
     queueCond_.wakeOne();
+}
+
+bool SyncWorker::submitWriteSync(const std::function<bool(QSqlDatabase&, QString*)>& task,
+                                 QString* err) {
+    if (!isRunning() || !wconnPtr_) {
+        if (err)
+            *err = QStringLiteral("SyncWorker not ready");
+        return false;
+    }
+    if (QThread::currentThread() == this) {
+        return task(*wconnPtr_, err);
+    }
+
+    auto sharedPromise = std::make_shared<std::promise<QPair<bool, QString>>>();
+    std::future<QPair<bool, QString>> future = sharedPromise->get_future();
+    enqueue([this, task, sp = sharedPromise]() {
+        QString taskErr;
+        bool ok = false;
+        if (wconnPtr_) {
+            ok = task(*wconnPtr_, &taskErr);
+        } else {
+            taskErr = QStringLiteral("wconn not available in worker");
+        }
+        sp->set_value(qMakePair(ok, taskErr));
+    });
+    if (future.wait_for(std::chrono::seconds(60)) == std::future_status::timeout) {
+        if (err)
+            *err = QStringLiteral("submitWriteSync timed out after 60s");
+        return false;
+    }
+    const auto result = future.get();
+    if (!result.first && err)
+        *err = result.second;
+    return result.first;
+}
+
+void SyncWorker::requestRescan() {
+    if (!isRunning())
+        return;
+    enqueue([this]() { scanInbox(); });
 }
 
 void SyncWorker::requestStop() {
@@ -242,6 +325,14 @@ void SyncWorker::run() {
     // loop).  It now exposes a synchronous scan() method called explicitly in scanInbox().
     watcher_ = std::make_unique<InboxWatcher>(config_.inboxDir(), wconn, *ledger_);
 
+    // L-01 fix: publish the canonical sync table list to the shared SyncContext so other
+    // modules (ComparisonSession, BatchTransfer, diagnostics) can read the same expanded set.
+    {
+        auto ctx = SyncContextRegistry::instance().getExisting(config_.sqlitePath());
+        if (ctx && !canonicalSyncTables_.isEmpty())
+            ctx->canonicalSyncTables = canonicalSyncTables_;
+    }
+
     // Signal successful initialization to initialize() caller
     initSemaphore_.release();
 
@@ -253,7 +344,18 @@ void SyncWorker::run() {
         {
             QMutexLocker lk(&queueMutex_);
             if (taskQueue_.isEmpty() && !stopRequested_) {
-                queueCond_.wait(&queueMutex_, static_cast<ulong>(config_.broadcastIntervalMs()));
+                // L-02 fix: shorten wait when an ACK deadline is active so E_SYNC_ACK_TIMEOUT
+                // fires at the configured time, not delayed by broadcastIntervalMs.
+                qint64 waitMs = config_.broadcastIntervalMs();
+                if (ackWaiting_.load()) {
+                    const qint64 remaining =
+                        ackDeadlineMs_.load() - QDateTime::currentMSecsSinceEpoch();
+                    if (remaining > 0 && remaining < waitMs)
+                        waitMs = remaining;
+                    else if (remaining <= 0)
+                        waitMs = 1;  // already expired; wake immediately
+                }
+                queueCond_.wait(&queueMutex_, static_cast<ulong>(waitMs));
             }
             if (stopRequested_ && taskQueue_.isEmpty())
                 break;
@@ -337,6 +439,8 @@ void SyncWorker::scanInbox() {
                             "Baseline fallback required.")
                  .arg(kDefaultGapTimeoutMs)
                  .arg(stale.size())});
+        for (const QString& artifactName : stale)
+            runBaselineFallbackFor(artifactName);
     }
 }
 
@@ -382,6 +486,9 @@ bool SyncWorker::processArtifact(const QString& path) {
     }
 
     ledger_->markSeen(*wconnPtr_, name, nullptr);
+    if (inboundGate_ && inboundGate_->shouldDefer(payloadTables(dec))) {
+        return false;
+    }
 
     bool ok = false;
     if (dec.kind == PayloadKind::Changeset)
@@ -447,6 +554,13 @@ bool SyncWorker::processChangesetArtifact(const DecodeResult& dec, const QString
         return false;
     }
 
+    // H-03(table_state): surface stale warning so callers know DiffEngine data may be stale.
+    if (!res.tableStateStaleSince.isEmpty()) {
+        emit errorOccurred(
+            {err::W_SYNC_UNTRACKED_CHANGE, Severity::Warning, QStringLiteral("table_state"),
+             hdr.origin, QStringLiteral("table_state update failed: ") + res.tableStateStaleSince});
+    }
+
     // I-16/J-13: Store rebase buffer; use insertion-ordered list for correct LRU eviction.
     if (!res.applyOutcome.rebaseBuffer.isEmpty()) {
         QString key = hdr.origin + QLatin1Char('/') + QString::number(hdr.originSeq);
@@ -484,10 +598,14 @@ bool SyncWorker::processSelectionPushArtifact(const DecodeResult& dec, const QSt
     // Insert on first chunk arrival (ON CONFLICT DO NOTHING is idempotent for subsequent chunks).
     if (!pushId.isEmpty()) {
         QSqlQuery ins(*wconnPtr_);
+        // H-05 fix: ON CONFLICT DO UPDATE so re-sends refresh total_chunks/status/updated_ms.
         ins.prepare(
-            QStringLiteral("INSERT OR IGNORE INTO __sync_push_progress "
+            QStringLiteral("INSERT INTO __sync_push_progress "
                            "(push_id, origin, peer, total_chunks, schema_ver, status, updated_ms) "
-                           "VALUES (?, ?, ?, ?, ?, 'streaming', ?)"));
+                           "VALUES (?, ?, ?, ?, ?, 'streaming', ?) "
+                           "ON CONFLICT(push_id) DO UPDATE SET "
+                           "  status='streaming', total_chunks=excluded.total_chunks, "
+                           "  schema_ver=excluded.schema_ver, updated_ms=excluded.updated_ms"));
         ins.addBindValue(pushId);
         ins.addBindValue(hdr.origin);
         ins.addBindValue(config_.nodeId());
@@ -573,6 +691,11 @@ bool SyncWorker::processSelectionPushArtifact(const DecodeResult& dec, const QSt
             {res.errorCode, Severity::Error, "selection_push", hdr.origin, res.errorMsg});
         return false;
     }
+    if (!res.tableStateStaleSince.isEmpty()) {
+        emit errorOccurred(
+            {err::W_SYNC_UNTRACKED_CHANGE, Severity::Warning, QStringLiteral("table_state"),
+             hdr.origin, QStringLiteral("table_state update failed: ") + res.tableStateStaleSince});
+    }
     PushChunkAck ack;
     ack.pushId = pushId;
     ack.chunkSeq = chunkSeq;
@@ -619,6 +742,7 @@ bool SyncWorker::processAckArtifact(const QString& path, const QString& name) {
             p.percent = 100;
             emit progressUpdated(p);
         }
+        evaluatePeers();
         return true;
     }
     // C-05 fix: process PushChunkAck — record per-chunk status and check for push completion.
@@ -673,6 +797,7 @@ bool SyncWorker::processAckArtifact(const QString& path, const QString& name) {
                 }
             }
         }
+        evaluatePeers();
         return true;
     }
     return false;
@@ -681,6 +806,8 @@ bool SyncWorker::processAckArtifact(const QString& path, const QString& name) {
 bool SyncWorker::broadcast(QString* outErr) {
     bool wroteAny = false;
     for (const QString& peer : config_.peerNodes()) {
+        if (isPeerEvicted(peer))
+            continue;
         QString peerErr;
         if (broadcastTopeer(peer, &peerErr))
             wroteAny = true;
@@ -694,6 +821,7 @@ bool SyncWorker::broadcast(QString* outErr) {
         if (outErr && outErr->isEmpty())
             *outErr = ackErr;
     }
+    evaluatePeers();
     return wroteAny;
 }
 
@@ -752,8 +880,9 @@ bool SyncWorker::broadcastTopeer(const QString& peer, QString* outErr) {
         hdr.routeTag = peer;
 
         QByteArray payload = codec_->encodeChangeset(hdr, changesetToSend);
-        QString artifactName = peer + QStringLiteral("_") + QString::number(entry.localSeq) +
-                               QStringLiteral(".payload");
+        // H-07 fix: use stable artifact naming contract for interop with third-party mover.
+        QString artifactName =
+            ddl::changesetArtifactName(entry.origin, hdr.streamEpoch, entry.originSeq);
         QString writeErr;
         if (!outbox_->write(artifactName, payload, &writeErr)) {
             emit errorOccurred(
@@ -778,6 +907,121 @@ bool SyncWorker::broadcastTopeer(const QString& peer, QString* outErr) {
 qint64 SyncWorker::computePeerAckedSeq(const QString& peer) {
     // I-15 fix: query the acked seq for this specific peer, not the global min.
     return ackStore_->ackedSeq(*wconnPtr_, peer, config_.nodeId(), streamEpoch_);
+}
+
+bool SyncWorker::isPeerEvicted(const QString& peer) {
+    if (!wconnPtr_)
+        return false;
+    QSqlQuery q(*wconnPtr_);
+    q.prepare(
+        QStringLiteral("SELECT COALESCE(MAX(pending_baseline), 0) "
+                       "FROM __sync_outbound_ack WHERE peer = ?"));
+    q.addBindValue(peer);
+    if (!q.exec() || !q.next())
+        return false;
+    return q.value(0).toInt() != 0;
+}
+
+qint64 SyncWorker::peerLastAckMs(const QString& peer) {
+    QSqlQuery q(*wconnPtr_);
+    q.prepare(
+        QStringLiteral("SELECT COALESCE(MAX(last_ack_ms), 0) "
+                       "FROM __sync_outbound_ack "
+                       "WHERE peer = ? AND origin != '__broadcast__'"));
+    q.addBindValue(peer);
+    if (!q.exec() || !q.next())
+        return 0;
+    return q.value(0).toLongLong();
+}
+
+qint64 SyncWorker::peerLagBytes(const QString& peer, qint64 afterLocalSeq) {
+    QSqlQuery q(*wconnPtr_);
+    q.prepare(
+        QStringLiteral("SELECT COALESCE(SUM(byte_size), 0) "
+                       "FROM __sync_changelog "
+                       "WHERE origin != ? AND local_seq > ?"));
+    q.addBindValue(peer);
+    q.addBindValue(afterLocalSeq);
+    if (!q.exec() || !q.next())
+        return 0;
+    return q.value(0).toLongLong();
+}
+
+void SyncWorker::evaluatePeers() {
+    if (!wconnPtr_ || !evictor_)
+        return;
+
+    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+    const qint64 localHead = clog_->maxLocalSeq(*wconnPtr_);
+    for (const QString& peer : config_.peerNodes()) {
+        const bool alreadyEvicted = isPeerEvicted(peer);
+        const qint64 lastSent = ackStore_->lastSentLocalSeq(*wconnPtr_, peer, streamEpoch_);
+
+        DeadPeerEvictor::PeerState state;
+        state.peer = peer;
+        state.lastAckMs = peerLastAckMs(peer);
+        state.lagSeq = qMax<qint64>(0, localHead - lastSent);
+        state.lagBytes = peerLagBytes(peer, lastSent);
+        state.evicted = alreadyEvicted;
+
+        const auto level = evictor_->evaluate(state, nowMs);
+        if (level == DeadPeerEvictor::AlertLevel::Dead && !alreadyEvicted) {
+            QString evictErr;
+            if (evictor_->evict(*wconnPtr_, peer, *ackStore_, &evictErr)) {
+                emit errorOccurred({err::E_SYNC_PEER_DEAD, Severity::Error, QStringLiteral("peer"),
+                                    peer,
+                                    QStringLiteral("Peer evicted; pending baseline required")});
+            } else {
+                emit errorOccurred({err::E_SYNC_TRANSPORT, Severity::Warning,
+                                    QStringLiteral("peer"), peer, evictErr});
+            }
+        } else if (level == DeadPeerEvictor::AlertLevel::Lagging) {
+            emit errorOccurred({err::W_SYNC_PEER_LAGGING, Severity::Warning, QStringLiteral("peer"),
+                                peer, QStringLiteral("Peer lag exceeds soft threshold")});
+        }
+    }
+}
+
+bool SyncWorker::runBaselineFallbackFor(const QString& artifactName) {
+    if (!wconnPtr_ || !hPtr_)
+        return false;
+
+    const QString path = config_.inboxDir() + QDir::separator() + artifactName;
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly))
+        return false;
+    const QByteArray data = f.readAll();
+    f.close();
+
+    DecodeResult dec;
+    QString decErr;
+    if (!codec_->decode(data, &dec, &decErr) || dec.kind != PayloadKind::Changeset)
+        return false;
+
+    BaselineManager baseline;
+    const qint64 applied = av_->current(*wconnPtr_, dec.header.origin, dec.header.streamEpoch);
+    if (!baseline.shouldFallbackToBaseline(applied, dec.header.originSeq))
+        return false;
+
+    BaselineManager::BaselineArtifact artifact;
+    QString baselineErr;
+    if (!baseline.exportBaseline(*wconnPtr_, canonicalSyncTables_, &artifact, &baselineErr)) {
+        emit errorOccurred({err::E_SYNC_BASELINE_FAILED, Severity::Error,
+                            QStringLiteral("baseline"), dec.header.origin, baselineErr});
+        return false;
+    }
+
+    ConsistencyCache cache;
+    cache.init(*wconnPtr_, config_.consistencyCacheDurable(), nullptr);
+    qint64 newAnchorSeq = 0;
+    if (!baseline.applyBaseline(*wconnPtr_, hPtr_, artifact, *av_, *ts_, *rw_, cache,
+                                dec.header.streamEpoch, dec.header.origin, &newAnchorSeq,
+                                &baselineErr)) {
+        emit errorOccurred({err::E_SYNC_BASELINE_FAILED, Severity::Error,
+                            QStringLiteral("baseline"), dec.header.origin, baselineErr});
+        return false;
+    }
+    return true;
 }
 
 // I-04: Submit import to run on the worker thread using wconn + session capture.
@@ -1019,9 +1263,9 @@ void SyncWorker::enqueueSelectionPush(const SyncSelection& selection,
                 body.rows.append(row);
 
             QByteArray payload = codec_->encodeSelectionPush(hdr, body);
-            const QString artifactName = QStringLiteral("%1_sel_%2_%3.payload")
-                                             .arg(config_.nodeId(), chunk.pushId)
-                                             .arg(chunk.chunkSeq, 4, 10, QLatin1Char('0'));
+            // H-07 fix: use stable naming contract for interop with third-party transport mover.
+            const QString artifactName =
+                ddl::selectionPushArtifactName(chunk.pushId, chunk.chunkSeq);
             QString writeErr;
             if (!outbox_->write(artifactName, payload, &writeErr)) {
                 emit errorOccurred({err::E_SYNC_TRANSPORT, Severity::Error,

@@ -14,6 +14,7 @@ struct RowWinner {
     int rank = INT_MIN;  // sentinel: no winner
     qint64 originSeq = 0;
     QByteArray contentHash;
+    QString winningContent;  // C-01: JSON-encoded row for low-rank DELETE recovery
 };
 
 // Maintains __sync_row_winner with (rank, seq) max-element conflict resolution (G-01).

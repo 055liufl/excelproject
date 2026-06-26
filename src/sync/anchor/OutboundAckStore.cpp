@@ -59,7 +59,7 @@ qint64 OutboundAckStore::minAckedSeq(QSqlDatabase& db, const QString& origin, qi
     QSqlQuery q(db);
     q.prepare(
         QStringLiteral("SELECT MIN(acked_seq) FROM __sync_outbound_ack "
-                       "WHERE origin = ? AND stream_epoch = ?"));
+                       "WHERE origin = ? AND stream_epoch = ? AND pending_baseline = 0"));
     q.addBindValue(origin);
     q.addBindValue(epoch);
     if (!q.exec() || !q.next())

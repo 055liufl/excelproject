@@ -57,14 +57,14 @@ bool BatchTransfer::startImport(const ImportOptions& options, QString* err) {
         return false;
     const QString dbPath = bridge_.dbPath();
 
-    // M-01 fix: acquire the shared ForegroundGate so import is mutually exclusive with
-    // sync() / syncSelected() on the same database.
-    bool hasGate = false;
+    // M-01 / H-06 fix: acquire the shared ForegroundGate. Capture shared_ptr to prevent
+    // use-after-free when SyncEngine destroys the context while import runs in background.
+    std::shared_ptr<sync::SyncContext> gateCtx;
     auto ctx = sync::SyncContextRegistry::instance().getExisting(dbPath);
     if (ctx) {
         if (!ctx->gate.tryAcquire(err))
             return false;
-        hasGate = true;
+        gateCtx = ctx;  // keep alive until lambda completes
     }
 
     // Reset all import state.
@@ -75,15 +75,10 @@ bool BatchTransfer::startImport(const ImportOptions& options, QString* err) {
     importProgress_ = TransferProgress{};
     lock.unlock();
 
-    importFuture_ = QtConcurrent::run([this, options, dbPath, profile, catalog, hasGate]() {
+    importFuture_ = QtConcurrent::run([this, options, dbPath, profile, catalog, gateCtx]() {
         runImport(options, dbPath, profile, catalog);
-        // Release gate after completion (hasGate captured by value).
-        if (hasGate) {
-            const QString dp = bridge_.dbPath();
-            auto c = sync::SyncContextRegistry::instance().getExisting(dp);
-            if (c)
-                c->gate.release();
-        }
+        if (gateCtx)
+            gateCtx->gate.release();
     });
     return true;
 }
@@ -112,13 +107,13 @@ bool BatchTransfer::startExport(const ExportOptions& options, QString* err) {
         return false;
     const QString dbPath = bridge_.dbPath();
 
-    // M-06 fix: export also acquires the shared ForegroundGate.
-    bool hasGate = false;
+    // M-06 / H-06 fix: export acquires gate, capturing shared_ptr for lifetime safety.
+    std::shared_ptr<sync::SyncContext> gateCtx;
     auto ctx = sync::SyncContextRegistry::instance().getExisting(dbPath);
     if (ctx) {
         if (!ctx->gate.tryAcquire(err))
             return false;
-        hasGate = true;
+        gateCtx = ctx;
     }
 
     exportStopRequested_.store(false);
@@ -128,14 +123,10 @@ bool BatchTransfer::startExport(const ExportOptions& options, QString* err) {
     exportProgress_ = TransferProgress{};
     lock.unlock();
 
-    exportFuture_ = QtConcurrent::run([this, options, dbPath, profile, catalog, hasGate]() {
+    exportFuture_ = QtConcurrent::run([this, options, dbPath, profile, catalog, gateCtx]() {
         runExport(options, dbPath, profile, catalog);
-        if (hasGate) {
-            const QString dp = bridge_.dbPath();
-            auto c = sync::SyncContextRegistry::instance().getExisting(dp);
-            if (c)
-                c->gate.release();
-        }
+        if (gateCtx)
+            gateCtx->gate.release();
     });
     return true;
 }

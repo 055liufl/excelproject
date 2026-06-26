@@ -1,4 +1,4 @@
-# SQLite 同步工具实现评审报告（第二十二轮）
+# SQLite 同步工具实现评审报告（第二十三轮）
 
 评审日期：2026-06-26
 
@@ -6,22 +6,23 @@
 
 | 维度 | 分数 | 结论 |
 | --- | ---: | --- |
-| 功能合规性 | 88 | 上一轮三项指定修复已落地；Excel OpenSpec 主路径未发现新的 C/H/M。同步侧仍有 changeset 过滤后处理、导入 table_state、复合主键能力差距。 |
-| 同步协议正确性 | 84 | RowWinner 决定性 tie-breaker 和 `putOrRefill()` 失败传播已修复；但 `apply_v2` 过滤只覆盖业务 apply，不覆盖 RowWinner/table_state 后处理，可能污染或绕过同步表边界。 |
-| Excel 导入/导出合规性 | 92 | `columnOrder`、reverse lookup、fkInject、row lookup、time-format 的 loader/validator/export/import 主干与规格总体一致；运行时测试仍被 Qt 符号冲突阻断。 |
-| 安全性 | 88 | SQL 标识符引用和绑定整体可接受；本轮发现 changeset 后处理未复用 `__sync_*` / allow-list 过滤，属于同步边界绕过风险。 |
-| 边界处理 | 83 | table_state 在导入、本地写、selection push 和失败回滚语义上仍不够硬；复合主键/WITHOUT ROWID 能力仍窄于设计。 |
-| 综合评分 | 85 | 较第二十一轮指定修复有进展，但新增 1 个 High、4 个 Medium，本轮未通过。 |
+| 功能合规性 | 90 | 第二十二轮指定 4 项修复均已落地；同步主干继续向设计靠拢。仍存在本地 origin_seq 事务外分配导致严格连续协议可被错误路径打断的问题，以及复合主键能力窄于设计文档的问题。 |
+| 同步协议正确性 | 86 | allow-list、table_state、哈希口径和回滚语义明显改善；但本地 changeset 序列在失败事务中被消耗，会制造对端永久 GAP_PENDING，属于协议层 High 风险。 |
+| Excel 导入/导出合规性 | 92 | columnOrder、reverse lookup、fkInject、row lookup、time-format 的 loader/validator/export/import 主干未发现新的 C/H/M 偏差。 |
+| 安全性 | 90 | SQL 标识符引用和绑定整体可接受；上轮 changeset 后处理绕过 allow-list 的边界风险已修复。 |
+| 边界处理 | 86 | table_state 写失败现在回滚，导入后会重算；但失败路径的本地序号、复合 PK/WITHOUT ROWID 能力、自动化测试可运行性仍是主要薄弱点。 |
+| 综合评分 | 88 | 较第二十二轮有实质进展，但本轮仍有 1 个 High、1 个 Medium，未达到通过标准。 |
 
-本轮审查范围：指定 10 组规格文档、`openspec/changes/archive/` 下 27 个归档文档，以及 `src/` 下 122 个源文件。自动验证：`cmake --build build -- -j2` 通过；`ctest --test-dir build --output-on-failure` 未注册测试；直接运行 `build/tests/tst_profile_loader` 仍因 Qt 符号 `_Z13qgpu_featuresRK7QString, version Qt_5` lookup error 失败，未进入业务断言。
+本轮审查范围：指定 10 组规格文档、`openspec/changes/archive/` 下归档变更文档，以及 `src/` 下全部源文件。验证命令：`cmake --build build -- -j2` 通过；`ctest --test-dir build --output-on-failure` 返回 “No tests were found”；直接运行 `build/tests/tst_*` 时首个二进制因 Qt 运行时符号 `_Z13qgpu_featuresRK7QString, version Qt_5` lookup error 失败，未进入业务断言。
 
 ## 上一轮修复验证（表格）
 
 | 编号 | 状态 | 验证结论 |
 | --- | --- | --- |
-| H-01 | 通过 | `SyncConfig::Builder::build()` 已拒绝显式配置的重复 rank；`ConflictArbiter::beats()`、`RowWinnerStore::beats()`、`ChangesetApplier::conflictCb()` / DELETE dominated 判断均加入 `originId` 字典序 tie-breaker，同 rank/同 seq 不再按到达顺序分歧。 |
-| M-01 | 通过 | `ChangesetApplier::updateWinnersFromChangeset()` 已对 `winners.putOrRefill()` 传入 `putErr` 并检查返回值，失败时返回 false，由外层回滚 apply。 |
-| M-03 | 部分通过 | changeset 分支 `CapturedWriteTemplate::extractMutations()` 已改为列名排序的 `TableStateStore::rowHash()` 口径；但 Branch B/C 的 RowMutation table_state 路径仍使用裸值序列，见本轮 M-02。 |
+| H-01 | 通过 | `ChangesetApplier::isAllowedSyncTable()` 已抽出并被 `filterCb()`、`updateWinnersFromChangeset()`、`CapturedWriteTemplate::extractMutations()` 共享；`__sync_*` 和非同步表不再进入 RowWinner/table_state 后处理。见 `src/sync/apply/ChangesetApplier.cpp:144`、`src/sync/apply/ChangesetApplier.cpp:159`、`src/sync/apply/ChangesetApplier.cpp:269`、`src/sync/apply/CapturedWriteTemplate.cpp:508`。 |
+| M-01 | 通过 | `submitImportSync()` 在 `SessionRecorder::sealInto()` 成功后、`txn.commit()` 前调用 `TableStateStore::resetFromBaseline()`，失败时回滚事务；空 `syncTables` 也会在 worker 初始化时展开为用户表清单。见 `src/sync/SyncWorker.cpp:219`、`src/sync/SyncWorker.cpp:1450`、`src/sync/SyncWorker.cpp:1473`。 |
+| M-02 | 通过 | Branch B/C 的 `beforeHash` 和 `afterHash` 已改为构造 `QVariantMap` 后调用 `TableStateStore::rowHash()`，与 baseline 全扫口径一致；当前调用方传入的是完整 frozen/staged row。见 `src/sync/apply/CapturedWriteTemplate.cpp:273`、`src/sync/apply/CapturedWriteTemplate.cpp:293`、`src/sync/diff/StagingBuffer.cpp:71`。 |
+| M-03 | 通过 | Branch A 与 Branch B/C 在 `TableStateStore::applyMutations()` 失败时均回滚并返回错误，不再降级 warning 后提交。见 `src/sync/apply/CapturedWriteTemplate.cpp:135`、`src/sync/apply/CapturedWriteTemplate.cpp:429`。 |
 
 ## Critical 问题（如有）
 
@@ -29,51 +30,27 @@
 
 ## High 问题（如有）
 
-### H-01：`apply_v2` 的 table allow-list 没有同步作用到 RowWinner/table_state 后处理，过滤表仍可污染元数据甚至触发恢复写入
+### H-01：本地 `origin_seq` 在事务成功前自增，失败路径会制造严格连续协议无法补齐的缺口
 
-- 位置：`src/sync/apply/ChangesetApplier.cpp:99`、`src/sync/apply/ChangesetApplier.cpp:111`、`src/sync/apply/ChangesetApplier.cpp:144`、`src/sync/apply/ChangesetApplier.cpp:234`、`src/sync/apply/ChangesetApplier.cpp:267`、`src/sync/apply/ChangesetApplier.cpp:368`、`src/sync/apply/ChangesetApplier.cpp:463`、`src/sync/apply/CapturedWriteTemplate.cpp:128`、`src/sync/apply/CapturedWriteTemplate.cpp:444`
-- 描述：`filterCb()` 正确拒绝 `__sync_*` 和不在 `syncTables` 中的表，但该过滤只传给 `sqlite3changeset_apply_v2()`。apply 完成后，`updateWinnersFromChangeset()` 重新遍历完整 changeset，未接收/检查同一 allow-list；`CapturedWriteTemplate::extractMutations()` 也对完整 changeset 生成 table_state delta。
-- 影响：被 `apply_v2` 跳过的表仍会写入 `__sync_row_winner` 和 `__sync_table_state`。更严重的是，若先前已被污染出 RowWinner，后续一个被过滤表的低 rank DELETE 会进入恢复分支，并执行 `INSERT ... ON CONFLICT DO UPDATE` 写回该表，绕过同步表 allow-list；`__sync_*` 内部表同样缺少后处理层防线。
-- 修复建议：抽出统一 `isAllowedSyncTable(table, syncTables)`，同时排除 `__sync_*`；`updateWinnersFromChangeset()`、`extractMutations()` 与 `filterCb()` 使用同一判定。补充测试：payload 同时包含允许表、非允许表、`__sync_*` 表，断言被过滤表没有业务写入、RowWinner、table_state 变化；再构造“先污染 RowWinner 后 DELETE”的回归，断言不会恢复写入过滤表。
+- 位置：`src/sync/SyncWorker.cpp:765`、`src/sync/SyncWorker.cpp:1450`、`src/sync/SyncWorker.cpp:1516`、`src/sync/SyncWorker.cpp:1562`、`src/sync/apply/CapturedWriteTemplate.cpp:342`、`src/sync/apply/CapturedWriteTemplate.cpp:429`、`src/sync/capture/SessionRecorder.cpp:77`、`src/sync/apply/AppliedVectorStore.cpp:24`
+- 描述：`nextLocalOriginSeq()` 直接 `++localOriginSeq_`，但它在 selection push 接收、本地导入、ComparisonSession save 等路径调用时，均发生在 `CapturedWriteTemplate` 或手写事务真正 commit 之前。若后续 `sealInto()` 之后的 `resetFromBaseline()`、`applyMutations()`、push progress 更新或 commit 失败，业务/changelog 事务会回滚，但内存中的 `localOriginSeq_` 不会回退。
+- 影响：下一次成功本地写会写入更大的 `origin_seq`，而被回滚的序号没有任何 changelog 制品。对端 `AppliedVectorStore::check()` 要求首包为 1、后续严格 `applied_seq + 1`，因此会把后续 payload 判为 `GAP_PENDING`，等待一个永远不会出现的缺口。该问题可导致当前进程生命周期内的广播同步停滞；重启后从 `MAX(origin_seq)` 重建内存序号只能缓解，不是协议保证。
+- 修复建议：把本地序号分配纳入同一事务和持久化状态。可选方案：新增 `__sync_origin_seq(origin, stream_epoch, next_seq)` 表，用 `BEGIN IMMEDIATE` 内的 `UPDATE ... RETURNING` 或等价 SELECT+UPDATE 分配；或先用候选序号，只有 commit 成功后才推进内存计数，失败时从 `MAX(origin_seq)` 重新校准。补充回归：在导入 seal 后 table_state 失败、Branch C applyMutations 失败、selection push chunk progress 失败三处注入失败，断言下一次成功 changelog 的 `origin_seq` 不跳号，远端不会进入 gap。
 
 ## Medium 问题（如有）
 
-### M-01：同步激活后的 `IBatchTransfer` 导入绕过 `CapturedWriteTemplate::branchC()`，成功导入不维护 `table_state`
+### M-01：同步 eligibility、selection、diff 仍只支持单列主键，窄于当前设计文档允许的复合主键能力
 
-- 位置：`src/batch/BatchTransfer.cpp:116`、`src/sync/SyncEngine.cpp:114`、`src/sync/SyncWorker.cpp:1383`、`src/sync/SyncWorker.cpp:1412`、`src/sync/SyncWorker.cpp:1443`、`src/sync/SyncWorker.cpp:1452`、`src/sync/SyncWorker.cpp:1464`
-- 描述：同步激活后，批量导入通过 `ctx->importFn` 改道到 `SyncWorker::submitImportSync()`。该函数注释称“CapturedWriteTemplate branch C”，但实际手写 `WriteTxn + rec_->begin + ImportService::run + rec_->sealInto + commit`，没有构造 `WriteParams{LocalWrite}`，也没有调用 `TableStateStore::applyMutations()`。
-- 影响：导入业务数据和 changelog 会提交，peer 端通过 changeset apply 可能维护了 table_state，但导入源端的 `__sync_table_state` 不更新。场景2 `DiffEngine` 用 `schema_fingerprint + row_count + content_checksum` 判等，源端会出现 missing/陈旧状态，导致表级零全量判等假红或 OnlyRemote/OnlyLocal。
-- 修复建议：导入路径应真正复用 `CapturedWriteTemplate`，或让 `ImportService` 输出可复用的 `RowMutation` / `TableMutation` 列表并在同一事务内更新 table_state。补充测试：同步激活后通过 `IBatchTransfer` 导入一行，断言业务表、changelog、`__sync_table_state.row_count/content_checksum` 同事务更新。
-
-### M-02：Branch B/C 的 `table_state` 哈希仍使用裸值序列，未复用上一轮修复后的列名排序 rowHash
-
-- 位置：`src/sync/apply/CapturedWriteTemplate.cpp:255`、`src/sync/apply/CapturedWriteTemplate.cpp:267`、`src/sync/apply/CapturedWriteTemplate.cpp:284`、`src/sync/apply/CapturedWriteTemplate.cpp:404`、`src/sync/apply/CapturedWriteTemplate.cpp:420`
-- 描述：上一轮修复只覆盖 changeset 的 `extractMutations()`。Branch B/C 对 `RowMutation` 的 afterHash 使用 `m.values` 裸序列，对 beforeHash 使用 `SELECT *` 裸序列，均不是 `TableStateStore::rowHash(QVariantMap)` 的 `key=value\n` 列名排序口径。
-- 影响：selection push、ComparisonSession save 等本地 UPSERT 路径的 checksum 与 baseline/changeset 路径不兼容；UPDATE/DELETE 后无法可靠抵消旧行 hash，DiffEngine 表级判等仍可能漂移。
-- 修复建议：为 `TableStateStore` 暴露统一 row fingerprint helper，Branch B/C 的 before/after 都按完整行 `QVariantMap` 计算；UPSERT 后按 PK 重新读取完整行生成 afterHash，避免只 hash mutation 中出现的列。
-
-### M-03：`table_state` 写失败被降级为 warning 后继续提交，破坏 apply 三件套同事务约束
-
-- 位置：`src/sync/apply/CapturedWriteTemplate.cpp:128`、`src/sync/apply/CapturedWriteTemplate.cpp:134`、`src/sync/apply/CapturedWriteTemplate.cpp:420`、`src/sync/apply/CapturedWriteTemplate.cpp:423`、`src/sync/diff/DiffEngine.cpp:43`
-- 描述：设计文档 §5.4 明确“任一步失败 rollback，向量/胜者/表态/changelog 一并回退”，计划 §1 也要求维护 table_state + 同事务。当前 Branch A/B/C 在 `ts_.applyMutations()` 失败时只设置 `tableStateStaleSince`，随后仍可推进 `applied_vector`、写 changelog 并提交业务数据。
-- 影响：业务数据和同步向量已经前进，但表级判等依据缺失或陈旧；后续场景2会在看似成功的同步流后给出错误判等。该问题不直接破坏业务行，但破坏“DiffEngine 可依赖 table_state”的实现前提。
-- 修复建议：同步 apply 的默认策略应把 table_state 写失败视为事务失败并回滚。若确实需要降级模式，应持久化显式 stale 标记，并让 `DiffEngine` 对 stale 表拒绝零全量判等或触发 baseline 重建，而不是继续使用旧 checksum。
-
-### M-04：同步 eligibility / selection / diff 仍只支持单列主键，窄于设计允许的复合主键与 WITHOUT ROWID 能力
-
-- 位置：`src/sync/schema/SchemaEligibility.cpp:80`、`src/sync/selection/SelectionResolver.cpp:14`、`src/sync/diff/DiffEngine.cpp:177`、`src/sync/diff/ComparisonSession.cpp:413`
-- 描述：实现已把复合主键显式标成 MVP 限制并报 `E_SYNC_COMPOSITE_PK_NOT_SUPPORTED`；但同步设计文档 §4.4 仍要求普通 rowid 表或 `WITHOUT ROWID` 表均可，只要有显式非空 PK。selection、diff、ComparisonSession 也只取第一个 PK 列。
-- 影响：合法 SQLite 业务表（复合 PK、WITHOUT ROWID 复合键）无法进入同步；若绕过 eligibility，行身份会丢失主键的一部分。
-- 修复建议：短期在设计/计划能力矩阵中明确“同步 MVP 仅支持单列 INTEGER/TEXT PK”；若按现设计实现，应引入统一复合 PK tuple 编码，并覆盖 eligibility、selection record、diff row key、RowWinner pkHash、FK closure 与 upsert target。
+- 位置：`src/sync/schema/SchemaEligibility.cpp:80`、`src/sync/selection/SelectionResolver.cpp:24`、`src/sync/diff/DiffEngine.cpp:177`、`src/sync/diff/ComparisonSession.cpp:413`
+- 描述：`SchemaEligibility` 明确拒绝复合主键并返回 `E_SYNC_COMPOSITE_PK_NOT_SUPPORTED`，`SelectionResolver`、`DiffEngine`、`ComparisonSession` 也只取 `pk == 1` 或最小 pk 序号的单列。同步设计文档 §4.4 的 eligibility 表仍要求普通 rowid 表或 `WITHOUT ROWID` 表均可，只要有显式非空 PRIMARY KEY，并未把能力限制到单列 PK。
+- 影响：合法 SQLite 业务表，例如复合业务主键或 `WITHOUT ROWID` 复合主键表，无法按当前规格进入同步。若未来绕过 eligibility，选择、diff、row identity 和 upsert conflict target 也会丢失主键的一部分。
+- 修复建议：短期在规格和计划中明确 “MVP 仅支持单列 PK” 并把复合 PK 作为后置能力；若要满足现设计，应引入统一 PK tuple 编码，贯穿 SyncSelection、FK closure、DiffEngine、RowWinner pkHash、TableState、UpsertExecutor 与 baseline seeding。
 
 ## 修复优先级汇总表（如无 C/H/M 则说明本轮通过）
 
 | 编号 | 文件 | 严重度 | 一句话描述 |
 | --- | --- | --- | --- |
-| H-01 | `src/sync/apply/ChangesetApplier.cpp:234` | High | changeset 后处理未复用 apply filter，被过滤表仍可写 RowWinner/table_state，DELETE 恢复分支还可能绕过 allow-list 写业务表。 |
-| M-01 | `src/sync/SyncWorker.cpp:1443` | Medium | 同步激活后的批量导入只捕获 changelog，不维护 `__sync_table_state`。 |
-| M-02 | `src/sync/apply/CapturedWriteTemplate.cpp:255` | Medium | Branch B/C table_state 哈希仍是裸值序列，不是统一列名排序 rowHash。 |
-| M-03 | `src/sync/apply/CapturedWriteTemplate.cpp:134` | Medium | table_state 写失败被降级 warning 后提交，违背 apply 三件套同事务。 |
-| M-04 | `src/sync/schema/SchemaEligibility.cpp:80` | Medium | 复合主键/WITHOUT ROWID 仍未实现，窄于当前同步设计文档。 |
+| H-01 | `src/sync/SyncWorker.cpp:1516` | High | 本地 origin_seq 在事务提交前自增，失败回滚后会跳号，使远端严格连续应用永久等待缺失 payload。 |
+| M-01 | `src/sync/schema/SchemaEligibility.cpp:80` | Medium | 实现仍拒绝复合主键并在 selection/diff/save 中只使用单列 PK，窄于当前同步设计文档。 |
 
-本轮未通过：无 Critical，但有 1 个 High、4 个 Medium。建议先修 H-01，再收口所有 table_state 写路径；否则 RowWinner 边界和场景2表级判等都不能作为可靠基础。
+本轮未通过：无 Critical，但有 1 个 High、1 个 Medium。建议优先修复 `origin_seq` 事务化分配；否则上一轮刚收紧的 table_state 回滚语义会放大跳号风险，导致同步流在错误恢复路径上停滞。

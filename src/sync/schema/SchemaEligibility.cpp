@@ -73,6 +73,15 @@ bool SchemaEligibility::verify(QSqlDatabase& db, const QStringList& syncTables,
             reject(QStringLiteral("PRIMARY KEY column(s) are nullable"));
             continue;
         }
+        // H-02 fix: reject composite PK tables. SelectionResolver, FkClosureBuilder, and
+        // ChangesetApplier all assume a single-column PK. Allowing composite-PK tables would
+        // silently produce wrong FK closures and incorrect selection-push semantics.
+        if (info.pkCols.size() > 1) {
+            reject(QStringLiteral("composite PRIMARY KEY (%1 columns) is not supported for sync; "
+                                  "add a surrogate single-column PK or use a UNIQUE index instead")
+                       .arg(info.pkCols.size()));
+            continue;
+        }
         if (!hasUpsertTarget(db, tbl, &localErr)) {
             if (!localErr.isEmpty()) {
                 if (err)
@@ -145,7 +154,11 @@ SchemaEligibility::TableInfo SchemaEligibility::introspect(QSqlDatabase& db, con
     // 3. PRAGMA table_info — collect PK columns
     {
         QSqlQuery q(db);
-        q.exec(QStringLiteral("PRAGMA table_info(\"%1\")").arg(table));
+        // M-03 fix: double-quote identifier to handle names with spaces/reserved words.
+        const QString quotedTbl = QStringLiteral("\"") +
+                                  QString(table).replace(QLatin1Char('"'), QLatin1String("\"\"")) +
+                                  QStringLiteral("\"");
+        q.exec(QStringLiteral("PRAGMA table_info(") + quotedTbl + QLatin1Char(')'));
         struct ColInfo {
             int pkSeq;
             bool notNull;
@@ -187,8 +200,12 @@ bool SchemaEligibility::hasUpsertTarget(QSqlDatabase& db, const QString& table, 
     // Additionally verify no partial unique index is the *only* unique constraint
     // (PK alone is sufficient, so just return true if PK exists).
     // M-02 fix: verify all PK columns are NOT NULL so ON CONFLICT(pk) is a valid target.
+    // M-03 fix: double-quote identifier.
     QSqlQuery ti(db);
-    ti.prepare(QStringLiteral("PRAGMA table_info(\"%1\")").arg(table));
+    const QString quotedTbl2 = QStringLiteral("\"") +
+                               QString(table).replace(QLatin1Char('"'), QLatin1String("\"\"")) +
+                               QStringLiteral("\"");
+    ti.prepare(QStringLiteral("PRAGMA table_info(") + quotedTbl2 + QLatin1Char(')'));
     if (!ti.exec()) {
         if (err)
             *err = ti.lastError().text();

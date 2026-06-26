@@ -179,15 +179,30 @@ WriteResult CapturedWriteTemplate::branchBC(const WriteParams& p) {
     if (isInbound && !p.pushId.isEmpty()) {
         QSqlQuery chk(wconn_);
         chk.prepare(
-            QStringLiteral("SELECT status FROM __sync_push_chunk_progress "
+            QStringLiteral("SELECT status, checksum FROM __sync_push_chunk_progress "
                            "WHERE push_id = ? AND chunk_seq = ?"));
         chk.addBindValue(p.pushId);
         chk.addBindValue(p.chunkSeq);
         if (chk.exec() && chk.next()) {
             const QString st = chk.value(0).toString();
             if (st == QLatin1String("applied")) {
+                // H-03 fix: verify checksum matches the already-applied chunk.
+                // Identical checksum → idempotent no-op (safe to skip).
+                // Different checksum → the payload is corrupt or mis-routed; quarantine.
+                const QString storedCs = chk.value(1).toString();
+                if (!storedCs.isEmpty() && !p.checksum.isEmpty() && storedCs != p.checksum) {
+                    txn.rollback();
+                    result.errorCode = QLatin1String(err::E_SYNC_PAYLOAD_CORRUPT);
+                    result.errorMsg =
+                        QStringLiteral(
+                            "chunk %1 of push %2 was already applied with checksum %3 "
+                            "but re-delivered with different checksum %4")
+                            .arg(p.chunkSeq)
+                            .arg(p.pushId, storedCs, p.checksum);
+                    return result;
+                }
                 txn.rollback();
-                result.ok = true;  // idempotent skip
+                result.ok = true;  // same checksum → idempotent skip
                 return result;
             }
         }
@@ -496,53 +511,6 @@ QList<TableMutation> CapturedWriteTemplate::extractMutations(const QByteArray& c
     return muts;
 }
 
-// ---------------------------------------------------------------------------
-// private: execMutation (kept for completeness; branchBC now uses UpsertExecutor)
-// ---------------------------------------------------------------------------
-
-bool CapturedWriteTemplate::execMutation(const RowMutation& m, QString* err) {
-    if (m.columns.isEmpty()) {
-        if (err)
-            *err = QStringLiteral("empty columns in mutation for table %1").arg(m.table);
-        return false;
-    }
-
-    // Build "col1=?,col2=?,..." update list (all non-pk columns).
-    QStringList updateClauses;
-    for (int i = 0; i < m.columns.size(); i++) {
-        if (!m.pkColumns.contains(m.columns[i]))
-            updateClauses << QStringLiteral("%1=excluded.%1").arg(m.columns[i]);
-    }
-
-    const QString colList = m.columns.join(QStringLiteral(", "));
-    QStringList phList;
-    phList.reserve(m.columns.size());
-    for (int i = 0; i < m.columns.size(); ++i)
-        phList << QStringLiteral("?");
-    const QString placeholders = phList.join(QStringLiteral(", "));
-    QString sql;
-    if (m.mode == UpsertMode::DoNothing || updateClauses.isEmpty()) {
-        sql = QStringLiteral("INSERT OR IGNORE INTO %1 (%2) VALUES (%3)")
-                  .arg(m.table, colList, placeholders);
-    } else {
-        const QString pkConflict = m.pkColumns.join(QStringLiteral(", "));
-        sql = QStringLiteral(
-                  "INSERT INTO %1 (%2) VALUES (%3) "
-                  "ON CONFLICT(%4) DO UPDATE SET %5")
-                  .arg(m.table, colList, placeholders, pkConflict,
-                       updateClauses.join(QStringLiteral(", ")));
-    }
-
-    QSqlQuery q(wconn_);
-    q.prepare(sql);
-    for (const QVariant& v : m.values)
-        q.addBindValue(v);
-    if (!q.exec()) {
-        if (err)
-            *err = q.lastError().text();
-        return false;
-    }
-    return true;
-}
+// L-02 fix: execMutation() was dead code with unquoted identifiers. Removed.
 
 }  // namespace dbridge::sync

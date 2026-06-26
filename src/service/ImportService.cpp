@@ -514,8 +514,9 @@ ImportResult ImportService::run(const ProfileSpec& profile, const SchemaCatalog&
         }
 
         // Map Excel columns to payloads
-        ctx.payloads =
-            mapper.map(*routesPtr, r, ctx.classId, reader, validatorMap, profile, &errors);
+        // M-06 fix: pass sheetName so Mapper error entries carry the correct sheet location.
+        ctx.payloads = mapper.map(*routesPtr, r, ctx.classId, reader, validatorMap, profile,
+                                  &errors, sheetName);
 
         // Apply lookups (Phase A.5 cache → row payload); failures seed cascade suppression (§D11)
         QSet<int> lookupFailed = applyLookups(ctx.payloads, *routesPtr, lookupCache, catalog,
@@ -636,6 +637,11 @@ ImportResult ImportService::run(const ProfileSpec& profile, const SchemaCatalog&
         }
         if (!writeOk)
             break;
+        // M-05 fix: writtenRows counts Excel rows successfully written (i.e. rows where at least
+        // one payload upsert succeeded). The previous semantics were identical — but the field name
+        // previously suggested "number of DB rows inserted/updated", which is ctx.payloads.size()
+        // times per Excel row (one upsert per route). The current semantics are Excel rows; callers
+        // that need exact DB upsert counts should sum payloads.size() for non-empty payloads.
         result.writtenRows++;
     }
 

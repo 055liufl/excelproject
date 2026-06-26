@@ -773,6 +773,12 @@ ExportResult ExportService::run(const ProfileSpec& profile, const SchemaCatalog&
             sql = sqlBuilder.buildAutoJoinSelect(sorted, profile.exportSpec);
         }
 
+        // needReverseLookup: true if any lookup has select columns (H-cols) to retrieve.
+        // hasAnyLookupHCols() covers both roundtrip=true (replacement) and roundtrip=false (raw
+        // H-col output). buildReverseCache() internally skips non-roundtrip lookups so the
+        // expensive prefetch is a no-op when all lookups have exportRoundtrip=false.
+        // M-07 note: the real performance win (skip buildReverseCache entirely for roundtrip=false)
+        // could be applied but is out of scope here since buildReverseCache is already selective.
         const bool needReverseLookup =
             !profile.exportSpec.explicitSql.isEmpty() ? false : hasAnyLookupHCols(sorted);
 

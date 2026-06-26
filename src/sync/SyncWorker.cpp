@@ -724,9 +724,14 @@ bool SyncWorker::processSelectionPushArtifact(const DecodeResult& dec, const QSt
 
     WriteParams p;
     p.kind = WriteKind::InboundSelectionPush;
-    p.origin = hdr.origin;
-    p.epoch = hdr.streamEpoch;
-    p.seq = hdr.originSeq;
+    // C-03 fix: attribute the changelog entry to the local node (not the remote sender) and
+    // allocate a fresh local origin seq. Using the sender's originSeq=0 (or any fixed seq)
+    // causes UNIQUE(origin, stream_epoch, origin_seq) collisions when multiple chunks arrive
+    // from the same sender in the same epoch. The changelog entry records "this node applied a
+    // selection push" — it is a local event, not a forwarding of the remote changeset.
+    p.origin = config_.nodeId();
+    p.epoch = streamEpoch_;
+    p.seq = nextLocalOriginSeq();
     p.schemaVer = hdr.schemaVer;
     p.schemaFp = hdr.schemaFingerprint;
     p.originRank = config_.originRank(hdr.origin);
@@ -759,6 +764,107 @@ bool SyncWorker::processSelectionPushArtifact(const DecodeResult& dec, const QSt
         emit errorOccurred(
             {err::E_SYNC_TRANSPORT, Severity::Warning, QStringLiteral("ack"), hdr.origin, ackErr});
     }
+    return true;
+}
+
+// C-01 fix: implement baseline request handler.
+// When a peer asks for a baseline (because it has a gap it cannot self-heal), this node
+// serializes the requested tables and writes a BaselineResponse artifact to the outbox.
+bool SyncWorker::processBaselineRequestArtifact(const DecodeResult& dec,
+                                                const QString& /*artifactName*/) {
+    if (!wconnPtr_)
+        return false;
+
+    const BaselineRequestPayload& req = dec.baselineRequest;
+
+    // Decide which tables to export: prefer the request's list, fall back to all sync tables.
+    QStringList tables = req.requestedTables.isEmpty() ? canonicalSyncTables_ : req.requestedTables;
+
+    BaselineManager bm;
+    BaselineManager::BaselineArtifact art;
+    QString exportErr;
+    if (!bm.exportBaseline(*wconnPtr_, tables, &art, &exportErr)) {
+        emit errorOccurred({err::E_SYNC_BASELINE_FAILED, Severity::Error,
+                            QStringLiteral("baseline_request"), dec.header.origin, exportErr});
+        return false;
+    }
+
+    BaselineResponsePayload resp;
+    resp.origin = config_.nodeId();
+    resp.requestOrigin = dec.header.origin;  // send back to requester
+    resp.streamEpoch = streamEpoch_;
+    resp.tables = tables;
+    resp.fromSeq = req.fromSeq;
+    resp.pendingArtifactName = req.pendingArtifactName;
+    resp.baselineData = art.data;
+    resp.sourceMaxSeq = art.sourceMaxSeq;
+
+    PayloadHeader hdr;
+    hdr.origin = config_.nodeId();
+    hdr.originSeq = nextLocalOriginSeq();
+    hdr.streamEpoch = streamEpoch_;
+    hdr.schemaVer = config_.schemaVersion();
+    hdr.schemaFingerprint = guard_ ? guard_->fingerprint() : QString();
+    hdr.routeTag = dec.header.origin;
+
+    QByteArray payload = codec_->encodeBaselineResponse(hdr, resp);
+
+    const QString artifactOut = QStringLiteral("blresp__") + config_.nodeId() +
+                                QStringLiteral("__") + dec.header.origin + QStringLiteral("__") +
+                                QString::number(QDateTime::currentMSecsSinceEpoch()) +
+                                QStringLiteral(".payload");
+    QString writeErr;
+    if (!outbox_->write(artifactOut, payload, &writeErr)) {
+        emit errorOccurred({err::E_SYNC_TRANSPORT, Severity::Error,
+                            QStringLiteral("baseline_request"), dec.header.origin, writeErr});
+        return false;
+    }
+    return true;
+}
+
+// C-01 fix: implement baseline response handler.
+// Applies the received baseline data, resets tracking stores, and triggers an inbox rescan
+// so any artifacts that were pending the baseline can now be processed.
+bool SyncWorker::processBaselineResponseArtifact(const DecodeResult& dec,
+                                                 const QString& /*artifactName*/) {
+    if (!wconnPtr_ || !hPtr_)
+        return false;
+
+    const BaselineResponsePayload& resp = dec.baselineResponse;
+
+    // Verify this response was sent to us.
+    if (!resp.requestOrigin.isEmpty() && resp.requestOrigin != config_.nodeId())
+        return true;  // not for this node — silently consume
+
+    BaselineManager bm;
+    BaselineManager::BaselineArtifact art;
+    art.data = resp.baselineData;
+    art.sourceMaxSeq = resp.sourceMaxSeq;
+
+    ConsistencyCache cache;
+    qint64 newAnchorSeq = 0;
+    QString applyErr;
+    const QString schemaFp = guard_ ? guard_->fingerprint() : QString();
+
+    if (!bm.applyBaseline(*wconnPtr_, hPtr_, art, *av_, *ts_, *rw_, cache, resp.streamEpoch,
+                          resp.origin, schemaFp, &newAnchorSeq, &applyErr)) {
+        emit errorOccurred({err::E_SYNC_BASELINE_FAILED, Severity::Error,
+                            QStringLiteral("baseline_response"), dec.header.origin, applyErr});
+        return false;
+    }
+
+    // Remove from in-flight tracking so the next gap scan doesn't re-request.
+    baselineRequestsInFlight_.remove(resp.pendingArtifactName);
+
+    // Trigger rescan so any artifacts that were deferred waiting for this baseline are now applied.
+    enqueue([this]() { scanInbox(); });
+
+    emit errorOccurred(
+        {err::W_SYNC_UNTRACKED_CHANGE, Severity::Warning, QStringLiteral("baseline"),
+         dec.header.origin,
+         QStringLiteral("Baseline from '%1' applied successfully; anchor seq=%2; rescanning inbox")
+             .arg(dec.header.origin)
+             .arg(newAnchorSeq)});
     return true;
 }
 
@@ -818,6 +924,12 @@ bool SyncWorker::processAckArtifact(const QString& path, const QString& name) {
                                     .arg(chunkAck.toPeer, config_.nodeId())});
             return true;
         }
+        // C-04 fix: ignore chunk ACKs that belong to a different (stale) push operation.
+        // This prevents an ACK from a previous enqueueSelectionPush() from completing the
+        // ackWaiting_ that was armed for the current push.
+        if (!pendingPushId_.isEmpty() && chunkAck.pushId != pendingPushId_) {
+            return true;  // silently consume — the artifact is valid but for a different operation
+        }
 
         const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
 
@@ -855,6 +967,9 @@ bool SyncWorker::processAckArtifact(const QString& path, const QString& name) {
                     doneQ.addBindValue(chunkAck.pushId);
                     doneQ.exec();
 
+                    // C-04 fix: clear pendingPushId_ so future unrelated chunk ACKs don't
+                    // match this operation (belt-and-suspenders alongside the pushId check above).
+                    pendingPushId_.clear();
                     // Transition foreground state to Completed (design §5.4 / FR-11).
                     if (ackWaiting_.exchange(false)) {
                         SyncProgress p;
@@ -1141,13 +1256,23 @@ ImportResult SyncWorker::submitImportSync(const ImportOptions& opts, const QStri
             return;
         }
 
+        // C-02 fix: check rec_->begin() return value; if it fails, the import cannot be
+        // session-captured and the changelog entry would be missing → reject the whole import.
         QString sessionErr;
-        rec_->begin(hPtr_, canonicalSyncTables_, &sessionErr);
+        if (!rec_->begin(hPtr_, canonicalSyncTables_, &sessionErr)) {
+            txn.rollback();
+            ImportResult errResult;
+            RowError e;
+            e.code = QLatin1String(err::E_SYNC_INIT);
+            e.message =
+                QStringLiteral("session begin failed (changelog unavailable): %1").arg(sessionErr);
+            errResult.errors.append(e);
+            sp->set_value(errResult);
+            return;
+        }
 
         // C-05 fix: pass manageTransaction=false so ImportService does not open an inner
         // db.transaction() while WriteTxn holds the outer BEGIN IMMEDIATE.
-        // SQLite/QSqlDatabase does not support nested transactions; the inner call would
-        // silently succeed or fail depending on driver implementation.
         detail::ImportService svc;
         ImportResult result = svc.run(profile, catalog, xlsxPath, opts, *wconnPtr_,
                                       /*manageTransaction=*/false);
@@ -1155,11 +1280,30 @@ ImportResult SyncWorker::submitImportSync(const ImportOptions& opts, const QStri
         if (result.ok) {
             qint64 localSeq = 0;
             QString sealErr;
-            QString fp = guard_ ? guard_->fingerprint() : QString();
+            const QString fp = guard_ ? guard_->fingerprint() : QString();
             const qint64 originSeq = nextLocalOriginSeq();
-            rec_->sealInto(hPtr_, *clog_, *wconnPtr_, txn, config_.nodeId(), streamEpoch_,
-                           config_.schemaVersion(), fp, 0, originSeq, &localSeq, &sealErr);
-            txn.commit(nullptr);
+            // C-02 fix: check sealInto() return value.
+            if (!rec_->sealInto(hPtr_, *clog_, *wconnPtr_, txn, config_.nodeId(), streamEpoch_,
+                                config_.schemaVersion(), fp, 0, originSeq, &localSeq, &sealErr)) {
+                rec_->abort();
+                txn.rollback();
+                result.ok = false;
+                RowError e;
+                e.code = QLatin1String(err::E_SYNC_INIT);
+                e.message = QStringLiteral("changelog seal failed: %1").arg(sealErr);
+                result.errors.append(e);
+                sp->set_value(result);
+                return;
+            }
+            // C-02 fix: check txn.commit() return value.
+            QString commitErr;
+            if (!txn.commit(&commitErr)) {
+                result.ok = false;
+                RowError e;
+                e.code = QLatin1String(err::E_SYNC_INIT);
+                e.message = QStringLiteral("transaction commit failed: %1").arg(commitErr);
+                result.errors.append(e);
+            }
         } else {
             rec_->abort();
             txn.rollback();
@@ -1182,6 +1326,53 @@ ImportResult SyncWorker::submitImportSync(const ImportOptions& opts, const QStri
 
 qint64 SyncWorker::nextLocalOriginSeq() {
     return ++localOriginSeq_;
+}
+
+// C-05 fix: routes RowMutations through CapturedWriteTemplate (session capture + changelog seal)
+// instead of directly through UpsertExecutor. This ensures comparison-session saves produce
+// changelog entries that are broadcast to peers, matching the semantics of a normal local write.
+bool SyncWorker::submitCaptureWriteSync(const QList<RowMutation>& mutations,
+                                        const QStringList& syncTables, QString* err) {
+    if (!isRunning() || !wconnPtr_) {
+        if (err)
+            *err = QStringLiteral("SyncWorker not ready");
+        return false;
+    }
+    if (mutations.isEmpty())
+        return true;
+
+    auto sharedPromise = std::make_shared<std::promise<QPair<bool, QString>>>();
+    std::future<QPair<bool, QString>> future = sharedPromise->get_future();
+
+    enqueue([this, mutations, syncTables, sp = sharedPromise]() {
+        if (!wconnPtr_ || !tpl_) {
+            sp->set_value(qMakePair(false, QStringLiteral("wconn/tpl not available")));
+            return;
+        }
+
+        WriteParams p;
+        p.kind = WriteKind::LocalWrite;
+        p.origin = config_.nodeId();
+        p.epoch = streamEpoch_;
+        p.seq = nextLocalOriginSeq();
+        p.schemaVer = config_.schemaVersion();
+        p.schemaFp = guard_ ? guard_->fingerprint() : QString();
+        p.mutations = mutations;
+        p.syncTables = syncTables.isEmpty() ? canonicalSyncTables_ : syncTables;
+
+        WriteResult res = tpl_->execute(p);
+        sp->set_value(qMakePair(res.ok, res.errorMsg.isEmpty() ? res.errorCode : res.errorMsg));
+    });
+
+    if (future.wait_for(std::chrono::seconds(60)) == std::future_status::timeout) {
+        if (err)
+            *err = QStringLiteral("submitCaptureWriteSync timed out after 60s");
+        return false;
+    }
+    const auto result = future.get();
+    if (!result.first && err)
+        *err = result.second;
+    return result.first;
 }
 
 // I-19: Signal worker that a foreground sync() is waiting for ACK.
@@ -1296,6 +1487,12 @@ void SyncWorker::enqueueSelectionPush(const SyncSelection& selection,
         // H-01 fix: capture schemaFingerprint before entering the loop.
         const QString schemaFp = guard_ ? guard_->fingerprint() : QString();
         const QString pushId = chunks.isEmpty() ? QString() : chunks.first().pushId;
+
+        // C-04 fix: record which push we're waiting to be fully ACKed.
+        // processAckArtifact() will only complete ackWaiting_ when ALL chunks of THIS pushId
+        // are ACKed, preventing stale or unrelated chunk ACKs from prematurely completing
+        // the foreground sync() caller.
+        pendingPushId_ = pushId;
 
         // M-05 / C-02: create push_progress(streaming) on the worker thread BEFORE writing chunks.
         // L-01 fix: ON CONFLICT DO UPDATE so re-sends refresh total_chunks/status/updated_ms.

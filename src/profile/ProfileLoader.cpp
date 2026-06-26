@@ -670,11 +670,10 @@ bool ProfileLoader::readMixed(const QJsonObject& o, ProfileSpec* out, QString* e
 
     QJsonObject discObj = o.value(QStringLiteral("discriminator")).toObject();
     out->discriminatorSource = discObj.value(QStringLiteral("source")).toString();
-    if (out->discriminatorSource.isEmpty()) {
-        if (err)
-            *err = QStringLiteral("mixed profile missing 'discriminator.source'");
-        return false;
-    }
+    // Discriminator is required for IMPORT (routing incoming rows to the right class), but
+    // optional for EXPORT-ONLY profiles that only use 'classes' to describe per-class routes.
+    // Allow empty discriminatorSource so export-only mixed profiles load without error.
+    // The Router will reject an import attempt at runtime if discriminatorSource is empty.
 
     QJsonArray classesArr = o.value(QStringLiteral("classes")).toArray();
     if (classesArr.isEmpty()) {
@@ -710,17 +709,21 @@ bool ProfileLoader::readMixed(const QJsonObject& o, ProfileSpec* out, QString* e
         out->classes.append(cls);
     }
 
-    // Check matchEquals uniqueness
-    QHash<QString, QString> seen;
-    for (const auto& cls : out->classes) {
-        if (seen.contains(cls.matchEquals)) {
-            if (err)
-                *err = QStringLiteral("duplicate matchEquals '") + cls.matchEquals +
-                       QStringLiteral("' in classes '") + seen[cls.matchEquals] +
-                       QStringLiteral("' and '") + cls.id + QStringLiteral("'");
-            return false;
+    // Check matchEquals uniqueness — only when a discriminator is present (import-capable profile).
+    // Export-only mixed profiles have no discriminator and no matchEquals values; skip the check
+    // to allow multiple classes with empty matchEquals.
+    if (!out->discriminatorSource.isEmpty()) {
+        QHash<QString, QString> seen;
+        for (const auto& cls : out->classes) {
+            if (seen.contains(cls.matchEquals)) {
+                if (err)
+                    *err = QStringLiteral("duplicate matchEquals '") + cls.matchEquals +
+                           QStringLiteral("' in classes '") + seen[cls.matchEquals] +
+                           QStringLiteral("' and '") + cls.id + QStringLiteral("'");
+                return false;
+            }
+            seen[cls.matchEquals] = cls.id;
         }
-        seen[cls.matchEquals] = cls.id;
     }
 
     // mixed mode must NOT have explicitSql
@@ -794,7 +797,12 @@ bool ProfileLoader::load(const QJsonDocument& doc, ProfileSpec* out, QString* er
         out->exportSpec.orderBy.append(s);
     }
     out->exportSpec.explicitSql = expObj.value(QStringLiteral("sql")).toString();
+    // classColumn may be declared at the export level OR at the top profile level.
+    // Fall back to the top-level field so mixed profiles that place classColumn at the root
+    // (a common pattern for export-only mixed profiles) are handled correctly.
     out->exportSpec.classColumn = expObj.value(QStringLiteral("classColumn")).toString();
+    if (out->exportSpec.classColumn.isEmpty())
+        out->exportSpec.classColumn = o.value(QStringLiteral("classColumn")).toString();
 
     // add-export-column-order: parse optional columnOrder array.
     QJsonValue colOrderVal = expObj.value(QStringLiteral("columnOrder"));

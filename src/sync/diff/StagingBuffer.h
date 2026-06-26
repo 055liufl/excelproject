@@ -21,6 +21,12 @@ class StagingBuffer {
     // pkCols: primary key column names (used to build RowMutation).
     bool save(QSqlDatabase& wconn, UpsertExecutor& upsert, const QStringList& pkCols, QString* err);
 
+    // C-05 fix: build RowMutation list for CapturedWriteTemplate (bypasses direct DB write).
+    // pkColsPerTable maps table name → PK column names; tables missing from the map fall back
+    // to pkColsFallback.
+    QList<RowMutation> toMutations(const QHash<QString, QStringList>& pkColsPerTable,
+                                   const QStringList& pkColsFallback = QStringList()) const;
+
     void discard();
     bool isEmpty() const;
 

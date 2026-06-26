@@ -8,8 +8,10 @@ namespace dbridge::detail {
 
 bool SchemaIntrospector::readTables(QSqlDatabase& db, QStringList* tables, QString* err) {
     QSqlQuery q(db);
-    if (!q.exec(QStringLiteral(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"))) {
+    // L-04 fix: exclude __sync_* meta-tables so the schema catalog only contains user tables.
+    // Profile/export logic should never bind to internal sync state tables.
+    if (!q.exec(QStringLiteral("SELECT name FROM sqlite_master WHERE type='table' "
+                               "AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '__sync_%'"))) {
         if (err)
             *err = q.lastError().text();
         return false;
@@ -22,8 +24,13 @@ bool SchemaIntrospector::readTables(QSqlDatabase& db, QStringList* tables, QStri
 
 bool SchemaIntrospector::readColumns(QSqlDatabase& db, TableInfo* info, QString* err) {
     QSqlQuery q(db);
-    // table_xinfo gives hidden column info (generated columns have hidden > 0)
-    QString sql = QStringLiteral("PRAGMA table_xinfo('%1')").arg(info->name);
+    // table_xinfo gives hidden column info (generated columns have hidden > 0).
+    // M-01 fix: use double-quote identifier quoting instead of single-quote string literal so
+    // table names with embedded double-quotes, spaces, or reserved words are handled correctly.
+    const QString quotedName =
+        QStringLiteral("\"") +
+        QString(info->name).replace(QLatin1Char('"'), QLatin1String("\"\"")) + QStringLiteral("\"");
+    QString sql = QStringLiteral("PRAGMA table_xinfo(") + quotedName + QLatin1Char(')');
     if (!q.exec(sql)) {
         if (err)
             *err = q.lastError().text();
@@ -73,7 +80,11 @@ bool SchemaIntrospector::isAutoIncrement(QSqlDatabase& db, const QString& tableN
 
 bool SchemaIntrospector::readIndexes(QSqlDatabase& db, TableInfo* info, QString* err) {
     QSqlQuery q(db);
-    QString sql = QStringLiteral("PRAGMA index_list('%1')").arg(info->name);
+    // M-01 fix: use double-quote identifier quoting.
+    const QString quotedTableName =
+        QStringLiteral("\"") +
+        QString(info->name).replace(QLatin1Char('"'), QLatin1String("\"\"")) + QStringLiteral("\"");
+    QString sql = QStringLiteral("PRAGMA index_list(") + quotedTableName + QLatin1Char(')');
     if (!q.exec(sql)) {
         if (err)
             *err = q.lastError().text();
@@ -93,7 +104,12 @@ bool SchemaIntrospector::readIndexes(QSqlDatabase& db, TableInfo* info, QString*
         idx.unique = unique;
 
         QSqlQuery qi(db);
-        qi.exec(QStringLiteral("PRAGMA index_info('%1')").arg(idxName));
+        // M-01 fix: double-quote index name.
+        const QString quotedIdx =
+            QStringLiteral("\"") +
+            QString(idxName).replace(QLatin1Char('"'), QLatin1String("\"\"")) +
+            QStringLiteral("\"");
+        qi.exec(QStringLiteral("PRAGMA index_info(") + quotedIdx + QLatin1Char(')'));
         while (qi.next()) {
             // seqno, cid, name
             idx.columns.append(qi.value(2).toString());
@@ -105,7 +121,11 @@ bool SchemaIntrospector::readIndexes(QSqlDatabase& db, TableInfo* info, QString*
 
 bool SchemaIntrospector::readForeignKeys(QSqlDatabase& db, TableInfo* info, QString* err) {
     QSqlQuery q(db);
-    QString sql = QStringLiteral("PRAGMA foreign_key_list('%1')").arg(info->name);
+    // M-01 fix: double-quote identifier.
+    const QString quotedName2 =
+        QStringLiteral("\"") +
+        QString(info->name).replace(QLatin1Char('"'), QLatin1String("\"\"")) + QStringLiteral("\"");
+    QString sql = QStringLiteral("PRAGMA foreign_key_list(") + quotedName2 + QLatin1Char(')');
     if (!q.exec(sql)) {
         if (err)
             *err = q.lastError().text();

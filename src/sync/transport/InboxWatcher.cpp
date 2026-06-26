@@ -23,9 +23,11 @@ QStringList InboxWatcher::scan(QSqlDatabase& db) {
     if (!d.exists())
         return newArtifacts;
 
-    // Find all .ready markers, sorted by time (oldest first for FIFO processing).
-    const QStringList readyFiles =
-        d.entryList(QStringList{QStringLiteral("*.ready")}, QDir::Files, QDir::Time);
+    // Find all .ready markers, sorted oldest-first for FIFO processing.
+    // M-08 fix: QDir::Reversed inverts the default QDir::Time (newest-first) order to
+    // produce the oldest-first sequence the comment and the gap-detection code assume.
+    const QStringList readyFiles = d.entryList(QStringList{QStringLiteral("*.ready")}, QDir::Files,
+                                               QDir::Time | QDir::Reversed);
 
     for (const QString& readyName : readyFiles) {
         // Derive artifact name: strip the trailing ".ready" (6 chars)

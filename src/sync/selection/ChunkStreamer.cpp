@@ -58,8 +58,21 @@ bool ChunkStreamer::stream(const QList<FkClosureBuilder::Entry>& manifest, const
     for (const auto& e : manifest) {
         const qint64 rowEst = estimateRowBytes(e.row);
 
-        // If this single entry alone exceeds budget AND current chunk is non-empty,
-        // start a new chunk to keep chunks roughly bounded.
+        // H-04 fix: a single row that exceeds the chunk budget on its own cannot be split further.
+        // Emit E_SYNC_SELECTION_TOO_LARGE so the caller can surface a clear error rather than
+        // silently producing an oversized chunk that may violate transport assumptions.
+        if (chunkBudgetBytes > 0 && rowEst > chunkBudgetBytes) {
+            if (err)
+                *err = QStringLiteral(
+                           "E_SYNC_SELECTION_TOO_LARGE: single row in table '%1' "
+                           "estimated at %2 bytes exceeds chunk budget %3 bytes")
+                           .arg(e.table)
+                           .arg(rowEst)
+                           .arg(chunkBudgetBytes);
+            return false;
+        }
+
+        // If adding this entry would overflow the current chunk, start a new one.
         if (!raw.last().entries.isEmpty() &&
             raw.last().estimatedBytes + rowEst > chunkBudgetBytes) {
             raw.append(RawChunk{});

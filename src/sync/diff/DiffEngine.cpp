@@ -135,7 +135,20 @@ QList<RowDiff> DiffEngine::rowDiffs(QSqlDatabase& rconn, const QString& table,
 QList<QVariantMap> DiffEngine::fetchLocalRows(QSqlDatabase& rconn, const QString& table, int offset,
                                               int limit) {
     QList<QVariantMap> rows;
-    QString sql = QString("SELECT * FROM \"%1\"").arg(table);
+    // H-01 fix: always ORDER BY pk so offset-based paging is stable across INSERT/DELETE.
+    // Without ORDER BY, rows arrive in undefined order and different offsets can overlap or skip.
+    const QString pkCol = getPkColumn(rconn, table);
+    // M-08 fix: use double-quote quoting via the same pattern as getPkColumn's PRAGMA.
+    const QString quotedTable = QStringLiteral("\"") +
+                                QString(table).replace(QLatin1Char('"'), QLatin1String("\"\"")) +
+                                QStringLiteral("\"");
+    QString sql = QStringLiteral("SELECT * FROM %1").arg(quotedTable);
+    if (!pkCol.isEmpty()) {
+        const QString quotedPk = QStringLiteral("\"") +
+                                 QString(pkCol).replace(QLatin1Char('"'), QLatin1String("\"\"")) +
+                                 QStringLiteral("\"");
+        sql += QStringLiteral(" ORDER BY %1").arg(quotedPk);
+    }
     if (limit >= 0)
         sql += " LIMIT :lim OFFSET :off";
 

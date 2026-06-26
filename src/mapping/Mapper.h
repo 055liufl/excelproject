@@ -24,10 +24,12 @@ class Mapper {
 
     // Map one Excel row to a list of RoutePayloads (one per route).
     // Returns payloads with validation results; any validation/temporal errors go to *errors.
+    // M-06 fix: sheetName is propagated into error entries so callers can pinpoint which sheet
+    // the error came from. Default is empty for backwards-compatibility.
     QVector<RoutePayload> map(const QVector<RouteSpec>& routes, int excelRow,
                               const QString& classId, const ExcelReader& reader,
                               const ValidatorMap& vm, const ProfileSpec& profile,
-                              ErrorCollector* errors) const;
+                              ErrorCollector* errors, const QString& sheetName = QString()) const;
 
    private:
     static QString routeKey(const RouteSpec& route, const QString& classId);

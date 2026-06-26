@@ -30,27 +30,14 @@ bool UpsertExecutor::apply(QSqlDatabase& db, const QList<RowMutation>& rows,
             continue;
         }
 
-        const QString key = cacheKey(m.table, m.mode);
+        // M-04 fix: use the full SQL string as cache key so different column sets or PK sets
+        // for the same table always produce distinct cache entries and never share a wrong
+        // prepared statement. The old (table:mode) key required a fragile lastQuery() check.
+        const QString sql = buildUpsertSql(m.table, m.columns, m.pkColumns, m.mode);
+        const QString key = sql;
 
-        // Build or reuse a prepared statement.
-        // Statements are keyed by (table, mode); we assume the column list is
-        // stable within a single apply() call for a given key.  If the
-        // columns differ we rebuild (the old entry is replaced).
         bool needPrepare = !cache_.contains(key);
-        if (!needPrepare) {
-            // Sanity: if column count changed, force re-prepare.
-            const QSqlQuery& cached = cache_[key];
-            Q_UNUSED(cached);
-            // Column count mismatch check: boundValues() is populated only
-            // after exec(), so we track mismatches via the SQL string.
-            // Simplest: rebuild if the cached placeholder count ≠ current.
-            const QString expectedSql = buildUpsertSql(m.table, m.columns, m.pkColumns, m.mode);
-            if (cache_[key].lastQuery() != expectedSql)
-                needPrepare = true;
-        }
-
         if (needPrepare) {
-            const QString sql = buildUpsertSql(m.table, m.columns, m.pkColumns, m.mode);
             QSqlQuery q(db);
             if (!q.prepare(sql)) {
                 // Prepare failure is fatal — the table likely doesn't exist.
@@ -142,9 +129,6 @@ QString UpsertExecutor::buildUpsertSql(const QString& table, const QStringList& 
         .arg(quote(table), colList, phList, pkConflict, setClauses.join(QStringLiteral(", ")));
 }
 
-QString UpsertExecutor::cacheKey(const QString& table, UpsertMode mode) const {
-    return table + QStringLiteral(":") +
-           (mode == UpsertMode::DoUpdate ? QStringLiteral("U") : QStringLiteral("N"));
-}
+// cacheKey() is no longer used (M-04 fix replaced it with SQL-as-key). Removed.
 
 }  // namespace dbridge::sync

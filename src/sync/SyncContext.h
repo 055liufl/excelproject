@@ -2,9 +2,11 @@
 #include "dbridge/Types.h"
 #include "dbridge/sync/SyncConfig.h"
 
+#include <QList>
 #include <QMutex>
 #include <QSqlDatabase>
 #include <QString>
+#include <QStringList>
 
 #include "ForegroundGate.h"
 #include "diff/InboundTableGate.h"
@@ -41,6 +43,13 @@ struct SyncContext {
     // Runs a synchronous write task on SyncWorker's single writer thread.
     std::function<bool(const std::function<bool(QSqlDatabase&, QString*)>&, QString*)>
         workerWriteFn;
+
+    // C-05 fix: routes a list of RowMutations through the worker's CapturedWriteTemplate so
+    // comparison-session saves are captured in the sqlite session, written to the changelog,
+    // and broadcast to peers — identical to a normal local write.
+    // syncTables: tables to attach the session recorder to (pass canonicalSyncTables).
+    std::function<bool(const QList<RowMutation>&, const QStringList&, QString*)>
+        workerCaptureWriteFn;
 
     // Requests an inbox rescan after a comparison gate is released.
     std::function<void()> rescanFn;

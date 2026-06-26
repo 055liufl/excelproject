@@ -68,6 +68,22 @@ bool StagingBuffer::save(QSqlDatabase& wconn, UpsertExecutor& upsert, const QStr
     return true;
 }
 
+QList<RowMutation> StagingBuffer::toMutations(const QHash<QString, QStringList>& pkColsPerTable,
+                                              const QStringList& pkColsFallback) const {
+    QList<RowMutation> mutations;
+    mutations.reserve(staged_.size());
+    for (const StagedRow& sr : staged_) {
+        RowMutation rm;
+        rm.table = sr.table;
+        rm.columns = sr.row.keys();
+        rm.values = sr.row.values();
+        rm.pkColumns = pkColsPerTable.value(sr.table, pkColsFallback);
+        rm.mode = UpsertMode::DoUpdate;
+        mutations.append(rm);
+    }
+    return mutations;
+}
+
 void StagingBuffer::discard() {
     staged_.clear();
 }

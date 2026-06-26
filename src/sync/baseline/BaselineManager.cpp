@@ -24,9 +24,12 @@ bool BaselineManager::serializeTables(QSqlDatabase& rconn, const QStringList& ta
     ds << static_cast<quint32>(tables.size());
 
     for (const QString& table : tables) {
+        // M-02 fix: use quoteIdent() to safely escape table names with embedded double-quotes.
+        const QString quotedTable = detail::SqlBuilder::quoteIdent(table);
+
         // Count rows first so we can write rowCount before row data.
         QSqlQuery cntQ(rconn);
-        cntQ.prepare(QStringLiteral("SELECT COUNT(*) FROM \"%1\"").arg(table));
+        cntQ.prepare(QStringLiteral("SELECT COUNT(*) FROM %1").arg(quotedTable));
         if (!cntQ.exec() || !cntQ.next()) {
             if (err)
                 *err = QStringLiteral("count failed on %1: %2").arg(table, cntQ.lastError().text());
@@ -38,7 +41,7 @@ bool BaselineManager::serializeTables(QSqlDatabase& rconn, const QStringList& ta
         ds << rowCount;
 
         QSqlQuery rowQ(rconn);
-        rowQ.prepare(QStringLiteral("SELECT * FROM \"%1\"").arg(table));
+        rowQ.prepare(QStringLiteral("SELECT * FROM %1").arg(quotedTable));
         if (!rowQ.exec()) {
             if (err)
                 *err =
@@ -209,7 +212,7 @@ bool BaselineManager::applyBaseline(QSqlDatabase& wconn, sqlite3* /*h*/,
                                     const BaselineArtifact& art, AppliedVectorStore& av,
                                     TableStateStore& ts, RowWinnerStore& rw,
                                     ConsistencyCache& cache, qint64 epoch, const QString& origin,
-                                    qint64* newAnchorSeq, QString* err) {
+                                    const QString& schemaFp, qint64* newAnchorSeq, QString* err) {
     // I-20 helper: prefix err with E_SYNC_BASELINE_FAILED if not already an E_SYNC code.
     auto wrapErr = [&](QString* ep) {
         if (ep && !ep->startsWith(QLatin1String("E_SYNC")))
@@ -237,9 +240,9 @@ bool BaselineManager::applyBaseline(QSqlDatabase& wconn, sqlite3* /*h*/,
         return false;
     }
 
-    // Reset table state store (schemaFp unknown at baseline time; pass empty string
-    // — caller may re-apply with real fp after schema negotiation).
-    if (!ts.resetFromBaseline(wconn, tables, epoch, QString(), err)) {
+    // H-05 fix: pass the caller-supplied schemaFp so DiffEngine::tableDiffs() can match
+    // the remote fingerprint and avoid producing false "Different" results after baseline apply.
+    if (!ts.resetFromBaseline(wconn, tables, epoch, schemaFp, err)) {
         txn.rollback();
         wrapErr(err);
         return false;

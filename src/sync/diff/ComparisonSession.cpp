@@ -268,21 +268,39 @@ bool ComparisonSession::save(QString* err) {
             allPkCols.append(pkCol);
     }
 
-    if (!context_ || !context_->workerWriteFn) {
+    if (!context_ || (!context_->workerCaptureWriteFn && !context_->workerWriteFn)) {
         if (err)
             *err = QStringLiteral("%1: comparison session has no worker write queue")
                        .arg(QLatin1String(err::E_SYNC_INIT));
         return false;
     }
 
-    StagingBuffer staged = staging_;
+    // C-05 fix: use workerCaptureWriteFn when available so mutations flow through
+    // CapturedWriteTemplate — they are session-captured, written to __sync_changelog, and
+    // broadcast to peers. Fall back to workerWriteFn for backwards-compat with contexts that
+    // don't have a capture function wired (e.g. test stubs).
     QString saveErr;
-    const bool ok = context_->workerWriteFn(
-        [staged, allPkCols](QSqlDatabase& wconn, QString* taskErr) mutable {
-            UpsertExecutor upsert;
-            return staged.save(wconn, upsert, allPkCols, taskErr);
-        },
-        &saveErr);
+    bool ok = false;
+    if (context_->workerCaptureWriteFn) {
+        // Build per-table PK column map for correct RowMutation construction.
+        QHash<QString, QStringList> pkColsPerTable;
+        for (const QString& table : tables) {
+            const QString pkCol = getPkColumn(table);
+            if (!pkCol.isEmpty())
+                pkColsPerTable[table] = QStringList{pkCol};
+        }
+        const QList<RowMutation> mutations = staging_.toMutations(pkColsPerTable, allPkCols);
+        const QStringList syncTables = context_->canonicalSyncTables;
+        ok = context_->workerCaptureWriteFn(mutations, syncTables, &saveErr);
+    } else {
+        StagingBuffer staged = staging_;
+        ok = context_->workerWriteFn(
+            [staged, allPkCols](QSqlDatabase& wconn, QString* taskErr) mutable {
+                UpsertExecutor upsert;
+                return staged.save(wconn, upsert, allPkCols, taskErr);
+            },
+            &saveErr);
+    }
     if (!ok) {
         if (err)
             *err = saveErr;

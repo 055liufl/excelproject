@@ -82,6 +82,12 @@ class SyncWorker : public QThread {
     // The worker will emit E_SYNC_ACK_TIMEOUT if no ACK arrives within ackMaxDelayMs.
     void startAckWait();
 
+    // C-05 fix: route RowMutations through CapturedWriteTemplate on the worker thread.
+    // Gives comparison-session saves the same session-capture + changelog semantics as local
+    // imports, ensuring changes are broadcast to peers.
+    bool submitCaptureWriteSync(const QList<RowMutation>& mutations, const QStringList& syncTables,
+                                QString* err = nullptr);
+
     // C-02: Enqueue an immediate drain cycle (scan inbox + broadcast) on the worker.
     bool enqueueDrain(QString* err = nullptr);
 
@@ -176,6 +182,12 @@ class SyncWorker : public QThread {
     // and the worker-thread main loop both access it safely without a mutex.
     std::atomic<bool> ackWaiting_{false};
     std::atomic<qint64> ackDeadlineMs_{0};
+
+    // C-04 fix: tracks the pushId of an in-flight selection push so processAckArtifact()
+    // can ignore chunk ACKs from stale or unrelated pushes. Accessed only on the worker thread
+    // (set inside the enqueueSelectionPush lambda, read in processAckArtifact — both run on the
+    // same worker thread, no additional locking needed).
+    QString pendingPushId_;
 
     QSet<QString> baselineRequestsInFlight_;
 };

@@ -17,6 +17,7 @@ SyncEngine::~SyncEngine() {
     if (ctx_) {
         ctx_->importFn = nullptr;
         ctx_->workerWriteFn = nullptr;
+        ctx_->workerCaptureWriteFn = nullptr;
         ctx_->rescanFn = nullptr;
     }
     if (worker_) {
@@ -86,6 +87,7 @@ bool SyncEngine::initialize(const SyncConfig& config, QString* err) {
         worker_.reset();
         ctx_->importFn = nullptr;
         ctx_->workerWriteFn = nullptr;
+        ctx_->workerCaptureWriteFn = nullptr;
         ctx_->rescanFn = nullptr;
         SyncContextRegistry::instance().release(canonicalKey_);
         ctx_.reset();
@@ -108,6 +110,7 @@ bool SyncEngine::initialize(const SyncConfig& config, QString* err) {
         worker_.reset();
         ctx_->importFn = nullptr;
         ctx_->workerWriteFn = nullptr;
+        ctx_->workerCaptureWriteFn = nullptr;
         ctx_->rescanFn = nullptr;
         SyncContextRegistry::instance().release(canonicalKey_);
         ctx_.reset();
@@ -125,6 +128,12 @@ bool SyncEngine::initialize(const SyncConfig& config, QString* err) {
     ctx_->workerWriteFn = [this](const std::function<bool(QSqlDatabase&, QString*)>& task,
                                  QString* taskErr) {
         return worker_ && worker_->submitWriteSync(task, taskErr);
+    };
+    // C-05 fix: route comparison-session saves through CapturedWriteTemplate so writes are
+    // session-captured and broadcast to peers like normal local writes.
+    ctx_->workerCaptureWriteFn = [this](const QList<RowMutation>& mutations,
+                                        const QStringList& syncTables, QString* captureErr) {
+        return worker_ && worker_->submitCaptureWriteSync(mutations, syncTables, captureErr);
     };
     ctx_->rescanFn = [this]() {
         if (worker_)
@@ -192,6 +201,7 @@ bool SyncEngine::stop(QString* err) {
     if (ctx_) {
         ctx_->importFn = nullptr;
         ctx_->workerWriteFn = nullptr;
+        ctx_->workerCaptureWriteFn = nullptr;
         ctx_->rescanFn = nullptr;
     }
     return true;

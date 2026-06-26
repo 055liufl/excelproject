@@ -43,7 +43,7 @@ bool Mapper::compileValidators(const QVector<RouteSpec>& routes, const QString& 
 QVector<RoutePayload> Mapper::map(const QVector<RouteSpec>& routes, int excelRow,
                                   const QString& classId, const ExcelReader& reader,
                                   const ValidatorMap& vm, const ProfileSpec& profile,
-                                  ErrorCollector* errors) const {
+                                  ErrorCollector* errors, const QString& sheetName) const {
     QVector<RoutePayload> payloads;
 
     for (const auto& route : routes) {
@@ -64,7 +64,8 @@ QVector<RoutePayload> Mapper::map(const QVector<RouteSpec>& routes, int excelRow
             if (!chain.isEmpty()) {
                 QString errCode, errMsg;
                 if (!chain.run(rawVal, &normalizedVal, &errCode, &errMsg)) {
-                    errors->add(QString(), excelRow, col.source, rawVal.toString(), errCode,
+                    // M-06 fix: pass sheetName so error entries have a complete location.
+                    errors->add(sheetName, excelRow, col.source, rawVal.toString(), errCode,
                                 errMsg);
                     normalizedVal = rawVal;
                     rowHasError = true;
@@ -91,7 +92,7 @@ QVector<RoutePayload> Mapper::map(const QVector<RouteSpec>& routes, int excelRow
                         QVariant structured =
                             tconv::toStructured(normalizedVal, kind, eff.excel, &errCode, &errMsg);
                         if (!structured.isValid()) {
-                            errors->add(QString(), excelRow, col.source, rawVal.toString(), errCode,
+                            errors->add(sheetName, excelRow, col.source, rawVal.toString(), errCode,
                                         errMsg);
                             normalizedVal = rawVal;
                             rowHasError = true;

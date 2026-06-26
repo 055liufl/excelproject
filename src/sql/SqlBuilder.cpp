@@ -75,20 +75,25 @@ QString SqlBuilder::buildAutoJoinSelect(const QVector<RouteSpec>& routes,
         }
 
         if (&route != &routes[0] && !route.fkInject.isEmpty()) {
+            // H-06 fix: use quoteIdent() for all identifiers in JOIN ON clauses.
             // M-06 fix: iterate ALL fkInject groups (not just [0]).
-            // Each group represents a distinct parent table; generate one JOIN per group.
-            // Multiple groups on the same child route yield multiple JOINs (e.g. multi-parent).
+            // Multiple FK inject groups on the same child route share ONE JOIN with all ON
+            // conditions AND-ed together (all FK conditions must hold simultaneously).
+            // Using one combined JOIN avoids duplicate LEFT JOIN on the same table, which would
+            // require aliases that break the SELECT clause's unaliased table.column references.
+            QStringList allOnParts;
             for (const FkInjectSpec& fk : route.fkInject) {
-                QStringList onParts;
                 for (const auto& pair : fk.pairs) {
-                    onParts.append(QStringLiteral("\"%1\".\"%2\" = \"%3\".\"%4\"")
-                                       .arg(route.table, pair.second, fk.fromTable, pair.first));
+                    allOnParts.append(quoteIdent(route.table) + QStringLiteral(".") +
+                                      quoteIdent(pair.second) + QStringLiteral(" = ") +
+                                      quoteIdent(fk.fromTable) + QStringLiteral(".") +
+                                      quoteIdent(pair.first));
                 }
-                if (!onParts.isEmpty()) {
-                    joinClauses.append(
-                        QStringLiteral("LEFT JOIN \"%1\" ON %2")
-                            .arg(route.table, onParts.join(QStringLiteral(" AND "))));
-                }
+            }
+            if (!allOnParts.isEmpty()) {
+                joinClauses.append(QStringLiteral("LEFT JOIN ") + quoteIdent(route.table) +
+                                   QStringLiteral(" ON ") +
+                                   allOnParts.join(QStringLiteral(" AND ")));
             }
         }
     }
@@ -101,14 +106,27 @@ QString SqlBuilder::buildAutoJoinSelect(const QVector<RouteSpec>& routes,
     }
 
     if (!exportSpec.orderBy.isEmpty()) {
+        // H-06 fix: qualify unqualified ORDER BY columns with their owning table name to avoid
+        // "ambiguous column name" errors when the same column name appears in multiple joined
+        // tables (e.g. both orders.order_no and order_items.order_no are in scope after a JOIN).
+        QHash<QString, QString> dbColToTable;
+        for (const auto& route : routes) {
+            for (const auto& col : route.columns) {
+                if (!dbColToTable.contains(col.dbColumn))
+                    dbColToTable.insert(col.dbColumn, route.table);
+            }
+        }
+
         QStringList orderParts;
         for (const auto& ob : exportSpec.orderBy) {
-            // H-05: quote the ORDER BY column identifier (single identifier only, no direction).
-            // If the caller passes "table.column", split and quote each part.
             const int dot = ob.indexOf(QLatin1Char('.'));
             if (dot > 0) {
+                // Already qualified by the caller — just quote each part.
                 orderParts.append(quoteIdent(ob.left(dot)) + QLatin1Char('.') +
                                   quoteIdent(ob.mid(dot + 1)));
+            } else if (dbColToTable.contains(ob)) {
+                // Qualify with the owning table so the identifier is unambiguous across joins.
+                orderParts.append(quoteIdent(dbColToTable[ob]) + QLatin1Char('.') + quoteIdent(ob));
             } else {
                 orderParts.append(quoteIdent(ob));
             }

@@ -19,11 +19,12 @@ class UpsertExecutor {
     void clearPreparedCache();
 
    private:
-    QHash<QString, QSqlQuery> cache_;  // keyed by "table:DoUpdate" or "table:DoNothing"
+    // M-04 fix: cache is now keyed by the full SQL string (not "table:mode") so different
+    // column sets always produce distinct entries.
+    QHash<QString, QSqlQuery> cache_;
 
     QString buildUpsertSql(const QString& table, const QStringList& cols, const QStringList& pkCols,
                            UpsertMode mode);
-    QString cacheKey(const QString& table, UpsertMode mode) const;
 };
 
 }  // namespace dbridge::sync

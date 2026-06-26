@@ -783,6 +783,12 @@ bool SyncWorker::processSelectionPushArtifact(const DecodeResult& dec, const QSt
             {res.errorCode, Severity::Error, "selection_push", hdr.origin, res.errorMsg});
         return false;
     }
+    // H-01 fix: sealInto() returns success with localChangelogSeq==0 when changeset is empty
+    // (no rows were actually modified). In that case the originSeq we allocated is unused, so
+    // roll it back to keep origin_seq contiguous.
+    if (res.localChangelogSeq == 0) {
+        rollbackOriginSeq(prevSeqPush);
+    }
     if (!res.tableStateStaleSince.isEmpty()) {
         emit errorOccurred(
             {err::W_SYNC_UNTRACKED_CHANGE, Severity::Warning, QStringLiteral("table_state"),
@@ -1470,6 +1476,13 @@ ImportResult SyncWorker::submitImportSync(const ImportOptions& opts, const QStri
                 sp->set_value(result);
                 return;
             }
+            // H-01 fix: sealInto() returns success with localSeq==0 when changeset is empty
+            // (no rows were captured). Roll back the unused originSeq to keep the counter
+            // contiguous. The transaction is still committed (rows are written) but no
+            // changelog entry was produced, which is consistent with a no-op import.
+            if (localSeq == 0) {
+                rollbackOriginSeq(prevSeqImport);
+            }
 
             // M-01 fix: update __sync_table_state after import so that DiffEngine sees
             // accurate checksums. Use resetFromBaseline() which does a full scan of the
@@ -1585,8 +1598,14 @@ bool SyncWorker::submitCaptureWriteSync(const QList<RowMutation>& mutations,
         p.syncTables = syncTables.isEmpty() ? canonicalSyncTables_ : syncTables;
 
         WriteResult res = tpl_->execute(p);
-        if (!res.ok)
+        if (!res.ok) {
             rollbackOriginSeq(prevSeqCapture);  // H-01 fix
+        } else if (res.localChangelogSeq == 0) {
+            // H-01 fix: sealInto() returned success with seq==0 (empty changeset — no actual
+            // row changes were captured by the session). Roll back the unused originSeq to
+            // keep origin_seq contiguous and avoid spurious gaps seen by peers.
+            rollbackOriginSeq(prevSeqCapture);
+        }
         sp->set_value(qMakePair(res.ok, res.errorMsg.isEmpty() ? res.errorCode : res.errorMsg));
     });
 

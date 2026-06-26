@@ -408,11 +408,21 @@ WriteResult CapturedWriteTemplate::branchBC(const WriteParams& p) {
     }
 
     // Update table_state from RowMutations using pre-scanned (correct) old-row info (H-05).
+    // M-01 fix: skip table_state update for DoNothing (INSERT OR IGNORE) mutations when the
+    // row already existed before the UPSERT. In that case the INSERT is a no-op — SQLite does
+    // not modify the row — so the actual session changeset contains no entry for it. Adding an
+    // afterHash for a no-op write would pollute the checksum and cause divergence with peers
+    // that compute table_state from the real changeset (branchA / extractMutations path).
     QList<TableMutation> tmuts;
     tmuts.reserve(p.mutations.size());
     for (int i = 0; i < p.mutations.size(); ++i) {
         const RowMutation& m = p.mutations[i];
         const PreScan& ps = preScan[i];
+        if (m.mode == UpsertMode::DoNothing && ps.rowExists) {
+            // INSERT OR IGNORE was a no-op: row already existed and was not changed.
+            // Do not update table_state for this row.
+            continue;
+        }
         TableMutation tm;
         tm.table = m.table;
         tm.isInsert = !ps.rowExists;

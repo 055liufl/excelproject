@@ -126,14 +126,17 @@ WriteResult CapturedWriteTemplate::branchA(const WriteParams& p) {
     }
 
     // 5a. Update table_state from changeset mutations (I-07)
-    QList<TableMutation> muts = extractMutations(p.changesetBlob);
+    QList<TableMutation> muts = extractMutations(p.changesetBlob, p.syncTables);
     if (!muts.isEmpty()) {
-        // M-04 fix: table_state failure is non-fatal (can be rebuilt on baseline), but must
-        // be surfaced so DiffEngine knows its data may be stale. Store the warning text;
-        // rollback is NOT performed here because the changeset is already applied correctly.
+        // M-03 fix: applyMutations() failure must roll back the entire apply transaction
+        // so that changeset, applied_vector, and table_state remain in sync (apply三件套
+        // must stay atomic). A stale table_state that cannot be corrected would silently
+        // diverge checksums across nodes.
         if (!ts_.applyMutations(wconn_, muts, p.epoch, p.schemaFp, p.seq, &err)) {
-            result.tableStateStaleSince = err;  // caller may emit W_SYNC_TABLE_STATE_STALE
-            err.clear();
+            txn.rollback();
+            result.errorCode = QStringLiteral("TABLE_STATE_UPDATE");
+            result.errorMsg = err;
+            return result;
         }
     }
 
@@ -263,13 +266,16 @@ WriteResult CapturedWriteTemplate::branchBC(const WriteParams& p) {
             }
         }
         ps.pkHash = QCryptographicHash::hash(pkMat, QCryptographicHash::Sha256).left(16);
-        // afterHash (from new values in RowMutation)
-        QByteArray contentMat;
-        for (const QVariant& v : m.values) {
-            contentMat.append(v.toString().toUtf8());
-            contentMat.append('\0');
+        // M-02 fix: afterHash must use the same column-name-sorted QVariantMap format as
+        // TableStateStore::rowHash() so that incremental mutations produce checksums
+        // consistent with resetFromBaseline().  Build a QVariantMap keyed by column name
+        // (QVariantMap is sorted by key automatically) and delegate to rowHash().
+        {
+            QVariantMap afterMap;
+            for (int i = 0; i < m.columns.size(); ++i)
+                afterMap.insert(m.columns[i], m.values[i]);
+            ps.afterHash = TableStateStore::rowHash(afterMap);
         }
-        ps.afterHash = QCryptographicHash::hash(contentMat, QCryptographicHash::Sha256).left(16);
         // rowExists + beforeHash: query BEFORE UPSERT
         if (!m.pkColumns.isEmpty() && !m.table.isEmpty()) {
             QStringList wp = buildWhereParts(m);
@@ -281,14 +287,14 @@ WriteResult CapturedWriteTemplate::branchBC(const WriteParams& p) {
             bindPkValues(existQ, m);
             if (existQ.exec() && existQ.next()) {
                 ps.rowExists = true;
-                QByteArray oldMat;
+                // M-02 fix: beforeHash must also use column-name-sorted QVariantMap so it
+                // matches the format produced by extractMutations (changeset path) and
+                // resetFromBaseline (full scan path). Build QVariantMap from QSqlRecord.
+                QVariantMap beforeMap;
                 QSqlRecord rec = existQ.record();
-                for (int ci = 0; ci < rec.count(); ++ci) {
-                    oldMat.append(existQ.value(ci).toString().toUtf8());
-                    oldMat.append('\0');
-                }
-                ps.beforeHash =
-                    QCryptographicHash::hash(oldMat, QCryptographicHash::Sha256).left(16);
+                for (int ci = 0; ci < rec.count(); ++ci)
+                    beforeMap.insert(rec.fieldName(ci), existQ.value(ci));
+                ps.beforeHash = TableStateStore::rowHash(beforeMap);
             }
         }
         preScan.append(ps);
@@ -418,10 +424,14 @@ WriteResult CapturedWriteTemplate::branchBC(const WriteParams& p) {
     }
 
     if (!tmuts.isEmpty()) {
+        // M-03 fix: applyMutations() failure must roll back the entire write transaction
+        // so that the upserted rows, changelog entry, and table_state remain atomic.
         if (!ts_.applyMutations(wconn_, tmuts, isInbound ? p.epoch : streamEpoch_,
                                 isInbound ? p.schemaFp : schemaFp_, originSeq, &err)) {
-            result.tableStateStaleSince = err;  // M-04: surface stale warning
-            err.clear();
+            txn.rollback();
+            result.errorCode = QStringLiteral("TABLE_STATE_UPDATE");
+            result.errorMsg = err;
+            return result;
         }
     }
 
@@ -441,7 +451,8 @@ WriteResult CapturedWriteTemplate::branchBC(const WriteParams& p) {
 // private: extractMutations — parse changeset blob into TableMutation list (I-07)
 // ---------------------------------------------------------------------------
 
-QList<TableMutation> CapturedWriteTemplate::extractMutations(const QByteArray& changeset) {
+QList<TableMutation> CapturedWriteTemplate::extractMutations(const QByteArray& changeset,
+                                                             const QStringList& syncTables) {
     QList<TableMutation> muts;
     if (changeset.isEmpty())
         return muts;
@@ -491,6 +502,12 @@ QList<TableMutation> CapturedWriteTemplate::extractMutations(const QByteArray& c
         sqlite3changeset_pk(iter, &pkMask, nullptr);
 
         const QString tableName = QString::fromUtf8(tbl ? tbl : "");
+
+        // H-01 fix: skip tables rejected by the allow-list so __sync_* meta tables and
+        // non-sync tables are never written to __sync_table_state.
+        if (!ChangesetApplier::isAllowedSyncTable(tableName, syncTables))
+            continue;
+
         const QStringList colNames = getColNames(tableName, nCol);
 
         // M-03 fix: build a QVariantMap keyed by column name (sorted automatically by QMap),

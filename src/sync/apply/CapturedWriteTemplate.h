@@ -76,7 +76,10 @@ class CapturedWriteTemplate {
     // L-02 fix: execMutation() removed (dead code with unquoted identifiers).
 
     // Parse a changeset blob into a list of TableMutations for table_state accounting (I-07).
-    QList<TableMutation> extractMutations(const QByteArray& changeset);
+    // H-01 fix: syncTables is the same allow-list as filterCb; tables not in the list
+    // (and __sync_* tables) are skipped so __sync_table_state is not polluted.
+    QList<TableMutation> extractMutations(const QByteArray& changeset,
+                                          const QStringList& syncTables);
 
     QSqlDatabase& wconn_;
     sqlite3* h_;

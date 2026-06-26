@@ -130,7 +130,7 @@ bool ChangesetApplier::apply(sqlite3* h, QSqlDatabase& wconn, const QByteArray& 
     // Authoritative (down-link) applies skip winner arbitration entirely.
     if (!opts.authoritative) {
         if (!updateWinnersFromChangeset(changeset, origin, originRank, originSeq, winners, wconn,
-                                        err))
+                                        syncTables, err))
             return false;
     }
 
@@ -151,6 +151,17 @@ int ChangesetApplier::filterCb(void* ctx, const char* tblName) {
     if (!c->syncTables)
         return 1;  // accept all when list is empty
     return c->syncTables->contains(QString::fromUtf8(tblName)) ? 1 : 0;
+}
+
+// H-01 fix: shared allow-list predicate used by filterCb, updateWinnersFromChangeset,
+// and extractMutations (via CapturedWriteTemplate) — all three paths reject the same tables.
+// static
+bool ChangesetApplier::isAllowedSyncTable(const QString& table, const QStringList& syncTables) {
+    if (table.startsWith(QLatin1String("__sync_")))
+        return false;
+    if (syncTables.isEmpty())
+        return true;  // empty list = accept all (test-only mode)
+    return syncTables.contains(table);
 }
 
 // ---------------------------------------------------------------------------
@@ -234,7 +245,7 @@ int ChangesetApplier::conflictCb(void* ctx, int conflict, sqlite3_changeset_iter
 bool ChangesetApplier::updateWinnersFromChangeset(const QByteArray& changeset,
                                                   const QString& origin, int rank, qint64 seq,
                                                   RowWinnerStore& winners, QSqlDatabase& wconn,
-                                                  QString* err) {
+                                                  const QStringList& syncTables, QString* err) {
     sqlite3_changeset_iter* iter = nullptr;
     int rc =
         sqlite3changeset_start(&iter, changeset.size(),
@@ -251,13 +262,19 @@ bool ChangesetApplier::updateWinnersFromChangeset(const QByteArray& changeset,
         unsigned char* pkMask = nullptr;
         sqlite3changeset_pk(iter, &pkMask, nullptr);
 
+        const QString tableName = QString::fromUtf8(tbl ? tbl : "");
+
+        // H-01 fix: skip tables rejected by the allow-list so __sync_* meta tables and
+        // non-sync tables are never written to __sync_row_winner.
+        if (!isAllowedSyncTable(tableName, syncTables))
+            continue;
+
         // For DELETE: use old values to build the pk/content hash.
         const bool useNew = (op != SQLITE_DELETE);
         QByteArray pkMaterial, contentMaterial;
         extractHashMaterials(iter, nCol, useNew, pkMask, &pkMaterial, &contentMaterial);
 
         const QString pkHashStr = computePkHashStr(pkMaterial, contentMaterial);
-        const QString tableName = QString::fromUtf8(tbl ? tbl : "");
 
         if (op == SQLITE_DELETE) {
             // C-12 fix: a DELETE from a node dominated by the current winner must NOT erase the

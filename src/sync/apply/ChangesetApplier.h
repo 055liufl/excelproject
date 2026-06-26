@@ -31,6 +31,11 @@ class ChangesetApplier {
                int originRank, qint64 originSeq, RowWinnerStore& winners, const ApplyOptions& opts,
                const QStringList& syncTables, ApplyOutcome* out, QString* err);
 
+    // H-01 fix: shared allow-list predicate — same logic as filterCb() so all three paths
+    // (xFilter, updateWinnersFromChangeset, extractMutations) reject the same tables.
+    // Public so CapturedWriteTemplate can reuse the same predicate.
+    static bool isAllowedSyncTable(const QString& table, const QStringList& syncTables);
+
    private:
     struct ConflictCtx {
         ChangesetApplier* self;
@@ -52,9 +57,11 @@ class ChangesetApplier {
     // C-11/C-12: post-apply, update row_winner for INSERT/UPDATE and restore any high-rank row
     // erased by a dominated low-rank DELETE. Returns false (with *err set) if a required restore
     // failed — the caller MUST roll back the transaction so the low-rank DELETE never wins.
+    // H-01 fix: syncTables is the same allow-list used by filterCb; tables not in the list
+    // (and __sync_* tables) are skipped so row_winner is not polluted.
     bool updateWinnersFromChangeset(const QByteArray& changeset, const QString& origin, int rank,
                                     qint64 seq, RowWinnerStore& winners, QSqlDatabase& wconn,
-                                    QString* err);
+                                    const QStringList& syncTables, QString* err);
 };
 
 }  // namespace dbridge::sync

@@ -1461,6 +1461,29 @@ ImportResult SyncWorker::submitImportSync(const ImportOptions& opts, const QStri
                 sp->set_value(result);
                 return;
             }
+
+            // M-01 fix: update __sync_table_state after import so that DiffEngine sees
+            // accurate checksums. Use resetFromBaseline() which does a full scan of the
+            // relevant tables — safe because import batches are typically large and
+            // incremental applyMutations() would require parsing the captured changeset
+            // which is not available here without an extra SessionRecorder round-trip.
+            // Roll back the whole transaction on failure (M-03 consistency principle).
+            if (!canonicalSyncTables_.isEmpty() && ts_) {
+                QString tsErr;
+                if (!ts_->resetFromBaseline(*wconnPtr_, canonicalSyncTables_, streamEpoch_, fp,
+                                            &tsErr)) {
+                    txn.rollback();
+                    result.ok = false;
+                    RowError e;
+                    e.code = QLatin1String(err::E_SYNC_INIT);
+                    e.message =
+                        QStringLiteral("table_state reset failed after import: %1").arg(tsErr);
+                    result.errors.append(e);
+                    sp->set_value(result);
+                    return;
+                }
+            }
+
             // C-02 fix: check txn.commit() return value.
             QString commitErr;
             if (!txn.commit(&commitErr)) {

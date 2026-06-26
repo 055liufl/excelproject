@@ -4,6 +4,9 @@
 
 #include <QCryptographicHash>
 #include <QDataStream>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonValue>
 #include <QSqlError>
 #include <QSqlQuery>
 #include <QSqlRecord>
@@ -382,6 +385,7 @@ bool BaselineManager::applyBaseline(QSqlDatabase& wconn, sqlite3* /*h*/,
                 continue;
 
             const QSqlRecord rec = rowQ.record();
+            const int colCount = rec.count();
             while (rowQ.next()) {
                 // Build pkMaterial in the same format as ChangesetApplier::extractHashMaterials:
                 // concatenate PK column values as UTF-8 bytes separated by \0.
@@ -398,11 +402,75 @@ bool BaselineManager::applyBaseline(QSqlDatabase& wconn, sqlite3* /*h*/,
                         .left(16)
                         .toHex());
 
+                // H-01 fix: build winningContent (JSON) and contentHash so that
+                // ChangesetApplier::updateWinnersFromChangeset() can restore this row when a
+                // low-rank DELETE arrives later. Without these fields the recovery path returns
+                // E_SYNC_APPLY_CONSTRAINT and permanently stalls the sync stream.
+                //
+                // Format mirrors ChangesetApplier's INSERT/UPDATE branch exactly:
+                //   INTEGER  → "__i64:<n>"  (preserves full int64 precision)
+                //   BLOB     → "__b64:<base64>"
+                //   FLOAT    → JSON double
+                //   TEXT/etc → JSON string
+                //   NULL     → JSON null
+                //
+                // contentHash = SHA-256 of the content material (all column bytes + \0) .left(16).
+                QJsonObject rowJson;
+                QByteArray contentMaterial;
+                for (int ci = 0; ci < colCount; ++ci) {
+                    const QVariant v = rowQ.value(ci);
+                    const QString colKey = rec.fieldName(ci);
+
+                    QByteArray colBytes;
+                    if (v.isNull() || !v.isValid()) {
+                        rowJson[colKey] = QJsonValue::Null;
+                        // null contributes empty bytes + separator
+                    } else {
+                        switch (static_cast<int>(v.type())) {
+                            case QVariant::LongLong:
+                            case QVariant::Int:
+                            case QVariant::UInt:
+                            case QVariant::ULongLong: {
+                                const qint64 iv = v.toLongLong();
+                                rowJson[colKey] = QStringLiteral("__i64:") + QString::number(iv);
+                                colBytes = QByteArray::number(iv);
+                                break;
+                            }
+                            case QVariant::Double: {
+                                rowJson[colKey] = v.toDouble();
+                                colBytes = v.toByteArray();
+                                break;
+                            }
+                            case QVariant::ByteArray: {
+                                const QByteArray ba = v.toByteArray();
+                                rowJson[colKey] =
+                                    QStringLiteral("__b64:") + QString::fromLatin1(ba.toBase64());
+                                colBytes = ba;
+                                break;
+                            }
+                            default: {
+                                const QString s = v.toString();
+                                rowJson[colKey] = s;
+                                colBytes = s.toUtf8();
+                                break;
+                            }
+                        }
+                    }
+                    contentMaterial.append(colBytes);
+                    contentMaterial.append('\0');
+                }
+
+                const QByteArray contentH =
+                    QCryptographicHash::hash(contentMaterial, QCryptographicHash::Sha256).left(16);
+                const QString winningContentStr =
+                    QString::fromUtf8(QJsonDocument(rowJson).toJson(QJsonDocument::Compact));
+
                 RowWinner winner;
                 winner.origin = origin;
                 winner.rank = baselineRank;
                 winner.originSeq = baselineSeq;
-                // contentHash left empty — rank/seq comparison is sufficient for conflict logic.
+                winner.contentHash = contentH;
+                winner.winningContent = winningContentStr;
                 rw.put(wconn, tableName, pkHashStr, winner, nullptr);
             }
         }

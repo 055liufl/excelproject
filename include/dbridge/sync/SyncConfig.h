@@ -449,6 +449,28 @@ class DBRIDGE_EXPORT SyncConfig::Builder {
                 *err = QStringLiteral("changelogRetention must be > 0 when set");
             return {};
         }
+        // H-01 fix: validate that all explicitly configured ranks are globally unique
+        // across all participating nodes (nodeId + peerNodes). Two origins with the same
+        // rank would make conflict resolution non-deterministic when seq also ties.
+        {
+            // Collect all node ids that have an explicitly configured rank.
+            QList<int> ranks;
+            for (auto it = cfg_.originRank_.begin(); it != cfg_.originRank_.end(); ++it) {
+                ranks.append(it.value());
+            }
+            // Sort and find duplicates.
+            std::sort(ranks.begin(), ranks.end());
+            for (int i = 1; i < ranks.size(); ++i) {
+                if (ranks[i] == ranks[i - 1]) {
+                    if (err)
+                        *err = QStringLiteral(
+                                   "originRank contains duplicate rank value %1; "
+                                   "every participating origin must have a unique rank")
+                                   .arg(ranks[i]);
+                    return {};
+                }
+            }
+        }
         cfg_.valid_ = true;
         return cfg_;
     }

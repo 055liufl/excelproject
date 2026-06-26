@@ -196,9 +196,13 @@ int ChangesetApplier::conflictCb(void* ctx, int conflict, sqlite3_changeset_iter
             challenger.contentHash = contentH;
 
             RowWinner incumbent = c->winners->get(*c->wconn, table, pkHashStr);
+            // H-01 fix: add originId tie-breaker when rank and seq both match, so the
+            // conflict outcome is deterministic regardless of arrival order.
             bool win =
                 (incumbent.rank == INT_MIN) || (challenger.rank > incumbent.rank) ||
-                (challenger.rank == incumbent.rank && challenger.originSeq > incumbent.originSeq);
+                (challenger.rank == incumbent.rank && challenger.originSeq > incumbent.originSeq) ||
+                (challenger.rank == incumbent.rank && challenger.originSeq == incumbent.originSeq &&
+                 challenger.origin > incumbent.origin);
             if (win) {
                 // H-01 fix: do NOT write the incomplete challenger here (winningContent is empty
                 // at this point).  updateWinnersFromChangeset() runs after apply_v2 and writes the
@@ -261,9 +265,12 @@ bool ChangesetApplier::updateWinnersFromChangeset(const QByteArray& changeset,
             // in the same transaction. If we cannot restore, return false so the caller rolls
             // back the whole apply (the DELETE is undone, applied_vector is not advanced, no ACK).
             RowWinner incumbent = winners.get(wconn, tableName, pkHashStr);
+            // H-01 fix: account for the originId tie-breaker when rank and seq match.
             const bool dominated =
                 incumbent.rank != INT_MIN &&
-                ((rank < incumbent.rank) || (rank == incumbent.rank && seq < incumbent.originSeq));
+                ((rank < incumbent.rank) || (rank == incumbent.rank && seq < incumbent.originSeq) ||
+                 (rank == incumbent.rank && seq == incumbent.originSeq &&
+                  origin < incumbent.origin));
             if (dominated) {
                 if (incumbent.winningContent.isEmpty()) {
                     // We know the row should survive but have no content to restore it with.
@@ -450,7 +457,18 @@ bool ChangesetApplier::updateWinnersFromChangeset(const QByteArray& changeset,
         // H-01 fix: use putOrRefill() so that if conflictCb() was called for this row
         // (and left an empty winningContent record), the full content written here takes
         // precedence even when rank/seq are identical.
-        winners.putOrRefill(wconn, tableName, pkHashStr, challenger, nullptr);
+        // M-01 fix: check the return value and propagate failure so the caller can roll back.
+        {
+            QString putErr;
+            if (!winners.putOrRefill(wconn, tableName, pkHashStr, challenger, &putErr)) {
+                if (err)
+                    *err = QStringLiteral(
+                               "E_SYNC_APPLY_CONSTRAINT: putOrRefill failed for %1 pk=%2: %3")
+                               .arg(tableName, pkHashStr, putErr);
+                ok = false;
+                break;
+            }
+        }
     }
     sqlite3changeset_finalize(iter);
     return ok;

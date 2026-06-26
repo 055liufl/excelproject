@@ -19,7 +19,14 @@ bool ConflictArbiter::beats(const QString& aOrigin, qint64 aSeq, const QString& 
         return ra > rb;
     }
 
-    return aSeq > bSeq;
+    if (aSeq != bSeq) {
+        return aSeq > bSeq;
+    }
+
+    // H-01 fix: rank == rank and seq == seq — use originId as a stable, deterministic
+    // tie-breaker so that applying changesets in any order yields the same final state.
+    // Lexicographically larger originId wins (arbitrary but consistent).
+    return aOrigin > bOrigin;
 }
 
 }  // namespace dbridge::sync

@@ -167,9 +167,17 @@ bool RowWinnerStore::beats(const RowWinner& challenger, const RowWinner& incumbe
         return true;  // no incumbent
     if (challenger.rank > incumbent.rank)
         return true;
-    if (challenger.rank == incumbent.rank && challenger.originSeq > incumbent.originSeq)
+    if (challenger.rank < incumbent.rank)
+        return false;
+    // Same rank: compare seq.
+    if (challenger.originSeq > incumbent.originSeq)
         return true;
-    return false;
+    if (challenger.originSeq < incumbent.originSeq)
+        return false;
+    // H-01 fix: rank == rank and seq == seq — use originId as a stable, deterministic
+    // tie-breaker so that applying changesets in any order yields the same final state.
+    // Lexicographically larger originId wins (arbitrary but consistent).
+    return challenger.origin > incumbent.origin;
 }
 
 }  // namespace dbridge::sync

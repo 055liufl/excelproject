@@ -452,6 +452,36 @@ QList<TableMutation> CapturedWriteTemplate::extractMutations(const QByteArray& c
             const_cast<void*>(static_cast<const void*>(changeset.constData()))) != SQLITE_OK)
         return muts;
 
+    // M-03 fix: cache column-name lists per table so that row hashes use the same
+    // "key=value\n sorted by column name" format as TableStateStore::rowHash().
+    // This ensures beforeHash / afterHash computed here are directly comparable to
+    // the checksums produced by resetFromBaseline(), preventing checksum divergence
+    // after a baseline reset followed by incremental UPDATE/DELETE.
+    QMap<QString, QStringList> colNameCache;
+
+    auto getColNames = [&](const QString& tableName, int nCol) -> QStringList {
+        auto it = colNameCache.find(tableName);
+        if (it != colNameCache.end())
+            return it.value();
+        QStringList names;
+        QSqlQuery ti(wconn_);
+        ti.prepare(QStringLiteral("PRAGMA table_info(\"%1\")")
+                       .arg(QString(tableName).replace(QLatin1Char('"'), QLatin1String("\"\""))));
+        if (ti.exec()) {
+            QMap<int, QString> cidMap;
+            while (ti.next())
+                cidMap.insert(ti.value(0).toInt(), ti.value(1).toString());
+            for (int i = 0; i < nCol; ++i)
+                names.append(cidMap.value(i, QStringLiteral("_col_%1").arg(i)));
+        } else {
+            // Fallback: use positional names so the cache is not empty.
+            for (int i = 0; i < nCol; ++i)
+                names.append(QStringLiteral("_col_%1").arg(i));
+        }
+        colNameCache.insert(tableName, names);
+        return names;
+    };
+
     while (sqlite3changeset_next(iter) == SQLITE_ROW) {
         const char* tbl = nullptr;
         int nCol = 0, op = 0, indirect = 0;
@@ -460,34 +490,45 @@ QList<TableMutation> CapturedWriteTemplate::extractMutations(const QByteArray& c
         unsigned char* pkMask = nullptr;
         sqlite3changeset_pk(iter, &pkMask, nullptr);
 
-        // Build pkHash and content hashes from column values.
-        auto hashSlice = [&](bool useNew) -> QByteArray {
-            QByteArray mat;
+        const QString tableName = QString::fromUtf8(tbl ? tbl : "");
+        const QStringList colNames = getColNames(tableName, nCol);
+
+        // M-03 fix: build a QVariantMap keyed by column name (sorted automatically by QMap),
+        // then delegate to TableStateStore::rowHash() for a consistent hash format.
+        auto rowHashFromIter = [&](bool useNew) -> QByteArray {
+            QVariantMap rowMap;
             for (int i = 0; i < nCol; i++) {
                 sqlite3_value* val = nullptr;
                 if (useNew)
                     sqlite3changeset_new(iter, i, &val);
                 else
                     sqlite3changeset_old(iter, i, &val);
+                const QString colName =
+                    (i < colNames.size()) ? colNames[i] : QStringLiteral("_col_%1").arg(i);
                 if (!val) {
-                    mat.append('\0');
+                    rowMap.insert(colName, QVariant());
                     continue;
                 }
                 const int vt = sqlite3_value_type(val);
                 if (vt == SQLITE_TEXT) {
                     const char* txt = reinterpret_cast<const char*>(sqlite3_value_text(val));
-                    mat.append(txt ? txt : "");
+                    rowMap.insert(colName, QString::fromUtf8(txt ? txt : ""));
                 } else if (vt == SQLITE_INTEGER) {
-                    mat.append(QByteArray::number(static_cast<qint64>(sqlite3_value_int64(val))));
+                    rowMap.insert(colName,
+                                  QVariant(static_cast<qlonglong>(sqlite3_value_int64(val))));
+                } else if (vt == SQLITE_FLOAT) {
+                    rowMap.insert(colName, sqlite3_value_double(val));
                 } else if (vt == SQLITE_BLOB) {
                     const void* b = sqlite3_value_blob(val);
                     const int bl = sqlite3_value_bytes(val);
-                    if (b && bl > 0)
-                        mat.append(static_cast<const char*>(b), bl);
+                    rowMap.insert(colName, (b && bl > 0) ? QVariant(QByteArray(
+                                                               static_cast<const char*>(b), bl))
+                                                         : QVariant(QByteArray()));
+                } else {
+                    rowMap.insert(colName, QVariant());
                 }
-                mat.append('\0');
             }
-            return QCryptographicHash::hash(mat, QCryptographicHash::Sha256).left(16);
+            return TableStateStore::rowHash(rowMap);
         };
 
         auto pkHashStr = [&](bool useNew) -> QString {
@@ -519,28 +560,28 @@ QList<TableMutation> CapturedWriteTemplate::extractMutations(const QByteArray& c
                 mat.append('\0');
             }
             if (mat.isEmpty())
-                mat = hashSlice(useNew);  // fallback: hash all cols
+                mat = rowHashFromIter(useNew);  // fallback: hash all cols
             QByteArray h = QCryptographicHash::hash(mat, QCryptographicHash::Sha256).left(16);
             return QString::fromLatin1(h.toHex());
         };
 
         TableMutation tm;
-        tm.table = QString::fromUtf8(tbl ? tbl : "");
+        tm.table = tableName;
 
         if (op == SQLITE_INSERT) {
             tm.pkHash = pkHashStr(true);
-            tm.afterHash = hashSlice(true);
+            tm.afterHash = rowHashFromIter(true);
             tm.isInsert = true;
             tm.isDelete = false;
         } else if (op == SQLITE_DELETE) {
             tm.pkHash = pkHashStr(false);
-            tm.beforeHash = hashSlice(false);
+            tm.beforeHash = rowHashFromIter(false);
             tm.isInsert = false;
             tm.isDelete = true;
         } else if (op == SQLITE_UPDATE) {
             tm.pkHash = pkHashStr(false);  // PK must not change across UPDATE
-            tm.beforeHash = hashSlice(false);
-            tm.afterHash = hashSlice(true);
+            tm.beforeHash = rowHashFromIter(false);
+            tm.afterHash = rowHashFromIter(true);
             tm.isInsert = false;
             tm.isDelete = false;
         } else {

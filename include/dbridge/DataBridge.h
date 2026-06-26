@@ -54,7 +54,9 @@ class DBRIDGE_EXPORT DataBridge {
 
     // J-09: Called by SyncEngine::initialize() / ~SyncEngine() to guard importExcel()
     // against direct writes while sync is active.
-    void setSyncActive(bool active);
+    // syncTables: the canonical sync-monitored table list; importExcel() allows profiles
+    // that target only non-sync tables to proceed even while sync is active.
+    void setSyncActive(bool active, const QStringList& syncTables = {});
 
    private:
     std::unique_ptr<detail::DataBridgePrivate> d_;

@@ -783,19 +783,18 @@ bool SyncWorker::processSelectionPushArtifact(const DecodeResult& dec, const QSt
 
     WriteParams p;
     p.kind = WriteKind::InboundSelectionPush;
-    // H-02 fix (option A): use the center node's own origin/epoch/seq so the changelog key
-    // (origin, stream_epoch, origin_seq) is fully controlled by the center.  Using hdr.origin
-    // with center's epoch/seq mixed the remote origin key-space with the local counter, causing
-    // RowWinnerStore to mis-sort by seq.  Center rank is used consistently.
-    p.origin = config_.nodeId();
+    // H-02 fix: use the push initiator's origin (hdr.origin) so the changelog records the
+    // correct business origin.  epoch and seq remain local (center-controlled) to keep the
+    // local counter contiguous; originRank is resolved against the actual push origin.
+    p.origin = hdr.origin;
     p.epoch = streamEpoch_;
-    // H-01 fix: save prevSeq so we can roll back if execute() fails (transaction rollback
+    // save prevSeq so we can roll back if execute() fails (transaction rollback
     // leaves localOriginSeq_ advanced, which would create a gap seen as false GAP by peers).
     const qint64 prevSeqPush = localOriginSeq_;
     p.seq = nextLocalOriginSeq();
     p.schemaVer = hdr.schemaVer;
     p.schemaFp = hdr.schemaFingerprint;
-    p.originRank = config_.originRank(config_.nodeId());
+    p.originRank = config_.originRank(hdr.origin);
     p.pushId = pushId;
     p.chunkSeq = chunkSeq;
     p.checksum = checksum;
@@ -1880,8 +1879,8 @@ void SyncWorker::enqueueSelectionPush(const SyncSelection& selection,
             // H-07 / H-08 fix: include center node as target peer to disambiguate artifacts.
             const QString centerPeer = config_.centerNodeId().isEmpty() ? QStringLiteral("center")
                                                                         : config_.centerNodeId();
-            const QString artifactName =
-                ddl::selectionPushArtifactName(chunk.pushId, chunk.chunkSeq, centerPeer);
+            const QString artifactName = ddl::selectionPushArtifactName(
+                hdr.origin, hdr.streamEpoch, chunk.pushId, chunk.chunkSeq, centerPeer);
             QString writeErr;
             if (!outbox_->write(artifactName, payload, &writeErr)) {
                 emit errorOccurred({err::E_SYNC_TRANSPORT, Severity::Error,

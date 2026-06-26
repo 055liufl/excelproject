@@ -141,7 +141,8 @@ bool SyncEngine::initialize(const SyncConfig& config, QString* err) {
     };
 
     // J-09: Block direct DataBridge::importExcel() while sync is active.
-    bridge_.setSyncActive(true);
+    // M-02: pass sync-monitored tables so importExcel() can allow non-sync profiles through.
+    bridge_.setSyncActive(true, configPtr_->syncTables());
 
     initialized_ = true;
     appendLog(Severity::Info, QStringLiteral("init"),

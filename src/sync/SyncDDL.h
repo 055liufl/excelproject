@@ -188,16 +188,27 @@ inline QString changesetArtifactName(const QString& origin, qint64 epoch, qint64
         .arg(uuid);
 }
 
-inline QString selectionPushArtifactName(const QString& pushId, int chunkSeq,
-                                         const QString& targetPeer = QString()) {
+// M-01 fix: naming follows the stable contract used by changeset artifacts:
+//   origin__epoch__selectionpush__pushId.chunkSeq__[peer-]uuid.payload
+// origin and epoch are at fixed positions; a UUID suffix guarantees global uniqueness.
+inline QString selectionPushArtifactName(const QString& origin, qint64 epoch, const QString& pushId,
+                                         int chunkSeq, const QString& targetPeer = QString()) {
+    const QString uuid = QUuid::createUuid().toString(QUuid::WithoutBraces).left(8);
+    const QString chunkStr = QString::number(chunkSeq).rightJustified(6, QLatin1Char('0'));
     if (targetPeer.isEmpty())
-        return QStringLiteral("%1__%2__selectionpush.payload")
+        return QStringLiteral("%1__%2__selectionpush__%3.%4__%5.payload")
+            .arg(origin)
+            .arg(epoch)
             .arg(pushId)
-            .arg(chunkSeq, 6, 10, QLatin1Char('0'));
-    return QStringLiteral("%1__%2__%3__selectionpush.payload")
+            .arg(chunkStr)
+            .arg(uuid);
+    return QStringLiteral("%1__%2__selectionpush__%3.%4__peer-%5-%6.payload")
+        .arg(origin)
+        .arg(epoch)
         .arg(pushId)
-        .arg(chunkSeq, 6, 10, QLatin1Char('0'))
-        .arg(targetPeer);
+        .arg(chunkStr)
+        .arg(targetPeer)
+        .arg(uuid);
 }
 
 inline QString baselineRequestArtifactName(const QString& fromPeer, const QString& toPeer,

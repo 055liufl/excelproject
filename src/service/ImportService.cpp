@@ -561,11 +561,16 @@ ImportResult ImportService::run(const ProfileSpec& profile, const SchemaCatalog&
         QSet<int> lookupFailed = applyLookups(ctx.payloads, *routesPtr, lookupCache, catalog,
                                               reader, r, sheetName, &errors);
 
+        // H-01 fix: merge Mapper-level failures (ctx.failedRouteIndices) into the seed set
+        // passed to FkInjector so both failure sources are preserved.  Previously the inject()
+        // return value overwrote ctx.failedRouteIndices, discarding the Mapper failures.
         // H-04 fix: capture failedRouteIndices so write phase skips only affected payloads
         // (and their descendants) rather than the entire Excel row.
+        QSet<int> initialFailed = ctx.failedRouteIndices;  // save Mapper failures
+        initialFailed |= lookupFailed;
         FkInjector fkInjector;
         ctx.failedRouteIndices = fkInjector.inject(ctx.payloads, *routesPtr, r, sheetName, &errors,
-                                                   std::move(lookupFailed));
+                                                   std::move(initialFailed));
 
         // Batch uniqueness check — only on payloads that did not fail injection
         for (int pi = 0; pi < ctx.payloads.size(); ++pi) {
@@ -713,6 +718,12 @@ ImportResult ImportService::run(const ProfileSpec& profile, const SchemaCatalog&
             skipPayloadIndices =
                 buildDescendantFailSet(ctx.payloads, *routesForCtx, ctx.failedRouteIndices);
 
+        // H-01 fix: track whether any payload was actually upserted for this Excel row so that
+        // writtenRows is only incremented when at least one route's data reaches the DB.  Rows
+        // whose all payloads are suppressed by skipPayloadIndices (route-local failures) must not
+        // count as written.
+        bool anyUpserted = false;
+
         for (int pi = 0; pi < ctx.payloads.size(); ++pi) {
             if (skipPayloadIndices.contains(pi))
                 continue;
@@ -752,6 +763,7 @@ ImportResult ImportService::run(const ProfileSpec& profile, const SchemaCatalog&
                 writeOk = false;
                 break;
             }
+            anyUpserted = true;
         }
         if (!writeOk)
             break;
@@ -760,7 +772,9 @@ ImportResult ImportService::run(const ProfileSpec& profile, const SchemaCatalog&
         // previously suggested "number of DB rows inserted/updated", which is ctx.payloads.size()
         // times per Excel row (one upsert per route). The current semantics are Excel rows; callers
         // that need exact DB upsert counts should sum payloads.size() for non-empty payloads.
-        result.writtenRows++;
+        // H-01 fix: only count the row when at least one payload was actually written.
+        if (anyUpserted)
+            result.writtenRows++;
     }
 
     if (writeOk) {

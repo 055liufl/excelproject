@@ -176,19 +176,48 @@ QString DataBridge::generateAutoProfileJson(const QString& table, QString* err) 
     return d_->autoBuilder_.toJson(spec);
 }
 
-void DataBridge::setSyncActive(bool active) {
-    d_->syncActive_ = active;
+void DataBridge::setSyncActive(bool active, const QStringList& syncTables) {
+    d_->syncTables_ = syncTables;
+    d_->syncActive_ = active;  // written last so reader sees syncTables_ first
+}
+
+// M-02 helper: collect all route-level table names from a profile (all modes).
+static QStringList profileRouteTables(const detail::ProfileSpec& spec) {
+    QStringList tables;
+    for (const auto& r : spec.routes)
+        tables.append(r.table);
+    for (const auto& cls : spec.classes)
+        for (const auto& r : cls.routes)
+            tables.append(r.table);
+    return tables;
 }
 
 ImportResult DataBridge::importExcel(const QString& xlsxPath, const ImportOptions& options) {
     ImportResult result;
     // J-09: Block direct imports while sync is active; callers must use IBatchTransfer instead.
+    // M-02 fix: if the profile's routes do not touch any sync-monitored table the import is safe
+    // to proceed (e.g. auxiliary/reference tables not included in the sync table list).
     if (d_->syncActive_) {
-        RowError e;
-        e.code = QString::fromLatin1(err::E_SYNC_WRITE_BLOCKED);
-        e.message = QStringLiteral("Sync is active; use IBatchTransfer for imports");
-        result.errors.append(e);
-        return result;
+        // Look up profile first so we can inspect its routes.
+        auto profIt = d_->profiles_.find(options.profileName);
+        bool blocked = true;  // conservative default: block if we can't determine safety
+        if (profIt != d_->profiles_.end() && !d_->syncTables_.isEmpty()) {
+            const QStringList routeTables = profileRouteTables(profIt.value());
+            blocked = false;
+            for (const QString& t : routeTables) {
+                if (d_->syncTables_.contains(t)) {
+                    blocked = true;
+                    break;
+                }
+            }
+        }
+        if (blocked) {
+            RowError e;
+            e.code = QString::fromLatin1(err::E_SYNC_WRITE_BLOCKED);
+            e.message = QStringLiteral("Sync is active; use IBatchTransfer for imports");
+            result.errors.append(e);
+            return result;
+        }
     }
     if (!d_->dbOpen_) {
         RowError e;

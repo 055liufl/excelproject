@@ -13,6 +13,11 @@ class SchemaEligibility {
     static bool verify(QSqlDatabase& db, const QStringList& syncTables, QStringList* rejected,
                        QString* err);
 
+    // C-08 fix: expand empty syncTables to all user tables (non-sqlite_%, non-__sync_%).
+    // Returns the canonical set used for session attach and eligibility check.
+    static QStringList expandSyncTables(QSqlDatabase& db, const QStringList& syncTables,
+                                        QString* err);
+
    private:
     struct TableInfo {
         bool exists = false;

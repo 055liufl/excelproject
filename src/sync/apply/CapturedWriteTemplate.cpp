@@ -80,8 +80,16 @@ WriteResult CapturedWriteTemplate::branchA(const WriteParams& p) {
     }
     if (sc == SeqCheckResult::Gap) {
         txn.rollback();
-        result.errorCode = QLatin1String(err::E_SYNC_GAP);
-        result.errorMsg = QStringLiteral("gap for origin=%1 seq=%2").arg(p.origin).arg(p.seq);
+        // H-03 fix: gap means a predecessor seq is missing. Per design G-05 / plan S-01,
+        // the artifact should remain in InboxLedger as 'seen' (pending) and be re-scanned
+        // on the next tick; E_SYNC_GAP is only emitted after the gap timeout expires
+        // (InboxLedger::stalePending). Returning a Gap-specific code (not a hard Error) lets
+        // processArtifact skip markConsumed so the ledger stays 'seen'.
+        result.errorCode = QStringLiteral(
+            "GAP_PENDING");  // not a Errors.h error code — handled by processArtifact
+        result.errorMsg = QStringLiteral("gap for origin=%1 seq=%2; keeping artifact pending")
+                              .arg(p.origin)
+                              .arg(p.seq);
         return result;
     }
 
@@ -271,6 +279,20 @@ WriteResult CapturedWriteTemplate::branchBC(const WriteParams& p) {
         txn.rollback();
         result.errorCode = QStringLiteral("E_DB_UPSERT");
         result.errorMsg = err;
+        return result;
+    }
+    // C-09 fix: any row-level errors (FK violation, constraint) must abort the whole chunk.
+    // Committing with partial row errors would let the receiver ACK a broken chunk.
+    if (!rowErrors.isEmpty()) {
+        rec_.abort();
+        txn.rollback();
+        result.errorCode = rowErrors.first().code.contains(QLatin1String("FK")) ||
+                                   rowErrors.first().message.contains(QLatin1String("foreign"))
+                               ? QLatin1String(err::E_SYNC_APPLY_FK)
+                               : QLatin1String(err::E_SYNC_APPLY_CONSTRAINT);
+        result.errorMsg = QStringLiteral("%1 row(s) failed; first: %2")
+                              .arg(rowErrors.size())
+                              .arg(rowErrors.first().message);
         return result;
     }
 

@@ -132,8 +132,11 @@ bool ChangelogStore::insertRow(QSqlDatabase& db, const QString& kind, const QStr
     const qint64 byteSize = changeset.size();
 
     QSqlQuery q(db);
+    // H-01 fix: plain INSERT (not OR IGNORE) so a duplicate (origin,epoch,origin_seq) triggers
+    // a real error that can be caught by the caller. Silently ignoring duplicates would let the
+    // caller believe the changelog was updated when it was not, causing broadcast/ACK drift.
     q.prepare(
-        QStringLiteral("INSERT OR IGNORE INTO __sync_changelog "
+        QStringLiteral("INSERT INTO __sync_changelog "
                        "(kind, origin, source_peer, origin_seq, parent_seq, stream_epoch, "
                        " schema_ver, schema_fingerprint, changeset, payload_checksum, "
                        " byte_size, authoritative, created_ms) "

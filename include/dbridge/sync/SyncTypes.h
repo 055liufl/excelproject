@@ -121,6 +121,7 @@ struct PushChunkAck {
     int totalChunks = 0;
     QString checksum;
     bool ok = false;
+    QString toPeer;  // H-04 fix: peer to which this ACK is routed (= original push origin)
 };
 
 enum class UpsertMode { DoUpdate, DoNothing };

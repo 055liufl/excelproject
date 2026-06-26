@@ -123,10 +123,19 @@ void SyncWorker::run() {
         }
     }
 
+    // C-08 fix: expand empty syncTables to all user tables so session always attaches something.
+    QString expandErr;
+    canonicalSyncTables_ =
+        SchemaEligibility::expandSyncTables(wconn, config_.syncTables(), &expandErr);
+    if (canonicalSyncTables_.isEmpty() && !config_.syncTables().isEmpty()) {
+        // explicit tables given but expansion failed — use original list
+        canonicalSyncTables_ = config_.syncTables();
+    }
+
     // Schema eligibility check
     QStringList rejected;
     QString eligErr;
-    if (!SchemaEligibility::verify(wconn, config_.syncTables(), &rejected, &eligErr)) {
+    if (!SchemaEligibility::verify(wconn, canonicalSyncTables_, &rejected, &eligErr)) {
         initError_ = QStringLiteral("E_SYNC_UNSUPPORTED_SCHEMA: ") + eligErr;
         if (!rejected.isEmpty())
             initError_ += QStringLiteral("; rejected: ") + rejected.join(QLatin1Char(','));
@@ -217,7 +226,7 @@ void SyncWorker::run() {
         return;
     }
 
-    QString schemaFp = SchemaGuard::computeFingerprint(wconn, config_.syncTables());
+    QString schemaFp = SchemaGuard::computeFingerprint(wconn, canonicalSyncTables_);
     guard_->setLocal(config_.schemaVersion(), schemaFp);
 
     routing_->configure(config_.nodeId(), config_.peerNodes());
@@ -429,7 +438,12 @@ bool SyncWorker::processChangesetArtifact(const DecodeResult& dec, const QString
 
     WriteResult res = tpl_->execute(p);
     if (!res.ok) {
-        emit errorOccurred({res.errorCode, Severity::Error, "apply", hdr.origin, res.errorMsg});
+        // H-03 fix: GAP_PENDING is not a hard error — keep artifact in ledger as 'seen' so the
+        // three-time-rescan logic can retry. The E_SYNC_GAP warning fires via stalePending() later.
+        if (res.errorCode == QLatin1String("GAP_PENDING"))
+            return false;  // caller must NOT markConsumed; ledger stays 'seen'
+        emit errorOccurred(
+            {res.errorCode, Severity::Error, QStringLiteral("apply"), hdr.origin, res.errorMsg});
         return false;
     }
 
@@ -473,7 +487,7 @@ bool SyncWorker::processSelectionPushArtifact(const DecodeResult& dec, const QSt
         ins.prepare(
             QStringLiteral("INSERT OR IGNORE INTO __sync_push_progress "
                            "(push_id, origin, peer, total_chunks, schema_ver, status, updated_ms) "
-                           "VALUES (?, ?, ?, ?, ?, 'receiving', ?)"));
+                           "VALUES (?, ?, ?, ?, ?, 'streaming', ?)"));
         ins.addBindValue(pushId);
         ins.addBindValue(hdr.origin);
         ins.addBindValue(config_.nodeId());
@@ -551,7 +565,7 @@ bool SyncWorker::processSelectionPushArtifact(const DecodeResult& dec, const QSt
     p.chunkSeq = chunkSeq;
     p.checksum = checksum;
     p.mutations = mutations;
-    p.syncTables = config_.syncTables();
+    p.syncTables = canonicalSyncTables_;
 
     WriteResult res = tpl_->execute(p);
     if (!res.ok) {
@@ -565,6 +579,7 @@ bool SyncWorker::processSelectionPushArtifact(const DecodeResult& dec, const QSt
     ack.totalChunks = totalChunks > 0 ? totalChunks : 1;
     ack.checksum = checksum;
     ack.ok = true;
+    ack.toPeer = hdr.origin;  // H-04 fix: ACK routes back to the push origin
     QString ackErr;
     if (!ackChan_->schedulePushChunkAck(ack, *codec_, &ackErr)) {
         emit errorOccurred(
@@ -811,12 +826,15 @@ ImportResult SyncWorker::submitImportSync(const ImportOptions& opts, const QStri
         }
 
         QString sessionErr;
-        rec_->begin(hPtr_, config_.syncTables(), &sessionErr);
+        rec_->begin(hPtr_, canonicalSyncTables_, &sessionErr);
 
-        // Run ImportService using the worker-owned wconn and the pre-snapshotted
-        // profile/catalog — zero access to DataBridge::db_ or main-thread state.
+        // C-05 fix: pass manageTransaction=false so ImportService does not open an inner
+        // db.transaction() while WriteTxn holds the outer BEGIN IMMEDIATE.
+        // SQLite/QSqlDatabase does not support nested transactions; the inner call would
+        // silently succeed or fail depending on driver implementation.
         detail::ImportService svc;
-        ImportResult result = svc.run(profile, catalog, xlsxPath, opts, *wconnPtr_);
+        ImportResult result = svc.run(profile, catalog, xlsxPath, opts, *wconnPtr_,
+                                      /*manageTransaction=*/false);
 
         if (result.ok) {
             qint64 localSeq = 0;
@@ -963,13 +981,17 @@ void SyncWorker::enqueueSelectionPush(const SyncSelection& selection,
         const QString schemaFp = guard_ ? guard_->fingerprint() : QString();
         const QString pushId = chunks.isEmpty() ? QString() : chunks.first().pushId;
 
-        // M-05 / C-02: create push_progress(sending) on the worker thread BEFORE writing chunks.
+        // M-05 / C-02: create push_progress(streaming) on the worker thread BEFORE writing chunks.
+        // L-01 fix: ON CONFLICT DO UPDATE so re-sends refresh total_chunks/status/updated_ms.
         if (!pushId.isEmpty() && wconnPtr_) {
             QSqlQuery ins(*wconnPtr_);
             ins.prepare(QStringLiteral(
-                "INSERT OR IGNORE INTO __sync_push_progress "
+                "INSERT INTO __sync_push_progress "
                 "(push_id, origin, peer, total_chunks, schema_ver, status, updated_ms)"
-                " VALUES (?, ?, '', ?, ?, 'sending', ?)"));
+                " VALUES (?, ?, '', ?, ?, 'streaming', ?)"
+                " ON CONFLICT(push_id) DO UPDATE SET"
+                "  status='streaming', total_chunks=excluded.total_chunks,"
+                "  updated_ms=excluded.updated_ms"));
             ins.addBindValue(pushId);
             ins.addBindValue(config_.nodeId());
             ins.addBindValue(chunks.size());

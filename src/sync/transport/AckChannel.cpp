@@ -43,9 +43,9 @@ bool AckChannel::flush(PayloadCodec& codec, QString* err) {
     QList<PushChunkAck> failedChunk;
     for (const PushChunkAck& ack : qAsConst(pendingChunk_)) {
         QByteArray data = codec.encodeChunkAck(ack);
-        // PushChunkAck does not carry a toPeer yet; keep existing routing tag.
-        // TODO(J-01): extend PushChunkAck with toPeer when push fan-out is implemented.
-        const QString name = ddl::ackArtifactName(nodeId_, ack.pushId, nowMs);
+        // H-04 fix: use toPeer (the push origin) so the ACK file is routed correctly.
+        const QString toPeer = ack.toPeer.isEmpty() ? ack.pushId : ack.toPeer;
+        const QString name = ddl::ackArtifactName(nodeId_, toPeer, nowMs);
         QString writeErr;
         if (!writer_.writeAck(name, data, &writeErr)) {
             ok = false;

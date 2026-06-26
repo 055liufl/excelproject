@@ -167,6 +167,7 @@ bool SyncEngine::stop(QString* err) {
         }
     }
     setProgress(SyncState::Stopped);
+    releaseGateIfTerminal(SyncState::Stopped);  // H-02 fix: gate must be released on stop
     return true;
 }
 

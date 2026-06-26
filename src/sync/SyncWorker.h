@@ -149,6 +149,8 @@ class SyncWorker : public QThread {
 
     qint64 streamEpoch_ = 0;
     qint64 localOriginSeq_ = 0;  // next seq for local node
+    // C-08: canonical sync table list (expanded from empty = all user tables).
+    QStringList canonicalSyncTables_;
 
     // I-16: Rebase buffers keyed by "origin/originSeq"; populated after each apply_v2.
     // J-13: Use insertion-ordered queue for correct LRU eviction.

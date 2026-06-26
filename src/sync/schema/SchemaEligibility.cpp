@@ -11,6 +11,26 @@ namespace dbridge::sync {
 // public
 // ---------------------------------------------------------------------------
 
+QStringList SchemaEligibility::expandSyncTables(QSqlDatabase& db, const QStringList& syncTables,
+                                                QString* err) {
+    if (!syncTables.isEmpty())
+        return syncTables;
+
+    // C-08 fix: empty = all user tables (exclude SQLite internals and sync meta tables).
+    QSqlQuery q(db);
+    if (!q.exec(QStringLiteral("SELECT name FROM sqlite_master WHERE type='table' "
+                               "AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '__sync_%' "
+                               "ORDER BY name"))) {
+        if (err)
+            *err = q.lastError().text();
+        return {};
+    }
+    QStringList tables;
+    while (q.next())
+        tables.append(q.value(0).toString());
+    return tables;
+}
+
 bool SchemaEligibility::verify(QSqlDatabase& db, const QStringList& syncTables,
                                QStringList* rejected, QString* err) {
     bool allOk = true;

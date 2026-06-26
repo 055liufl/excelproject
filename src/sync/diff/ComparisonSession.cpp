@@ -495,15 +495,14 @@ std::unique_ptr<IComparisonSession> createComparisonSession(const SyncConfig& co
         return nullptr;
     }
 
-    // streamEpoch is not known here at factory time (it is owned by SyncWorker);
-    // use 0 as a placeholder — the caller can call initialize() to set up diffs.
-    constexpr qint64 kPlaceholderEpoch = 0;
+    // H-13 fix: use the worker's published stream epoch (not a 0 placeholder) so
+    // DiffEngine::tableDiffs() reads __sync_table_state at the correct epoch.
+    const qint64 epoch = deps->ctx->streamEpoch;
 
     auto session = std::make_unique<ComparisonSession>(
         deps->rconn,  // rconn: read-only diff queries
         deps->rconn,  // unused write reference; writes are marshalled to SyncWorker
-        deps->ts, deps->diff, *deps->ctx->inboundTableGate, deps->upsert, kPlaceholderEpoch,
-        deps->ctx);
+        deps->ts, deps->diff, *deps->ctx->inboundTableGate, deps->upsert, epoch, deps->ctx);
 
     return std::make_unique<OwningComparisonSession>(std::move(deps), std::move(session));
 }

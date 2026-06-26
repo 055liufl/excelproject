@@ -7,6 +7,8 @@
 #include <QSqlQuery>
 #include <QSqlRecord>
 
+#include "sql/SqlBuilder.h"
+
 namespace dbridge::sync {
 
 // Stable key for dedup set: "table\x1fpk"
@@ -32,7 +34,9 @@ QString FkClosureBuilder::getPkColumn(QSqlDatabase& rconn, const QString& table)
         return *it;
 
     QSqlQuery q(rconn);
-    q.prepare(QStringLiteral("PRAGMA table_info(\"%1\")").arg(table));
+    // M-11 fix: quote identifier (escapes embedded double-quotes).
+    q.prepare(QStringLiteral("PRAGMA table_info(") + detail::SqlBuilder::quoteIdent(table) +
+              QLatin1Char(')'));
     if (!q.exec())
         return {};
     while (q.next()) {
@@ -56,7 +60,10 @@ bool FkClosureBuilder::fetchRow(QSqlDatabase& rconn, const QString& table, const
     }
 
     QSqlQuery q(rconn);
-    q.prepare(QStringLiteral("SELECT * FROM \"%1\" WHERE \"%2\" = ? LIMIT 1").arg(table, pkCol));
+    // M-11 fix: quote table and column identifiers.
+    q.prepare(QStringLiteral("SELECT * FROM ") + detail::SqlBuilder::quoteIdent(table) +
+              QStringLiteral(" WHERE ") + detail::SqlBuilder::quoteIdent(pkCol) +
+              QStringLiteral(" = ? LIMIT 1"));
     q.addBindValue(pk);
     if (!q.exec()) {
         if (err)

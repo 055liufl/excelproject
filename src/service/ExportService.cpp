@@ -160,20 +160,25 @@ bool hasAnyLookupHCols(const QVector<RouteSpec>& routes) {
 }
 
 // Build the extra SQL column selections for H-cols (all lookups, roundtrip true and false).
-// Returns e.g. ", "t"."h1", "t"."h2"" to be appended before " FROM " in the base SQL.
+// Returns e.g. ", "t"."h1" AS "h1", "t"."h2" AS "h2"" to be appended before " FROM ".
+// H-14 fix: each H-col carries an explicit `AS "dbColumn"` alias so the result-set field name
+// is exactly sp.second (the dbColumn), regardless of how Qt/SQLite would otherwise name a
+// quoted table.column expression. De-dup is keyed on the alias (sp.second) so the result set
+// never has two columns with the same name.
 QString buildHColSelectSuffix(const QVector<RouteSpec>& routes) {
     QStringList parts;
-    QSet<QString> seen;
+    QSet<QString> seenAlias;
     for (const auto& route : routes) {
         for (const auto& lk : route.lookups) {
             for (const auto& sp : lk.select) {
-                // H-10 fix: quote both table and column identifiers.
+                const QString& alias = sp.second;  // dbColumn = result-set field name
+                if (seenAlias.contains(alias))
+                    continue;
+                seenAlias.insert(alias);
                 QString qualified = SqlBuilder::quoteIdent(route.table) + QLatin1Char('.') +
-                                    SqlBuilder::quoteIdent(sp.second);
-                if (!seen.contains(qualified)) {
-                    seen.insert(qualified);
-                    parts.append(qualified);
-                }
+                                    SqlBuilder::quoteIdent(alias) + QStringLiteral(" AS ") +
+                                    SqlBuilder::quoteIdent(alias);
+                parts.append(qualified);
             }
         }
     }

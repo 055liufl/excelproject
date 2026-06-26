@@ -48,6 +48,11 @@ struct SyncContext {
     // L-01 fix: canonical sync table list (expanded from empty = all user tables).
     // Populated by SyncWorker after initialization so all modules share the same set.
     QStringList canonicalSyncTables;
+
+    // H-13 fix: the worker's active stream epoch. Published by SyncWorker after init so the
+    // ComparisonSession factory can read local __sync_table_state with the correct epoch
+    // (instead of the placeholder 0, which made tableDiffs() read state as "not found").
+    qint64 streamEpoch = 0;
 };
 
 // Process-wide singleton registry of SyncContext objects.

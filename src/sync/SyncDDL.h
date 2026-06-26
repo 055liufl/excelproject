@@ -187,6 +187,34 @@ inline QString selectionPushArtifactName(const QString& pushId, int chunkSeq,
         .arg(targetPeer);
 }
 
+inline QString baselineRequestArtifactName(const QString& fromPeer, const QString& toPeer,
+                                           qint64 epoch, qint64 fromSeq,
+                                           const QString& uniqueSuffix = QString()) {
+    const QString suffix = uniqueSuffix.isEmpty()
+                               ? QUuid::createUuid().toString(QUuid::WithoutBraces).left(8)
+                               : uniqueSuffix;
+    return QStringLiteral("%1__%2__%3__%4__%5__baselinerequest.payload")
+        .arg(fromPeer)
+        .arg(toPeer)
+        .arg(epoch)
+        .arg(fromSeq, 12, 10, QLatin1Char('0'))
+        .arg(suffix);
+}
+
+inline QString baselineResponseArtifactName(const QString& fromPeer, const QString& toPeer,
+                                            qint64 epoch, qint64 sourceMaxSeq,
+                                            const QString& uniqueSuffix = QString()) {
+    const QString suffix = uniqueSuffix.isEmpty()
+                               ? QUuid::createUuid().toString(QUuid::WithoutBraces).left(8)
+                               : uniqueSuffix;
+    return QStringLiteral("%1__%2__%3__%4__%5__baselineresponse.payload")
+        .arg(fromPeer)
+        .arg(toPeer)
+        .arg(epoch)
+        .arg(sourceMaxSeq, 12, 10, QLatin1Char('0'))
+        .arg(suffix);
+}
+
 // H-03 fix: include a per-call UUID suffix so same-millisecond ACKs never collide.
 inline QString ackArtifactName(const QString& fromPeer, const QString& toPeer, qint64 ms,
                                const QString& uniqueSuffix = QString()) {

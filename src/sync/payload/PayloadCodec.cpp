@@ -81,6 +81,55 @@ QByteArray PayloadCodec::encodeSelectionPush(const PayloadHeader& h,
     return buf;
 }
 
+QByteArray PayloadCodec::encodeBaselineRequest(const PayloadHeader& h,
+                                               const BaselineRequestPayload& body) {
+    QJsonArray tablesArr;
+    for (const QString& table : body.requestedTables)
+        tablesArr.append(table);
+
+    QJsonObject root;
+    root[QStringLiteral("origin")] = body.origin;
+    root[QStringLiteral("streamEpoch")] = QString::number(body.streamEpoch);
+    root[QStringLiteral("requestedTables")] = tablesArr;
+    root[QStringLiteral("fromSeq")] = QString::number(body.fromSeq);
+    root[QStringLiteral("pendingArtifactName")] = body.pendingArtifactName;
+    QByteArray json = QJsonDocument(root).toJson(QJsonDocument::Compact);
+
+    QByteArray buf;
+    QDataStream ds(&buf, QIODevice::WriteOnly);
+    ds.setVersion(QDataStream::Qt_5_12);
+    ds << kMagic << kVersion << static_cast<quint8>(KBaselineRequest);
+    writeHeader(ds, h);
+    ds << qCompress(json);
+    return buf;
+}
+
+QByteArray PayloadCodec::encodeBaselineResponse(const PayloadHeader& h,
+                                                const BaselineResponsePayload& body) {
+    QJsonArray tablesArr;
+    for (const QString& table : body.tables)
+        tablesArr.append(table);
+
+    QJsonObject root;
+    root[QStringLiteral("origin")] = body.origin;
+    root[QStringLiteral("requestOrigin")] = body.requestOrigin;
+    root[QStringLiteral("streamEpoch")] = QString::number(body.streamEpoch);
+    root[QStringLiteral("tables")] = tablesArr;
+    root[QStringLiteral("fromSeq")] = QString::number(body.fromSeq);
+    root[QStringLiteral("pendingArtifactName")] = body.pendingArtifactName;
+    root[QStringLiteral("baselineData")] = QString::fromLatin1(body.baselineData.toBase64());
+    root[QStringLiteral("sourceMaxSeq")] = QString::number(body.sourceMaxSeq);
+    QByteArray json = QJsonDocument(root).toJson(QJsonDocument::Compact);
+
+    QByteArray buf;
+    QDataStream ds(&buf, QIODevice::WriteOnly);
+    ds.setVersion(QDataStream::Qt_5_12);
+    ds << kMagic << kVersion << static_cast<quint8>(KBaselineResponse);
+    writeHeader(ds, h);
+    ds << qCompress(json);
+    return buf;
+}
+
 // ---------------------------------------------------------------------------
 // public: decode
 // ---------------------------------------------------------------------------
@@ -155,6 +204,48 @@ bool PayloadCodec::decode(const QByteArray& data, DecodeResult* out, QString* er
         }
         return true;
     }
+    if (kind == KBaselineRequest) {
+        out->kind = PayloadKind::BaselineRequest;
+        QJsonParseError pe;
+        QJsonDocument doc = QJsonDocument::fromJson(body, &pe);
+        if (doc.isNull()) {
+            if (err)
+                *err = QStringLiteral("baseline request JSON: %1").arg(pe.errorString());
+            return false;
+        }
+        QJsonObject root = doc.object();
+        BaselineRequestPayload& br = out->baselineRequest;
+        br.origin = root[QStringLiteral("origin")].toString();
+        br.streamEpoch = root[QStringLiteral("streamEpoch")].toString().toLongLong();
+        br.fromSeq = root[QStringLiteral("fromSeq")].toString().toLongLong();
+        br.pendingArtifactName = root[QStringLiteral("pendingArtifactName")].toString();
+        for (const QJsonValue& tv : root[QStringLiteral("requestedTables")].toArray())
+            br.requestedTables.append(tv.toString());
+        return true;
+    }
+    if (kind == KBaselineResponse) {
+        out->kind = PayloadKind::BaselineResponse;
+        QJsonParseError pe;
+        QJsonDocument doc = QJsonDocument::fromJson(body, &pe);
+        if (doc.isNull()) {
+            if (err)
+                *err = QStringLiteral("baseline response JSON: %1").arg(pe.errorString());
+            return false;
+        }
+        QJsonObject root = doc.object();
+        BaselineResponsePayload& br = out->baselineResponse;
+        br.origin = root[QStringLiteral("origin")].toString();
+        br.requestOrigin = root[QStringLiteral("requestOrigin")].toString();
+        br.streamEpoch = root[QStringLiteral("streamEpoch")].toString().toLongLong();
+        br.fromSeq = root[QStringLiteral("fromSeq")].toString().toLongLong();
+        br.pendingArtifactName = root[QStringLiteral("pendingArtifactName")].toString();
+        br.baselineData =
+            QByteArray::fromBase64(root[QStringLiteral("baselineData")].toString().toLatin1());
+        br.sourceMaxSeq = root[QStringLiteral("sourceMaxSeq")].toString().toLongLong();
+        for (const QJsonValue& tv : root[QStringLiteral("tables")].toArray())
+            br.tables.append(tv.toString());
+        return true;
+    }
     if (err)
         *err = QStringLiteral("unknown payload kind %1").arg(kind);
     return false;
@@ -168,8 +259,9 @@ QByteArray PayloadCodec::encodeChangesetAck(const ChangesetAck& ack) {
     QByteArray buf;
     QDataStream ds(&buf, QIODevice::WriteOnly);
     ds.setVersion(QDataStream::Qt_5_12);
+    // M-09 fix: include toPeer so the ACK artifact is self-describing (not file-name-only routed).
     ds << kMagic << kVersion << static_cast<quint8>(KChangesetAck) << ack.origin << ack.streamEpoch
-       << ack.appliedSeq;
+       << ack.appliedSeq << ack.toPeer;
     return buf;
 }
 
@@ -177,9 +269,10 @@ QByteArray PayloadCodec::encodeChunkAck(const PushChunkAck& ack) {
     QByteArray buf;
     QDataStream ds(&buf, QIODevice::WriteOnly);
     ds.setVersion(QDataStream::Qt_5_12);
+    // M-09 fix: include toPeer so the chunk ACK is self-describing.
     ds << kMagic << kVersion << static_cast<quint8>(KChunkAck) << ack.pushId
        << static_cast<qint32>(ack.chunkSeq) << static_cast<qint32>(ack.totalChunks) << ack.checksum
-       << ack.ok;
+       << ack.ok << ack.toPeer;
     return buf;
 }
 
@@ -192,7 +285,7 @@ bool PayloadCodec::decodeChangesetAck(const QByteArray& data, ChangesetAck* out)
     ds >> magic >> ver >> kind;
     if (magic != kMagic || kind != KChangesetAck)
         return false;
-    ds >> out->origin >> out->streamEpoch >> out->appliedSeq;
+    ds >> out->origin >> out->streamEpoch >> out->appliedSeq >> out->toPeer;
     return ds.status() == QDataStream::Ok;
 }
 
@@ -206,7 +299,7 @@ bool PayloadCodec::decodeChunkAck(const QByteArray& data, PushChunkAck* out) {
     if (magic != kMagic || kind != KChunkAck)
         return false;
     qint32 cs = 0, tc = 0;
-    ds >> out->pushId >> cs >> tc >> out->checksum >> out->ok;
+    ds >> out->pushId >> cs >> tc >> out->checksum >> out->ok >> out->toPeer;
     out->chunkSeq = cs;
     out->totalChunks = tc;
     return ds.status() == QDataStream::Ok;

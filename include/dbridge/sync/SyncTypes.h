@@ -2,6 +2,7 @@
 #include <QByteArray>
 #include <QList>
 #include <QString>
+#include <QStringList>
 #include <QVariant>
 
 namespace dbridge::sync {
@@ -80,7 +81,7 @@ struct PayloadHeader {
     int totalChunks = 0;
 };
 
-enum class PayloadKind { Changeset, SelectionPush };
+enum class PayloadKind { Changeset, SelectionPush, BaselineRequest, BaselineResponse };
 
 struct FrozenEntry {
     QString table;
@@ -100,11 +101,32 @@ struct SelectionPushBody {
     int totalChunks = 0;
 };
 
+struct BaselineRequestPayload {
+    QString origin;
+    qint64 streamEpoch = 0;
+    QStringList requestedTables;
+    qint64 fromSeq = 0;
+    QString pendingArtifactName;
+};
+
+struct BaselineResponsePayload {
+    QString origin;
+    QString requestOrigin;
+    qint64 streamEpoch = 0;
+    QStringList tables;
+    qint64 fromSeq = 0;
+    QString pendingArtifactName;
+    QByteArray baselineData;
+    qint64 sourceMaxSeq = 0;
+};
+
 struct DecodeResult {
     PayloadHeader header;
     PayloadKind kind = PayloadKind::Changeset;
     QByteArray changeset;
     SelectionPushBody selection;
+    BaselineRequestPayload baselineRequest;
+    BaselineResponsePayload baselineResponse;
 };
 
 // Typed ACK artifacts

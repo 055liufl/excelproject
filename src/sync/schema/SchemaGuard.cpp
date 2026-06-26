@@ -6,6 +6,8 @@
 #include <QStringList>
 #include <QVariant>
 
+#include "sql/SqlBuilder.h"
+
 namespace dbridge::sync {
 
 void SchemaGuard::setLocal(qint64 localVer, const QString& localFp) {
@@ -43,7 +45,9 @@ QString SchemaGuard::computeFingerprint(QSqlDatabase& db, const QStringList& tab
 
         // column info
         QSqlQuery colQ(db);
-        colQ.exec(QStringLiteral("PRAGMA table_info(%1)").arg(tbl));
+        // M-11 fix: quote identifier (previously raw %1 — would break on reserved/special names).
+        colQ.exec(QStringLiteral("PRAGMA table_info(") + detail::SqlBuilder::quoteIdent(tbl) +
+                  QLatin1Char(')'));
         while (colQ.next()) {
             // cid, name, type, notnull, dflt_value, pk
             QString colName = colQ.value(1).toString();

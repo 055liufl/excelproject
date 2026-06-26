@@ -6,6 +6,7 @@
 
 #include <QMutex>
 #include <QSemaphore>
+#include <QSet>
 #include <QThread>
 #include <QWaitCondition>
 
@@ -107,6 +108,8 @@ class SyncWorker : public QThread {
     bool processChangesetArtifact(const DecodeResult& dec, const QString& artifactName);
     bool processSelectionPushArtifact(const DecodeResult& dec, const QString& artifactName,
                                       const QString& checksum);
+    bool processBaselineRequestArtifact(const DecodeResult& dec, const QString& artifactName);
+    bool processBaselineResponseArtifact(const DecodeResult& dec, const QString& artifactName);
     bool processAckArtifact(const QString& path, const QString& artifactName);
 
     // --- Broadcast helpers ---
@@ -173,6 +176,8 @@ class SyncWorker : public QThread {
     // and the worker-thread main loop both access it safely without a mutex.
     std::atomic<bool> ackWaiting_{false};
     std::atomic<qint64> ackDeadlineMs_{0};
+
+    QSet<QString> baselineRequestsInFlight_;
 };
 
 }  // namespace dbridge::sync

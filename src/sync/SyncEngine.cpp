@@ -187,6 +187,13 @@ bool SyncEngine::stop(QString* err) {
     }
     setProgress(SyncState::Stopped);
     releaseGateIfTerminal(SyncState::Stopped);  // H-02 fix: gate must be released on stop
+    // M-10 fix: clear context-bound worker callbacks so a surviving ComparisonSession (which may
+    // still hold the shared SyncContext) cannot dispatch save()/rescan() to a stopped worker.
+    if (ctx_) {
+        ctx_->importFn = nullptr;
+        ctx_->workerWriteFn = nullptr;
+        ctx_->rescanFn = nullptr;
+    }
     return true;
 }
 

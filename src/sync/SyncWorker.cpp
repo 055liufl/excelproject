@@ -327,10 +327,31 @@ void SyncWorker::run() {
 
     // L-01 fix: publish the canonical sync table list to the shared SyncContext so other
     // modules (ComparisonSession, BatchTransfer, diagnostics) can read the same expanded set.
+    // H-13 fix: also publish the active stream epoch so the ComparisonSession factory reads
+    // __sync_table_state at the correct epoch (instead of a 0 placeholder).
     {
         auto ctx = SyncContextRegistry::instance().getExisting(config_.sqlitePath());
-        if (ctx && !canonicalSyncTables_.isEmpty())
-            ctx->canonicalSyncTables = canonicalSyncTables_;
+        if (ctx) {
+            if (!canonicalSyncTables_.isEmpty())
+                ctx->canonicalSyncTables = canonicalSyncTables_;
+            ctx->streamEpoch = streamEpoch_;
+        }
+    }
+
+    // H-16 fix: on startup, replay any quarantined payloads whose schema version is now
+    // applicable — e.g. payloads quarantined before a restart that brought the local schema up
+    // to date, or after a baseline. drainReady() removes the rows; a replay that still fails
+    // re-quarantines. We drain once at init (not every scan) because the worker's schema version
+    // is fixed for its lifetime, so re-draining at runtime would only churn incompatible rows.
+    {
+        const QList<QByteArray> readyPayloads =
+            quarantine_->drainReady(wconn, config_.schemaVersion());
+        for (const QByteArray& payload : readyPayloads) {
+            DecodeResult qdec;
+            QString qerr;
+            if (codec_->decode(payload, &qdec, &qerr) && qdec.kind == PayloadKind::Changeset)
+                processChangesetArtifact(qdec, QString());
+        }
     }
 
     // Signal successful initialization to initialize() caller
@@ -504,6 +525,10 @@ bool SyncWorker::processArtifact(const QString& path) {
         const QString checksum =
             QString::fromLatin1(QCryptographicHash::hash(data, QCryptographicHash::Sha256).toHex());
         ok = processSelectionPushArtifact(dec, name, checksum);
+    } else if (dec.kind == PayloadKind::BaselineRequest) {
+        ok = processBaselineRequestArtifact(dec, name);
+    } else if (dec.kind == PayloadKind::BaselineResponse) {
+        ok = processBaselineResponseArtifact(dec, name);
     }
 
     if (ok) {
@@ -641,6 +666,25 @@ bool SyncWorker::processSelectionPushArtifact(const DecodeResult& dec, const QSt
         return false;
     }
 
+    // H-15 fix: enforce in-order chunk application. ChunkStreamer emits chunks in topological
+    // order (parent chunks before child chunks); applying chunk N before 0..N-1 would risk
+    // FK-dangling rows and break the "half not externalised" guarantee. Apply chunk N only when
+    // all chunks 0..N-1 are already applied; otherwise keep the artifact pending (ledger stays
+    // 'seen') and retry on the next inbox scan once the predecessor chunks arrive.
+    if (chunkSeq > 0 && !pushId.isEmpty()) {
+        QSqlQuery cq(*wconnPtr_);
+        cq.prepare(
+            QStringLiteral("SELECT COUNT(*) FROM __sync_push_chunk_progress "
+                           "WHERE push_id=? AND status='applied' AND chunk_seq < ?"));
+        cq.addBindValue(pushId);
+        cq.addBindValue(chunkSeq);
+        if (cq.exec() && cq.next()) {
+            const int appliedBefore = cq.value(0).toInt();
+            if (appliedBefore < chunkSeq)
+                return false;  // predecessor chunk(s) not yet applied — keep pending, retry later
+        }
+    }
+
     // Build mutations from selection push body.
     // J-05: Fill pkColumns from PRAGMA table_info so UpsertExecutor can build correct
     // ON CONFLICT(...) clauses. Use cached PRAGMA result per table.
@@ -738,6 +782,15 @@ bool SyncWorker::processAckArtifact(const QString& path, const QString& name) {
     // Try changeset ACK first
     ChangesetAck csAck;
     if (codec_->decodeChangesetAck(data, &csAck)) {
+        // M-09 fix: the ACK payload is self-describing; ignore ACKs not addressed to this node
+        // (e.g. mis-routed or renamed artifacts).
+        if (!csAck.toPeer.isEmpty() && csAck.toPeer != config_.nodeId()) {
+            emit errorOccurred({err::W_SYNC_UNTRACKED_CHANGE, Severity::Warning,
+                                QStringLiteral("ack"), csAck.origin,
+                                QStringLiteral("changeset ACK addressed to %1, not this node %2")
+                                    .arg(csAck.toPeer, config_.nodeId())});
+            return true;  // consumed (not ours), don't reprocess
+        }
         // I-15 fix: pass peer (sender) as the first peer argument, not csAck.origin.
         if (!peer.isEmpty())
             ackStore_->updateAcked(*wconnPtr_, peer, csAck.origin, csAck.streamEpoch,
@@ -757,6 +810,14 @@ bool SyncWorker::processAckArtifact(const QString& path, const QString& name) {
     if (codec_->decodeChunkAck(data, &chunkAck)) {
         if (chunkAck.pushId.isEmpty())
             return false;
+        // M-09 fix: ignore chunk ACKs not addressed to this node.
+        if (!chunkAck.toPeer.isEmpty() && chunkAck.toPeer != config_.nodeId()) {
+            emit errorOccurred({err::W_SYNC_UNTRACKED_CHANGE, Severity::Warning,
+                                QStringLiteral("ack"), chunkAck.pushId,
+                                QStringLiteral("chunk ACK addressed to %1, not this node %2")
+                                    .arg(chunkAck.toPeer, config_.nodeId())});
+            return true;
+        }
 
         const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
 

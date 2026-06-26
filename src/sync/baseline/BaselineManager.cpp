@@ -7,6 +7,7 @@
 #include <QSqlQuery>
 #include <QSqlRecord>
 
+#include "sql/SqlBuilder.h"
 #include "sync/WriteTxn.h"
 
 namespace dbridge::sync {
@@ -124,7 +125,8 @@ bool BaselineManager::deserializeAndApply(QSqlDatabase& wconn, const QByteArray&
         // DELETE existing rows.
         {
             QSqlQuery delQ(wconn);
-            delQ.prepare(QStringLiteral("DELETE FROM \"%1\"").arg(tableName));
+            delQ.prepare(QStringLiteral("DELETE FROM ") +
+                         detail::SqlBuilder::quoteIdent(tableName));
             if (!delQ.exec()) {
                 if (err)
                     *err = QStringLiteral("delete failed on %1: %2")
@@ -150,15 +152,17 @@ bool BaselineManager::deserializeAndApply(QSqlDatabase& wconn, const QByteArray&
             // M-05 fix: plain INSERT (not OR REPLACE). The DELETE above already cleared the
             // table, so no PK conflicts exist. INSERT OR REPLACE triggers DELETE+INSERT
             // semantics which can fire FK cascade deletes on child tables unexpectedly.
+            // M-11 fix: quote table and column identifiers (escapes embedded double-quotes).
             QStringList cols, placeholders;
             for (auto it = rowMap.cbegin(); it != rowMap.cend(); ++it) {
-                cols << QStringLiteral("\"%1\"").arg(it.key());
+                cols << detail::SqlBuilder::quoteIdent(it.key());
                 placeholders << QStringLiteral("?");
             }
 
-            const QString sql = QStringLiteral("INSERT INTO \"%1\" (%2) VALUES (%3)")
-                                    .arg(tableName, cols.join(QLatin1Char(',')),
-                                         placeholders.join(QLatin1Char(',')));
+            const QString sql =
+                QStringLiteral("INSERT INTO %1 (%2) VALUES (%3)")
+                    .arg(detail::SqlBuilder::quoteIdent(tableName), cols.join(QLatin1Char(',')),
+                         placeholders.join(QLatin1Char(',')));
 
             QSqlQuery insQ(wconn);
             insQ.prepare(sql);

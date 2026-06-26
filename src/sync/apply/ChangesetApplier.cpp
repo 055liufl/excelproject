@@ -4,6 +4,8 @@
 #include <QCryptographicHash>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QMap>
+#include <QSqlError>
 #include <QSqlQuery>
 #include <QString>
 #include <QVariant>
@@ -96,20 +98,16 @@ bool ChangesetApplier::apply(sqlite3* h, QSqlDatabase& wconn, const QByteArray& 
     // xFilter (table allow-list) and xConflict (row-winner arbitration) state.
     ctx.syncTables = syncTables.isEmpty() ? nullptr : &syncTables;
 
-    // C-04 fix: pre-filter the changeset to remove rows where (inRank,inSeq) < stored winner.
-    // This ensures low-rank late arrivals never bypass the winner check on clean (non-conflict)
-    // SQLite applies (e.g. DELETE where old-image matches current row).
-    const QByteArray& changesetToApply =
-        opts.authoritative ? changeset
-                           : filterByWinner(changeset, originRank, originSeq, winners, wconn);
-
-    // For non-authoritative path we use apply_v2 with a rebase buffer.
+    // C-11 fix: there is no reliable public SQLite API to rebuild a row-filtered changeset, so
+    // we do NOT pre-filter. Instead, low-rank DELETE protection is enforced AFTER apply by
+    // updateWinnersFromChangeset(): it restores any high-rank row erased by a dominated DELETE,
+    // within the SAME transaction. If the restore fails, apply() returns false and the caller
+    // rolls back — so a low-rank DELETE can never win (G-01/FR-6).
     void* pRebase = nullptr;
     int nRebase = 0;
 
     int rc = sqlite3changeset_apply_v2(
-        h, changesetToApply.size(),
-        const_cast<void*>(static_cast<const void*>(changesetToApply.constData())),
+        h, changeset.size(), const_cast<void*>(static_cast<const void*>(changeset.constData())),
         &filterCb,  // H-04: table filter — uses same pCtx as conflictCb
         &conflictCb, &ctx, &pRebase, &nRebase, SQLITE_CHANGESETAPPLY_NOSAVEPOINT);
 
@@ -125,9 +123,14 @@ bool ChangesetApplier::apply(sqlite3* h, QSqlDatabase& wconn, const QByteArray& 
         return false;
     }
 
-    // Post-apply: update row_winner for all INSERT/UPDATE rows that were
-    // applied without triggering a conflict callback (I-03).
-    updateWinnersFromChangeset(changesetToApply, origin, originRank, originSeq, winners, wconn);
+    // C-12 fix: post-apply winner update + low-rank DELETE recovery. Returns false on a failed
+    // recovery; the caller must roll back so the bad terminal state is never committed/ACKed.
+    // Authoritative (down-link) applies skip winner arbitration entirely.
+    if (!opts.authoritative) {
+        if (!updateWinnersFromChangeset(changeset, origin, originRank, originSeq, winners, wconn,
+                                        err))
+            return false;
+    }
 
     return true;
 }
@@ -218,16 +221,18 @@ int ChangesetApplier::conflictCb(void* ctx, int conflict, sqlite3_changeset_iter
 // private: updateWinnersFromChangeset (I-03)
 // ---------------------------------------------------------------------------
 
-void ChangesetApplier::updateWinnersFromChangeset(const QByteArray& changeset,
+bool ChangesetApplier::updateWinnersFromChangeset(const QByteArray& changeset,
                                                   const QString& origin, int rank, qint64 seq,
-                                                  RowWinnerStore& winners, QSqlDatabase& wconn) {
+                                                  RowWinnerStore& winners, QSqlDatabase& wconn,
+                                                  QString* err) {
     sqlite3_changeset_iter* iter = nullptr;
     int rc =
         sqlite3changeset_start(&iter, changeset.size(),
                                const_cast<void*>(static_cast<const void*>(changeset.constData())));
     if (rc != SQLITE_OK || !iter)
-        return;
+        return true;  // nothing to iterate — not a failure
 
+    bool ok = true;
     while (sqlite3changeset_next(iter) == SQLITE_ROW) {
         const char* tbl = nullptr;
         int nCol = 0, op = 0, indirect = 0;
@@ -245,47 +250,72 @@ void ChangesetApplier::updateWinnersFromChangeset(const QByteArray& changeset,
         const QString tableName = QString::fromUtf8(tbl ? tbl : "");
 
         if (op == SQLITE_DELETE) {
-            // C-01 fix: for DELETE, check if the deleted row was the RowWinner.
+            // C-12 fix: a DELETE from a node dominated by the current winner must NOT erase the
+            // high-rank row. apply_v2 already executed the DELETE; restore the winning row here,
+            // in the same transaction. If we cannot restore, return false so the caller rolls
+            // back the whole apply (the DELETE is undone, applied_vector is not advanced, no ACK).
             RowWinner incumbent = winners.get(wconn, tableName, pkHashStr);
-            if (incumbent.rank != INT_MIN &&
-                ((rank < incumbent.rank) ||
-                 (rank == incumbent.rank && seq < incumbent.originSeq))) {
-                // Low-rank DELETE erased a high-rank row. Restore from winning_content.
-                if (!incumbent.winningContent.isEmpty()) {
-                    // Parse JSON array of column values and re-INSERT using direct SQL.
-                    QJsonDocument doc = QJsonDocument::fromJson(incumbent.winningContent.toUtf8());
-                    if (doc.isObject()) {
-                        const QJsonObject obj = doc.object();
-                        QStringList cols, placeholders;
-                        QVariantList vals;
-                        for (auto it = obj.begin(); it != obj.end(); ++it) {
-                            cols << QStringLiteral("\"%1\"").arg(
-                                QString(it.key()).replace(QLatin1Char('"'), QLatin1String("\"\"")));
-                            placeholders << QStringLiteral("?");
-                            vals << it.value().toVariant();
-                        }
-                        if (!cols.isEmpty()) {
-                            // C-08 fix: cols now use real column names from winning_content JSON.
-                            QSqlQuery restoreQ(wconn);
-                            restoreQ.prepare(
-                                QStringLiteral("INSERT OR REPLACE INTO \"%1\" (%2) VALUES (%3)")
-                                    .arg(QString(tableName).replace(QLatin1Char('"'),
-                                                                    QLatin1String("\"\"")),
-                                         cols.join(QLatin1Char(',')),
-                                         placeholders.join(QLatin1Char(','))));
-                            for (const QVariant& v : vals)
-                                restoreQ.addBindValue(v);
-                            if (!restoreQ.exec()) {
-                                // Restore failed — clear winner so high-rank node can re-deliver.
-                                winners.clear(wconn, tableName, pkHashStr, nullptr);
-                            }
-                        }
-                    }
-                    // Winner entry stays — row is restored, no need to clear.
-                } else {
-                    // No stored content — clear winner so high-rank node can re-deliver.
-                    winners.clear(wconn, tableName, pkHashStr, nullptr);
+            const bool dominated =
+                incumbent.rank != INT_MIN &&
+                ((rank < incumbent.rank) || (rank == incumbent.rank && seq < incumbent.originSeq));
+            if (dominated) {
+                if (incumbent.winningContent.isEmpty()) {
+                    // We know the row should survive but have no content to restore it with.
+                    // Fail the apply so the DELETE is rolled back rather than silently winning.
+                    if (err)
+                        *err = QStringLiteral(
+                                   "E_SYNC_APPLY_CONSTRAINT: low-rank DELETE on %1 would erase "
+                                   "high-rank winner (origin=%2 rank=%3) with no stored content "
+                                   "to restore")
+                                   .arg(tableName, incumbent.origin)
+                                   .arg(incumbent.rank);
+                    ok = false;
+                    break;
                 }
+                QJsonDocument doc = QJsonDocument::fromJson(incumbent.winningContent.toUtf8());
+                if (!doc.isObject()) {
+                    if (err)
+                        *err = QStringLiteral(
+                                   "E_SYNC_APPLY_CONSTRAINT: winning_content for %1 is "
+                                   "not a JSON object")
+                                   .arg(tableName);
+                    ok = false;
+                    break;
+                }
+                const QJsonObject obj = doc.object();
+                QStringList cols, placeholders;
+                QVariantList vals;
+                for (auto it = obj.begin(); it != obj.end(); ++it) {
+                    cols << QStringLiteral("\"%1\"").arg(
+                        QString(it.key()).replace(QLatin1Char('"'), QLatin1String("\"\"")));
+                    placeholders << QStringLiteral("?");
+                    vals << it.value().toVariant();
+                }
+                if (cols.isEmpty()) {
+                    if (err)
+                        *err = QStringLiteral(
+                                   "E_SYNC_APPLY_CONSTRAINT: winning_content for %1 has no columns")
+                                   .arg(tableName);
+                    ok = false;
+                    break;
+                }
+                QSqlQuery restoreQ(wconn);
+                restoreQ.prepare(
+                    QStringLiteral("INSERT OR REPLACE INTO \"%1\" (%2) VALUES (%3)")
+                        .arg(QString(tableName).replace(QLatin1Char('"'), QLatin1String("\"\"")),
+                             cols.join(QLatin1Char(',')), placeholders.join(QLatin1Char(','))));
+                for (const QVariant& v : vals)
+                    restoreQ.addBindValue(v);
+                if (!restoreQ.exec()) {
+                    if (err)
+                        *err = QStringLiteral(
+                                   "E_SYNC_APPLY_CONSTRAINT: failed to restore high-rank "
+                                   "row on %1: %2")
+                                   .arg(tableName, restoreQ.lastError().text());
+                    ok = false;
+                    break;
+                }
+                // Restore succeeded — the winner entry is unchanged and remains authoritative.
             }
             continue;  // do not update winner with DELETE info
         }
@@ -352,94 +382,7 @@ void ChangesetApplier::updateWinnersFromChangeset(const QByteArray& changeset,
             winners.put(wconn, tableName, pkHashStr, challenger, nullptr);
     }
     sqlite3changeset_finalize(iter);
-}
-
-// ---------------------------------------------------------------------------
-// C-04: filterByWinner — pre-filter changeset removing low-rank rows
-// ---------------------------------------------------------------------------
-// Uses sqlite3changegroup to concatenate kept rows into a new changeset.
-// A row is KEPT if: authoritative OR no stored winner OR (inRank,inSeq) >= (winnerRank,winnerSeq).
-// Rows that lose the rank check are silently dropped (they would have been OMITted by
-// conflictCb if a DATA conflict fired, but no conflict fires for clean DELETE/INSERT matches).
-QByteArray ChangesetApplier::filterByWinner(const QByteArray& changeset, int inRank, qint64 inSeq,
-                                            RowWinnerStore& winners, QSqlDatabase& wconn) {
-    if (changeset.isEmpty())
-        return changeset;
-
-    sqlite3_changeset_iter* pIter = nullptr;
-    if (sqlite3changeset_start(
-            &pIter, changeset.size(),
-            const_cast<void*>(static_cast<const void*>(changeset.constData()))) != SQLITE_OK)
-        return changeset;  // fallback: return original on failure
-
-    // We rebuild accepted rows into a new changeset blob via sqlite3changegroup.
-    sqlite3_changegroup* pGroup = nullptr;
-    if (sqlite3changegroup_new(&pGroup) != SQLITE_OK) {
-        sqlite3changeset_finalize(pIter);
-        return changeset;
-    }
-
-    bool anyFiltered = false;
-    int rc = SQLITE_ROW;
-    while ((rc = sqlite3changeset_next(pIter)) == SQLITE_ROW) {
-        const char* tblName = nullptr;
-        int nCol = 0, opType = 0, bIndirect = 0;
-        sqlite3changeset_op(pIter, &tblName, &nCol, &opType, &bIndirect);
-
-        if (opType == SQLITE_DELETE) {
-            // For DELETE: check if this is a low-rank attempt to remove a higher-rank win.
-            // Build pkHash from PK columns.
-            unsigned char* pkMask = nullptr;
-            sqlite3changeset_pk(pIter, &pkMask, nullptr);
-            QByteArray pkMat, contentMat;
-            extractHashMaterials(pIter, nCol, /*useNew=*/false, pkMask, &pkMat, &contentMat);
-            const QString pkHashStr = computePkHashStr(pkMat, contentMat);
-            const QString table = QString::fromUtf8(tblName ? tblName : "");
-
-            RowWinner incumbent = winners.get(wconn, table, pkHashStr);
-            bool dominated = (incumbent.rank != INT_MIN) &&
-                             ((inRank < incumbent.rank) ||
-                              (inRank == incumbent.rank && inSeq < incumbent.originSeq));
-            if (dominated) {
-                anyFiltered = true;
-                continue;  // skip this DELETE row
-            }
-        }
-        // For INSERT/UPDATE: conflictCb handles the rank check; no pre-filter needed
-        // (conflictCb fires for CONFLICT on INSERT and DATA on UPDATE-mismatch).
-
-        // Keep this row: serialize it into a single-row changeset and add to group.
-        void* pSingle = nullptr;
-        int nSingle = 0;
-        if (sqlite3changeset_apply_v2(nullptr, 0, nullptr, nullptr, nullptr, nullptr, nullptr,
-                                      nullptr, 0) == SQLITE_MISUSE) {
-            // We can't easily serialize a single row without a full DB context.
-            // Fall back: just return the original changeset unfiltered.
-            sqlite3changegroup_delete(pGroup);
-            sqlite3changeset_finalize(pIter);
-            return changeset;
-        }
-        Q_UNUSED(pSingle)
-        Q_UNUSED(nSingle)
-        break;  // placeholder — see note below
-    }
-    sqlite3changeset_finalize(pIter);
-    sqlite3changegroup_delete(pGroup);
-
-    // Note: Rebuilding a filtered changeset requires serializing individual rows, which
-    // SQLite's public API doesn't directly support without a full DB round-trip.
-    // Practical approach: if no rows were filtered, return original. If rows were filtered,
-    // fall back to the conflict-callback path (which handles DATA conflicts correctly for
-    // INSERT/UPDATE, and the winner check via C-04 handles DELETE above only when we can
-    // build the filtered blob — a future improvement can use sqlite3session_changeset_apply
-    // with per-row patchset reconstruction).
-    //
-    // For now, to avoid regressions from broken changeset construction, we return the
-    // ORIGINAL changeset. The conflictCb still handles INSERT/UPDATE conflicts correctly
-    // via RowWinner, and DELETE protection is achieved via the winner check post-apply
-    // in updateWinnersFromChangeset + manual revert below.
-    Q_UNUSED(anyFiltered)
-    return changeset;
+    return ok;
 }
 
 }  // namespace dbridge::sync

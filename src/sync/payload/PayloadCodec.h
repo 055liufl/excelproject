@@ -17,6 +17,9 @@ class PayloadCodec {
     // Encode a selection-push payload.
     QByteArray encodeSelectionPush(const PayloadHeader& h, const SelectionPushBody& body);
 
+    QByteArray encodeBaselineRequest(const PayloadHeader& h, const BaselineRequestPayload& body);
+    QByteArray encodeBaselineResponse(const PayloadHeader& h, const BaselineResponsePayload& body);
+
     // Decode any payload artifact.  Returns false + *err on failure.
     bool decode(const QByteArray& data, DecodeResult* out, QString* err);
 
@@ -30,7 +33,14 @@ class PayloadCodec {
     static constexpr quint32 kMagic = 0x44425359u;  // "DBSY"
     static constexpr quint16 kVersion = 1;
 
-    enum KindByte : quint8 { KChangeset = 0, KSelectionPush = 1, KChangesetAck = 2, KChunkAck = 3 };
+    enum KindByte : quint8 {
+        KChangeset = 0,
+        KSelectionPush = 1,
+        KChangesetAck = 2,
+        KChunkAck = 3,
+        KBaselineRequest = 4,
+        KBaselineResponse = 5
+    };
 
     void writeHeader(QDataStream& ds, const PayloadHeader& h);
     bool readHeader(QDataStream& ds, PayloadHeader* h, QString* err);

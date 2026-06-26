@@ -77,29 +77,31 @@ bool OutboxWriter::writeAtomic(const QString& finalName, const QByteArray& data,
         return false;
     }
 
-    // 4. Write .ready marker (empty file signals receiver), with flush + fsync.
+    // M-08 fix: once the main payload has been renamed into place, any failure of the .ready
+    // marker or directory fsync must clean up BOTH the final payload and the .ready file.
+    // Otherwise an orphan payload (visible without its .ready sentinel) is left behind and a
+    // same-name retry could fail or be mis-scanned by the third-party mover.
     const QString readyPath = finalPath + QStringLiteral(".ready");
+    auto cleanupAndFail = [&](const QString& msg) -> bool {
+        if (err)
+            *err = msg;
+        QFile::remove(readyPath);
+        QFile::remove(finalPath);
+        return false;
+    };
+
+    // 4. Write .ready marker (empty file signals receiver), with flush + fsync.
     {
         QFile rf(readyPath);
-        if (!rf.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-            if (err)
-                *err = QStringLiteral("cannot write .ready: %1").arg(rf.errorString());
-            return false;
-        }
+        if (!rf.open(QIODevice::WriteOnly | QIODevice::Truncate))
+            return cleanupAndFail(QStringLiteral("cannot write .ready: %1").arg(rf.errorString()));
         // I-11 fix: flush + fsync the .ready marker so it is durable before return.
-        if (!rf.flush()) {
-            if (err)
-                *err = QStringLiteral("flush .ready failed: %1").arg(rf.errorString());
-            rf.remove();
-            return false;
-        }
+        if (!rf.flush())
+            return cleanupAndFail(QStringLiteral("flush .ready failed: %1").arg(rf.errorString()));
         int rfd = static_cast<int>(rf.handle());
         if (rfd >= 0 && ::fsync(rfd) != 0) {
-            if (err)
-                *err = QStringLiteral("fsync .ready failed (errno=%1)").arg(errno);
             rf.close();
-            rf.remove();
-            return false;
+            return cleanupAndFail(QStringLiteral("fsync .ready failed (errno=%1)").arg(errno));
         }
         rf.close();
     }
@@ -112,20 +114,16 @@ bool OutboxWriter::writeAtomic(const QString& finalName, const QByteArray& data,
         int dirFd = ::open(dirPath.constData(), O_RDONLY);
         if (dirFd < 0) {
             // M-06 fix: directory open failure means we cannot fsync — treat as transport error.
-            if (err)
-                *err = QStringLiteral("cannot open dir for fsync: %1 (errno=%2)")
-                           .arg(d.absolutePath())
-                           .arg(errno);
-            return false;
+            return cleanupAndFail(QStringLiteral("cannot open dir for fsync: %1 (errno=%2)")
+                                      .arg(d.absolutePath())
+                                      .arg(errno));
         }
         const int rc = ::fsync(dirFd);
         ::close(dirFd);
         if (rc != 0) {
-            if (err)
-                *err = QStringLiteral("dir fsync failed for %1 (errno=%2)")
-                           .arg(d.absolutePath())
-                           .arg(errno);
-            return false;
+            return cleanupAndFail(QStringLiteral("dir fsync failed for %1 (errno=%2)")
+                                      .arg(d.absolutePath())
+                                      .arg(errno));
         }
     }
 

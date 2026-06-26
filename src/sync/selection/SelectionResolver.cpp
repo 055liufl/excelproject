@@ -5,13 +5,17 @@
 #include <QSqlQuery>
 #include <QSqlRecord>
 
+#include "sql/SqlBuilder.h"
+
 namespace dbridge::sync {
 
 // Returns the pk column name for a table via PRAGMA table_info.
 // Returns empty string on failure.
 static QString pkColumnForTable(const QString& table, QSqlDatabase& rconn) {
     QSqlQuery q(rconn);
-    q.prepare(QStringLiteral("PRAGMA table_info(\"%1\")").arg(table));
+    // M-11 fix: quote identifier (escapes embedded double-quotes) instead of raw "%1".
+    q.prepare(QStringLiteral("PRAGMA table_info(") + detail::SqlBuilder::quoteIdent(table) +
+              QLatin1Char(')'));
     if (!q.exec())
         return {};
     while (q.next()) {
@@ -51,7 +55,10 @@ bool SelectionResolver::resolveRecord(QSqlDatabase& rconn, const QString& table,
     }
 
     QSqlQuery q(rconn);
-    q.prepare(QStringLiteral("SELECT * FROM \"%1\" WHERE \"%2\" = ? LIMIT 1").arg(table, pkCol));
+    // M-11 fix: quote table and column identifiers.
+    q.prepare(QStringLiteral("SELECT * FROM ") + detail::SqlBuilder::quoteIdent(table) +
+              QStringLiteral(" WHERE ") + detail::SqlBuilder::quoteIdent(pkCol) +
+              QStringLiteral(" = ? LIMIT 1"));
     q.addBindValue(pk);
 
     if (!q.exec()) {

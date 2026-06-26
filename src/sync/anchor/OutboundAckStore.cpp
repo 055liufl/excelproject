@@ -114,6 +114,12 @@ qint64 OutboundAckStore::minUnackedLocalSeq(QSqlDatabase& db, const QString& pee
     // (i.e. nothing has been confirmed yet) rather than being silently excluded.
     // With an inner JOIN, an origin that never appeared in outbound_ack would be missed
     // entirely, causing broadcastToPeer to skip its changelog entries.
+    // M-02 fix: do NOT filter by cl.stream_epoch so that cross-epoch un-ACKed entries are
+    // included in the lower-bound calculation.  The LEFT JOIN already matches on
+    // (peer, origin, stream_epoch) as a three-part key, so each changelog row is correctly
+    // paired with its own epoch's ACK row (or treated as unacked when absent).
+    // epoch parameter is kept for API compatibility but no longer used in the WHERE clause.
+    Q_UNUSED(epoch)
     QSqlQuery q(db);
     q.prepare(
         QStringLiteral("SELECT COALESCE(MIN(cl.local_seq), -1) - 1 "
@@ -123,10 +129,8 @@ qint64 OutboundAckStore::minUnackedLocalSeq(QSqlDatabase& db, const QString& pee
                        "  AND oa.stream_epoch = cl.stream_epoch "
                        "  AND oa.peer = ? "
                        "  AND oa.origin != '__broadcast__' "
-                       "WHERE cl.stream_epoch = ? "
-                       "  AND cl.origin_seq > COALESCE(oa.acked_seq, -1)"));
+                       "WHERE cl.origin_seq > COALESCE(oa.acked_seq, -1)"));
     q.addBindValue(peer);
-    q.addBindValue(epoch);
     if (!q.exec() || !q.next())
         return -1;
     if (q.value(0).isNull())

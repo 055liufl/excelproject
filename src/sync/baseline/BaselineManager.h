@@ -31,8 +31,12 @@ class BaselineManager {
     };
 
     // Export all rows from syncTables into a BaselineArtifact.
+    // M-01 fix: localOrigin/localEpoch/localOriginSeq are the caller's own identity so that
+    // the self origin cut (absent from __sync_applied_vector on the exporting node) is merged
+    // into the artifact's originCuts, preventing the receiver from resetting it to 0.
     bool exportBaseline(QSqlDatabase& rconn, const QStringList& tables, BaselineArtifact* out,
-                        QString* err);
+                        QString* err, const QString& localOrigin = QString(), qint64 localEpoch = 0,
+                        qint64 localOriginSeq = 0);
 
     // Apply a baseline: import rows into wconn, then reset tracking stores.
     // H-05 fix: schemaFp is written into table_state so DiffEngine can compare fingerprints

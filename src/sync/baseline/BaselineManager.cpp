@@ -210,7 +210,9 @@ bool BaselineManager::deserializeAndApply(QSqlDatabase& wconn, const QByteArray&
 // exportBaseline
 // ---------------------------------------------------------------------------
 bool BaselineManager::exportBaseline(QSqlDatabase& rconn, const QStringList& tables,
-                                     BaselineArtifact* out, QString* err) {
+                                     BaselineArtifact* out, QString* err,
+                                     const QString& localOrigin, qint64 localEpoch,
+                                     qint64 localOriginSeq) {
     qint64 maxSeq = 0;
     QByteArray data;
     if (!serializeTables(rconn, tables, &data, &maxSeq, err)) {
@@ -224,6 +226,29 @@ bool BaselineManager::exportBaseline(QSqlDatabase& rconn, const QStringList& tab
     // C-03 fix: capture per-origin applied_vector snapshot so applyBaseline can call
     // av.resetTo(origin, epoch, seq, generation) with the correct epoch per origin.
     out->originCuts = queryOriginCuts(rconn);
+
+    // M-01 fix: the exporting node's own writes never advance its own __sync_applied_vector,
+    // so the (localOrigin, localEpoch) cut is absent from queryOriginCuts().  Merge it in
+    // by taking the max, so the receiver does not reset the exporter's seq to 0.
+    if (!localOrigin.isEmpty() && localEpoch > 0) {
+        bool found = false;
+        for (BaselineOriginCut& cut : out->originCuts) {
+            if (cut.origin == localOrigin && cut.streamEpoch == localEpoch) {
+                if (localOriginSeq > cut.appliedSeq)
+                    cut.appliedSeq = localOriginSeq;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            BaselineOriginCut selfCut;
+            selfCut.origin = localOrigin;
+            selfCut.streamEpoch = localEpoch;
+            selfCut.appliedSeq = localOriginSeq;
+            out->originCuts.append(selfCut);
+        }
+    }
+
     return true;
 }
 

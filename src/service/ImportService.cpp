@@ -584,6 +584,13 @@ ImportResult ImportService::run(const ProfileSpec& profile, const SchemaCatalog&
         ForeignKeyPreflight fkPreflight;
         fkPreflight.check(contexts, topoRoutes.value(QString()), db, sheetName, &errors);
     } else {
+        // H-01 fix: build an excelRow→index map before iterating by class, so failed
+        // failedRouteIndices written into the per-class copy can be merged back into the
+        // original contexts vector (the write phase only sees contexts, not clsContexts).
+        QHash<int, int> excelRowToIdx;
+        for (int i = 0; i < contexts.size(); ++i)
+            excelRowToIdx[contexts[i].excelRow] = i;
+
         for (const auto& cls : profile.classes) {
             QVector<RowContext> clsContexts;
             for (const auto& ctx : contexts) {
@@ -592,6 +599,15 @@ ImportResult ImportService::run(const ProfileSpec& profile, const SchemaCatalog&
             }
             ForeignKeyPreflight fkPreflight;
             fkPreflight.check(clsContexts, topoRoutes.value(cls.id), db, sheetName, &errors);
+
+            // Merge failedRouteIndices from the temporary copy back into original contexts.
+            for (const auto& clsCtx : clsContexts) {
+                if (!clsCtx.failedRouteIndices.isEmpty()) {
+                    auto it = excelRowToIdx.find(clsCtx.excelRow);
+                    if (it != excelRowToIdx.end())
+                        contexts[it.value()].failedRouteIndices |= clsCtx.failedRouteIndices;
+                }
+            }
         }
     }
 

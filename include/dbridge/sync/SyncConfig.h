@@ -384,6 +384,34 @@ class DBRIDGE_EXPORT SyncConfig::Builder {
                 *err = QStringLiteral("schemaVersion must be >= 1");
             return {};
         }
+        // M-03 fix: validate each lag threshold is positive before checking soft <= hard.
+        // Non-positive values would be silently treated as disabled/zero and cause incorrect
+        // peer eviction or lag logic.
+        if (cfg_.peerLagSoftSeq_ <= 0) {
+            if (err)
+                *err = QStringLiteral("peerLagSoftSeq must be > 0");
+            return {};
+        }
+        if (cfg_.peerLagHardSeq_ <= 0) {
+            if (err)
+                *err = QStringLiteral("peerLagHardSeq must be > 0");
+            return {};
+        }
+        if (cfg_.peerLagSoftBytes_ <= 0) {
+            if (err)
+                *err = QStringLiteral("peerLagSoftBytes must be > 0");
+            return {};
+        }
+        if (cfg_.peerLagHardBytes_ <= 0) {
+            if (err)
+                *err = QStringLiteral("peerLagHardBytes must be > 0");
+            return {};
+        }
+        if (cfg_.peerLagHardMs_ <= 0) {
+            if (err)
+                *err = QStringLiteral("peerLagHardMs must be > 0");
+            return {};
+        }
         // M-01 fix: validate soft <= hard threshold relationships and positive-only fields.
         if (cfg_.peerLagSoftSeq_ > cfg_.peerLagHardSeq_) {
             if (err)

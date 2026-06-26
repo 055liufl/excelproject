@@ -756,15 +756,16 @@ bool SyncWorker::processSelectionPushArtifact(const DecodeResult& dec, const QSt
 
     WriteParams p;
     p.kind = WriteKind::InboundSelectionPush;
-    // C-04 fix: preserve the remote sender's origin so the downstream broadcast can attribute
-    // the change to its true source.  A fresh local origin_seq is still allocated to avoid
-    // UNIQUE(origin, stream_epoch, origin_seq) collisions with the sender's own seq space.
-    p.origin = hdr.origin;
+    // H-02 fix (option A): use the center node's own origin/epoch/seq so the changelog key
+    // (origin, stream_epoch, origin_seq) is fully controlled by the center.  Using hdr.origin
+    // with center's epoch/seq mixed the remote origin key-space with the local counter, causing
+    // RowWinnerStore to mis-sort by seq.  Center rank is used consistently.
+    p.origin = config_.nodeId();
     p.epoch = streamEpoch_;
     p.seq = nextLocalOriginSeq();
     p.schemaVer = hdr.schemaVer;
     p.schemaFp = hdr.schemaFingerprint;
-    p.originRank = config_.originRank(hdr.origin);
+    p.originRank = config_.originRank(config_.nodeId());
     p.pushId = pushId;
     p.chunkSeq = chunkSeq;
     p.checksum = checksum;
@@ -813,7 +814,8 @@ bool SyncWorker::processBaselineRequestArtifact(const DecodeResult& dec,
     BaselineManager bm;
     BaselineManager::BaselineArtifact art;
     QString exportErr;
-    if (!bm.exportBaseline(*wconnPtr_, tables, &art, &exportErr)) {
+    if (!bm.exportBaseline(*wconnPtr_, tables, &art, &exportErr, config_.nodeId(), streamEpoch_,
+                           localOriginSeq_)) {
         emit errorOccurred({err::E_SYNC_BASELINE_FAILED, Severity::Error,
                             QStringLiteral("baseline_request"), dec.header.origin, exportErr});
         return false;
@@ -1675,12 +1677,16 @@ void SyncWorker::enqueueSelectionPush(const SyncSelection& selection,
         QString resolveErr;
         if (!resolver.resolvePk(rconn, selection, &resolved, &resolveErr)) {
             cleanupRconn();
+            // M-05 fix: cancel any pending ACK wait so the foreground caller is not left hanging.
+            cancelAckWait();
             emit errorOccurred({err::E_SYNC_SELECTION_EMPTY, Severity::Error,
                                 QStringLiteral("syncSelected"), QString(), resolveErr});
             return;
         }
         if (resolved.isEmpty()) {
             cleanupRconn();
+            // M-05 fix: cancel any pending ACK wait.
+            cancelAckWait();
             emit errorOccurred({err::E_SYNC_SELECTION_EMPTY, Severity::Error,
                                 QStringLiteral("syncSelected"), QString(),
                                 QStringLiteral("Selection resolved to zero rows")});
@@ -1696,6 +1702,8 @@ void SyncWorker::enqueueSelectionPush(const SyncSelection& selection,
         if (!builder.build(rconn, resolved, catalog, cache, config_.maxSelectionSize(), &manifest,
                            &buildErr, selection.includeFkDeps(), selection.pruneConsistent())) {
             cleanupRconn();
+            // M-05 fix: cancel any pending ACK wait.
+            cancelAckWait();
             const char* code =
                 buildErr.contains(QLatin1String("cycle"))   ? err::E_SYNC_FK_CYCLE_UNSUPPORTED
                 : buildErr.contains(QLatin1String("large")) ? err::E_SYNC_SELECTION_TOO_LARGE
@@ -1712,6 +1720,8 @@ void SyncWorker::enqueueSelectionPush(const SyncSelection& selection,
         QString streamErr;
         if (!streamer.stream(manifest, config_.nodeId(), QString(), config_.pushChunkBudgetBytes(),
                              *codec_, &chunks, &streamErr)) {
+            // M-05 fix: cancel any pending ACK wait so the foreground caller is not left hanging.
+            cancelAckWait();
             emit errorOccurred({err::E_SYNC_SELECTION_TOO_LARGE, Severity::Error,
                                 QStringLiteral("syncSelected"), QString(), streamErr});
             return;

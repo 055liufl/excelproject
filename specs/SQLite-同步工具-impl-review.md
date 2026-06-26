@@ -1,153 +1,128 @@
-# SQLite 同步工具实现评审报告（第十五轮）
+# SQLite 同步工具实现评审报告（第十六轮）
 
 评审日期：2026-06-26
 
 ## 总体评分
 
-总分：72 / 100
+总分：76 / 100
 
 | 维度 | 分数 | 结论 |
 | --- | ---: | --- |
-| 功能合规性 | 77 | Excel 主路径和多数 OpenSpec 扩展已补齐；同步 foreground ACK、baseline、selection push 仍有协议偏差 |
-| 同步协议正确性 | 58 | ACK 窗口、重发锚点、epoch 保真、forward ACK 路由仍会破坏多 peer/多 origin 收敛 |
-| Excel 导入/导出合规性 | 84 | `columnOrder`、反向 lookup、时间格式基本可用；批量导出和 route-local 失败粒度仍有遗漏 |
-| 安全性 | 86 | SQL 绑定和内部表过滤较上一轮明显改善；配置完整性和同步表 eligibility 仍偏 MVP |
-| 边界处理 | 68 | quarantine、FK closure、fingerprint 开关已修；大批量广播、baseline epoch、多片 push 完成边界仍不稳 |
+| 功能合规性 | 82 | 第十五轮多数显式修复已落地；baseline、route-local 失败粒度、反向 lookup error 语义仍有偏差 |
+| 同步协议正确性 | 63 | ACK 窗口修复明显改善，但转发流仍混用本地 epoch，baseline cut 不完整，quarantine 持久化失效 |
+| Excel 导入/导出合规性 | 84 | columnOrder、批量导出校验、时间格式基本符合；FK preflight 与 reverse lookup 的错误粒度仍不完全符合规格 |
+| 安全性 | 87 | SQL 标识符引用、绑定与内部表过滤总体可接受；未发现新的注入类 Critical |
+| 边界处理 | 71 | ACK deadline、push done、缺口 pending 有改善；schema mismatch、baseline、长 push 屏障仍有高风险边界缺陷 |
 
-本轮核查了 9 个主规格文档、`openspec/changes/archive/` 下 27 个归档文件，以及 `src/` 下全部 122 个 `.cpp/.h` 文件；同步公共头文件中与实现直接绑定的 `include/dbridge/sync/*.h` 也纳入核对。
+本轮对指定规格文档、`openspec/specs/`、`openspec/changes/archive/` 与 `src/` 下同步、导入导出、profile、batch 关键实现进行了静态审查；未执行编译或自动化测试。
 
 ## 上一轮修复验证
 
-### 修复验证结果
-
 | 编号 | 状态 | 验证结论 |
 | --- | --- | --- |
-| C-01 | 有偏差 | `pendingAckWindow_` 已存在，`processAckArtifact()` 会遍历窗口；但窗口在广播后用 `localOriginSeq_` 反推，只覆盖本地 origin，不能表达本轮实际发出的每个 `(peer, origin, epoch, seq)` |
-| C-02 | 有偏差 | 广播不再直接用 `last_sent_seq` 作为下界，但 `minUnackedLocalSeq()` 仍用单个 `local_seq` 下界和 ACK 表 JOIN，可能跳过没有 ACK 行的未确认 origin |
-| C-03 | 有偏差 | `originMaxSeq` 和 `resetTo()` 已实现；但 baseline 只携带 `origin -> max_seq`，没有 `stream_epoch`，且来源是 changelog 最大值，不是完整 applied vector |
-| C-04 | 有偏差 | selection push 入站 `origin` 保留远端 origin；但 changelog 没有 push_id 元数据，广播过滤按 origin 粗粒度执行，且中心侧 push_progress 不会在全片应用后置为 done |
-| H-01 | 通过 | `drainReady()` 按 `id ASC` 返回，删除已解耦到 `markReplayed()` |
-| H-02 | 通过 | `FkClosureBuilder::build()` 接收并使用 `includeFkDeps/pruneConsistent`，调用方已传入 `SyncSelection` flags |
-| H-03 | 基本通过 | `DataBridge::exportExcel()` 已调用 `validateForExport()`；但 `BatchTransfer::runExport()` 仍绕过该校验，见 H-04 |
-| H-04 | 未生效 | `failedRouteIndices` 已收集；写入阶段仍把任意 row-level error 归入 `failedExcelRows`，整行跳过 |
-| M-01 | 有偏差 | `SyncConfig::Builder` 增加了部分正数/自 peer 校验，但仍缺重复 peer、center/role、软硬阈值关系等完整性校验 |
-| M-02 | 通过 | `SchemaGuard` 构造时使用 `verifySchemaFingerprint()`，关闭时跳过 fingerprint 比较 |
-| M-03 | 通过 | 新错误码已在 `Errors.h` 中落地，主要触发点有接入 |
-| M-04 | 通过 | `ChangesetApplier::filterCb()` 先拒绝 `__sync_*`，再处理 allow-list |
-| M-05 | 通过 | Mixed export-only profile 不再强制 discriminator |
-| M-06 | 基本通过 | baseline apply 后会触发 `drainQuarantine()`；运行期 schema 热升级没有独立 API，本轮不再作为阻断项 |
+| C-01 | 通过 | `enqueueDrain()` 直接调用 `broadcastTopeer(..., &broadcastedEntries)`，并按实际写出的 `(peer, origin, epoch, originSeq)` 构造 `pendingAckWindow_`。 |
+| C-02 | 有偏差 | `minUnackedLocalSeq()` 已改为 LEFT JOIN + COALESCE，覆盖无 ACK 行 origin；但广播仍以本地 `streamEpoch_` 查询/更新部分转发 ACK 锚点，见 Critical C-02。 |
+| C-03 | 有偏差 | baseline payload 已有 `BaselineOriginCut{origin, streamEpoch, appliedSeq}` 且来自 `__sync_applied_vector`；但未补充 baseline 源节点自己的本地 origin cut，见 Critical C-01。 |
+| C-04 | 有偏差 | `EntryFull` 返回 `streamEpoch`，payload header 使用 entry epoch；但路由 ACK 查询仍用本地 epoch，且 entry 未返回 `push_id`，见 Critical C-02 / High H-01。 |
+| C-05 | 通过 | `PayloadHeader.senderPeer` 已写入，接收方 changeset ACK 使用物理发送者。 |
+| H-01 | 通过 | `CapturedWriteTemplate` 在 chunk applied 后统计 total/applied，达到总数时将 `__sync_push_progress.status` 置为 `done`。 |
+| H-02 | 有偏差 | 写入阶段对 `lookup/fkInject` 已按 route 过滤；但 FK preflight 失败仍只记录 row error，未合并进 route 失败集合，见 High H-02。 |
+| H-03 | 通过 | `BatchTransfer::runExport()` 调用 `ProfileValidator::validateForExport()`，批量导出不再绕过 export-mode 校验。 |
+| H-04 | 有偏差 | `resolveAHeaders()` 已返回失败 A-header 集合并清空对应列；但当前 OpenSpec 的 `exportOnMissing:"error"` 要求受影响行不写出，见 High H-03。 |
+| M-01 | 有偏差 | `SyncConfig::Builder` 增加了重复 peer、空 peer、Edge center、部分正数校验；仍缺软硬阈值关系和部分字段正数校验，见 Medium M-01。 |
+| M-02 | 通过 | `SchemaEligibility` 的 composite PK 拒绝消息已明确为 MVP 限制。规格能力偏差另列 Medium M-02。 |
+| M-03 | 通过 | `AckChannel::nextDeadlineMs()` 已纳入 worker wait interval，ACK flush 不再依赖 broadcast tick。 |
+| M-04 | 有偏差 | `__sync_changelog.push_id` 列已增加，但广播屏障仍按 `origin` 粗过滤，未按 entry 的 `push_id` 精确过滤，见 High H-01。 |
 
 ## Critical 问题（必须修复）
 
-### C-01：Foreground ACK 窗口不是“本轮实际发出载荷”的窗口，会误完成、误超时或卡住前台 gate
+### C-01：baseline 未携带源节点本地 origin cut，应用后会把源 origin 的 applied vector 重置为 0
 
-- 位置：`src/sync/SyncWorker.cpp:1497`、`src/sync/SyncWorker.cpp:1504`、`src/sync/SyncWorker.cpp:1517`、`src/sync/SyncWorker.cpp:1530`
-- 描述：`enqueueDrain()` 先 `scanInbox()`/`broadcast()`，之后才构造 `pendingAckWindow_`；窗口只记录 `origin=config_.nodeId()` 且目标为全局 `localOriginSeq_`。如果本轮只广播转发的远端 origin，`wrote=true` 但窗口为空，代码直接清 `ackWaiting_` 且不发 `Completed`，`SyncEngine` 会停在 `Exporting` 并持有 `ForegroundGate`。如果本地 changelog 超过 `broadcastThreshold`，窗口目标又可能大于本轮实际写出的最大 seq，导致必然 ACK timeout。
-- 规格依据：设计文档 §7.1 要求 `Exporting(percent=-1)` 直到足额 ACK；plan T1.12 要求前台 `Exporting=等ACK`，足额 ACK 才 `Completed`。
-- 修复方案：广播函数返回本轮实际写出的 `QList<PendingAckEntry>`，每个 entry 必须来自实际 artifact header 的 `(targetPeer, origin, stream_epoch, origin_seq)`；窗口应在写出 artifact 的同一逻辑中累积，而不是事后用 `localOriginSeq_`/`last_sent_seq` 推断。窗口为空但 `wrote=true` 应视为内部错误，不应静默清等待位。
+- 位置：`src/sync/baseline/BaselineManager.cpp:149`、`src/sync/baseline/BaselineManager.cpp:155`、`src/sync/baseline/BaselineManager.cpp:359`
+- 描述：`queryOriginCuts()` 只读取 `__sync_applied_vector`。本地写入不会推进本节点自己的 applied vector，因此 baseline 源节点的本地 `(origin=source, stream_epoch=sourceEpoch, applied_seq=localOriginSeq)` 通常不在 cuts 中。`applyBaseline()` 在 `primaryReset=false` 时把该 origin 重置到 `0`。baseline 数据已经包含源节点当前表切面，但接收端仍认为源节点 seq 只应用到 0；后续若旧 changelog 已压缩或只收到 seq N+1，会永久 gap / 反复 baseline；若旧 artifact 重放，也可能重复应用已包含在 baseline 中的变更。
+- 规格依据：设计文档 §5.10 要求 baseline 是权威切面，应用后重置 applied-vector/table_state/row_winner；plan T5.1 要求 baseline 后锚点与权威切面对齐。
+- 修复方案：baseline export 时在 `originCuts` 中补充源节点本地 cut。可从 `__sync_changelog WHERE origin=<local node> AND stream_epoch=<local epoch>` 取 `MAX(origin_seq)`，或由 worker 显式传入 `localOriginSeq_` 和 `streamEpoch_`。若 applied_vector 中已有同 tuple，取两者最大值。禁止用 `sourceMaxSeq` 的 `local_seq` 代替 `origin_seq`。
 
-### C-02：重发下界仍可能跳过没有 ACK 行的未确认 origin
+### C-02：转发 changeset 的 ACK 查询仍使用本地 epoch，远端 origin 会被无限重播
 
-- 位置：`src/sync/anchor/OutboundAckStore.cpp:112`、`src/sync/anchor/OutboundAckStore.cpp:119`、`src/sync/SyncWorker.cpp:1048`、`src/sync/capture/ChangelogStore.cpp:76`
-- 描述：`minUnackedLocalSeq()` 只 JOIN 已存在 `__sync_outbound_ack` 行的 origin。若某 origin 的 artifact 已写出但 ACK 丢失，因此还没有 ACK 行，而另一个已建 ACK 行的 origin 存在更大的未 ACK `local_seq`，单一 `afterLocalSeq` 会越过前者，`readRangeAll(local_seq > afterLocalSeq)` 永久不再读到该未确认 origin。
-- 规格依据：设计 §6.1/§7.4 与 plan T1.8 要求发送端锚点按 ACK 前移，未 ACK 数据必须可重发；`last_sent_seq` 不能作为排除条件。
-- 修复方案：不要用单个 local_seq 作为全局排除下界。可选方案：发送前为 `(peer, origin, epoch)` 建 ACK 行并以 `acked_seq=-1` 参与查询；或按 origin 分组读取 `origin_seq > acked_seq` 后合并排序；或维护 pending outbox 表直到 ACK。
+- 位置：`src/sync/SyncWorker.cpp:1079`、`src/sync/SyncWorker.cpp:1095`、`src/sync/SyncWorker.cpp:1176`、`src/sync/anchor/OutboundAckStore.cpp:119`
+- 描述：`broadcastTopeer()` 读取 entry 后，`ackedSeq(peer, entry.origin, streamEpoch_)` 用的是当前节点本地 epoch，而不是 `entry.streamEpoch`。中心转发 B-origin artifact 给 C 后，C 的 ACK 会按 `(peer=C, origin=B, epoch=B_epoch)` 更新；下一轮中心仍查 `(peer=C, origin=B, epoch=center_epoch)` 得到 -1，于是 `RoutingTable::shouldRoute()` 继续允许发送。`minUnackedLocalSeq()` 也按单个本地 epoch 过滤 changelog，无法正确作为多 epoch 转发流的重发下界。
+- 规格依据：设计文档 §6.1 中 `__sync_outbound_ack` 主键是 `(peer, origin, stream_epoch)`；§7.4 要求发送端锚点按收到的 typed ACK 前移，未 ACK 才重发。
+- 修复方案：所有 per-entry ACK 判断必须使用 `entry.streamEpoch`。`readRangeAll()` 应返回 `push_id/schemaVer/schemaFingerprint` 等元数据；重发下界不能只按本地 epoch 的 sentinel 行计算，建议按 changelog entry LEFT JOIN `__sync_outbound_ack(peer, origin, stream_epoch)` 后筛选 `origin_seq > acked_seq`，再按 `local_seq ASC LIMIT` 发送。
 
-### C-03：baseline applied vector 缺少 `stream_epoch`，且导出来源不是权威 applied vector
+### C-03：schema mismatch quarantine 存入空 payload，持久重放能力失效
 
-- 位置：`include/dbridge/sync/SyncTypes.h:121`、`src/sync/baseline/BaselineManager.cpp:90`、`src/sync/baseline/BaselineManager.cpp:95`、`src/sync/baseline/BaselineManager.cpp:281`
-- 描述：`BaselineResponsePayload::originMaxSeq` 是 `QHash<QString,qint64>`，只按 origin 分组。`queryOriginMaxSeq()` 从 `__sync_changelog GROUP BY origin` 取最大 `origin_seq`，忽略 `stream_epoch`，也忽略已经通过 baseline/compaction 推进但不在 changelog 中的 applied vector。`applyBaseline()` 又把所有 origin 重置到单个 `resp.streamEpoch` 下。
-- 规格依据：设计 §6.1 中 `__sync_applied_vector` 主键是 `(origin, stream_epoch)`，§5.10 要求 baseline 是权威切面，应用后重置 applied vector/table_state/row_winner。
-- 修复方案：baseline payload 应携带数组 `{origin, stream_epoch, applied_seq}`，来源以 `__sync_applied_vector` 为准，并补充切面时刻 changelog 中尚未反映到 vector 的本地 cut。apply 时逐 tuple 调用 `resetTo(origin, epoch, seq, generation)`。
-
-### C-04：转发 changeset 时改写了原始 `stream_epoch`
-
-- 位置：`src/sync/capture/ChangelogStore.h:38`、`src/sync/capture/ChangelogStore.cpp:76`、`src/sync/SyncWorker.cpp:1101`、`src/sync/SyncWorker.cpp:1104`
-- 描述：`__sync_changelog` 保存了 `stream_epoch`，但 `EntryFull`/`readRangeAll()` 不返回该字段；`broadcastTopeer()` 重新编码 payload 时统一写 `hdr.streamEpoch = streamEpoch_`。中心转发 B 节点 changeset 给 C 时，载荷变成 `(origin=B, stream_epoch=centerEpoch, origin_seq=BSeq)`，破坏 applied_vector 的命名空间。
-- 规格依据：设计 §6.1 明确 changelog 唯一键和 applied_vector 均按 `(origin, stream_epoch, origin_seq)`；§6 epoch 规则要求应用前比对载荷 epoch。
-- 修复方案：`ChangelogStore::EntryFull` 返回 `streamEpoch/schemaVer/schemaFingerprint`；广播 header 必须使用 entry 中保存的原始 epoch 和 schema 元数据。ACK 查询和更新也必须使用该 entry epoch。
-
-### C-05：转发 changeset 的 ACK 被发给 origin，而不是发给本次 artifact 的发送者
-
-- 位置：`src/sync/SyncWorker.cpp:536`、`src/sync/SyncWorker.cpp:544`、`src/sync/transport/AckChannel.cpp:33`
-- 描述：接收方应用 changeset 后设置 `ack.toPeer = dec.header.origin`。直接 A→B 时 origin 恰好等于发送者；但中心转发 B-origin artifact 给 C 时，C 会把 ACK 发给 B，而中心的 `__sync_outbound_ack(peer=C, origin=B, epoch=...)` 永远不会前移，导致中心无限重发/无法完成以远端 origin 为目标的 ACK 窗口。
-- 规格依据：设计 §5.11/§7.4 要求 ACK 前移发送端 per-peer 锚点；ACK 是运输层对本次发送者的确认，不是业务 origin 的私信。
-- 修复方案：payload header 或 artifact naming 必须携带 `fromPeer/senderPeer`，或由 InboxWatcher/transport 层把物理来源传入 `processArtifact()`。ACK 的 `toPeer` 应为发送者，ACK body 仍携带业务 `(origin, stream_epoch, applied_seq)`。
+- 位置：`src/sync/payload/PayloadCodec.cpp:161`、`include/dbridge/sync/SyncTypes.h:145`、`src/sync/SyncWorker.cpp:590`
+- 描述：`DecodeResult::rawPayload` 注释要求保存完整 encoded artifact，`processChangesetArtifact()` 在 schema mismatch 时用 `dec.rawPayload` 写入 `__sync_quarantine`。但 `PayloadCodec::decode()` 从未执行 `out->rawPayload = data`。结果 quarantine 行保存空 BLOB；`drainReady()` 后 `codec_->decode(empty)` 必然失败。若原 inbox 文件被传输层清理或重启后不可用，唯一持久副本不可重放，schema-mismatch payload 会丢失。
+- 规格依据：设计文档 §5.2/§5.4/§5.10 要求 schema 不匹配载荷隔离到 quarantine，并在 schema/baseline 适配后重放；QuarantineStore 注释也要求 `drainReady()` 返回可 replay payload。
+- 修复方案：在 `PayloadCodec::decode()` 成功读取 magic/version 后立即保存完整输入：`out->rawPayload = data`，并在进入 decode 前清空 `*out` 避免复用污染。补充 schema mismatch → quarantine → drainReady → replay 的回归测试。
 
 ## High 问题
 
-### H-01：selection push 的“完成后解锁广播”没有在中心侧落地
+### H-01：selection push 半截广播屏障仍按 origin 粗过滤，未按 push_id 精确过滤
 
-- 位置：`src/sync/SyncWorker.cpp:633`、`src/sync/apply/CapturedWriteTemplate.cpp:344`、`src/sync/SyncWorker.cpp:993`、`src/sync/SyncWorker.cpp:1068`
-- 描述：中心收到 selection push chunk 时把 `__sync_push_progress.status` 写成 `streaming`，chunk 应用后只更新 `__sync_push_chunk_progress`。`status='done'` 的代码只在处理 `PushChunkAck` 时执行，也就是原始 push 发起方收到 ACK 时执行；中心侧没有在全部 chunk applied 后置 done。于是中心广播层的 `status != 'done'` 过滤会长期阻止该 origin 的 changelog 下游广播。
-- 规格依据：设计 §5.5/§7.3 要求中心在全片完成前不向 C/D 广播本 push，完成后应解锁；plan T2.13 要求半截不外泄且全片 ACK 后 Completed。
-- 修复方案：中心侧每次 chunk applied 后按 `push_id` 统计 `total_chunks` 与 applied chunk 数；达到总数时在同一事务或紧随事务把 `push_progress.status='done'`。广播过滤必须按 changelog 的 push_id 精确判断，不能按 origin 粗过滤。
+- 位置：`src/sync/SyncWorker.cpp:1099`、`src/sync/SyncWorker.cpp:1106`、`src/sync/capture/ChangelogStore.h:41`、`src/sync/capture/ChangelogStore.cpp:154`
+- 描述：`__sync_changelog` 已有 `push_id`，`appendForward/insertRow` 也可写入；但 `EntryFull` 不返回 `push_id`，`broadcastTopeer()` 仍查询 `__sync_push_progress WHERE origin=? AND status!='done'`。这会在某个 B-origin push streaming 时阻塞 B 的所有其它普通 forwarded changeset，也无法证明只屏蔽“本 push 的直选变更”。
+- 规格依据：设计文档 §5.5 要求中心在“本 push”完成前不得向下游广播本 push 的直选变更，而不是冻结该 origin 的所有流量。
+- 修复方案：`EntryFull` 增加 `pushId`，`readRangeAll()` SELECT `push_id`。广播时仅当 `entry.pushId` 非空且对应 `push_progress.status!='done'` 时跳过；普通 changeset 和其它 push 不受影响。
 
-### H-02：`failedRouteIndices` 收集后仍被 `failedExcelRows` 整行跳过
+### H-02：FK preflight 失败仍导致整行跳过，兄弟 route 不能继续写入
 
-- 位置：`src/service/ImportService.cpp:555`、`src/service/ImportService.cpp:623`、`src/service/ImportService.cpp:663`
-- 描述：`FkInjector::inject()` 已返回失败 route 集合，`ctx.failedRouteIndices` 也已保存；但写入前仍把所有 row-level errors 加入 `failedExcelRows`，随后 `if (failedExcelRows.contains(ctx.excelRow)) continue;`。任一 lookup/fkInject/preflight route 出错都会跳过整个 Excel 行，兄弟 route 无法继续。
-- 规格依据：`openspec/specs/fk-injection/spec.md` 要求失败 route 只级联抑制 descendants，兄弟 route 不受影响；`row-lookup` 要求 lookup 输出 route-local。
-- 修复方案：错误收集需要带 route index 或 route table；写入阶段不要用 row 维度总开关。对每个 `RowContext` 构造 `directFailedRoutes + descendants` 后只跳过对应 payload。非 route 绑定的行错误才可整行跳过。
+- 位置：`src/validation/ForeignKeyPreflight.cpp:14`、`src/validation/ForeignKeyPreflight.cpp:150`、`src/service/ImportService.cpp:623`、`src/service/ImportService.cpp:671`
+- 描述：`FkInjector::inject()` 返回 route 失败集合，写入阶段据此过滤 route 及 descendants；但 `ForeignKeyPreflight::check()` 只向 `ErrorCollector` 添加 row-level `E_VALIDATE_FK`，没有把失败 route index 回填到 `RowContext::failedRouteIndices`。因此当某个 route 预检缺父行时，`failedExcelRows` 包含该 row 且 `ctx.failedRouteIndices` 可能为空，整行被跳过；不相关 sibling route 仍无法写入。
+- 规格依据：`openspec/specs/fk-injection/spec.md` 与归档 design 要求失败 route 只级联抑制 descendants，不相关 sibling route 不受影响。
+- 修复方案：让 `ForeignKeyPreflight::check()` 返回 `QHash<excelRow,QSet<routeIndex>>` 或直接接收可变 `contexts` 并合并失败 route。写入阶段统一使用 `directFailedRoutes + descendants`，只有非 route 绑定的结构/映射错误才整行跳过。
 
-### H-03：批量导出绕过 export-mode profile validation
+### H-03：`exportOnMissing:"error"` 的 reverse lookup 仍写出该行，只清空 A 列
 
-- 位置：`src/DataBridge.cpp:349`、`src/batch/BatchTransfer.cpp:104`、`src/batch/BatchTransfer.cpp:272`
-- 描述：`DataBridge::exportExcel()` 已调用 `ProfileValidator::validateForExport()`，但 `BatchTransfer::startExport()` snapshot profile/catalog 后，worker 线程直接 `ExportService::run()`。这条公开导出路径仍可绕过 `columnOrder` unknown/duplicate、raw SQL 互斥、反向 lookup post-substitution header 校验。
-- 规格依据：`export-column-order` 要求这些条件在 profile validation 阶段失败；`export-reverse-lookup` 要求 columnOrder 按替换后 header 集校验。
-- 修复方案：把 export validation 下沉到共享 helper，`DataBridge::exportExcel()`、`DataBridge::runExportOnDb()`、`BatchTransfer::runExport()` 在调用 `ExportService` 前统一执行。
-
-### H-04：反向 lookup 的 row-level 错误跳过整行，而不是仅影响声明 route
-
-- 位置：`src/service/ExportService.cpp:440`、`src/service/ExportService.cpp:487`、`src/service/ExportService.cpp:936`、`src/service/ExportService.cpp:941`
-- 描述：`resolveAHeaders()` 只返回一个 `rowSkip` 布尔值；任一 lookup miss/ambiguous 就让整条导出行不写。规格要求 `"error"` 模式跳过声明 route 在该 Excel 行的输出，其他 route 贡献不受影响。
-- 规格依据：`export-reverse-lookup` §`exportOnMissing` 与 Row resilience 明确单个 `E_REVERSE_LOOKUP_*` 不得中止整 sheet，且其他 route 不受影响。
-- 修复方案：反向 lookup resolver 返回失败 route 集合和 A-header 空值集合；投影时只清空/跳过该 route 的输出列，保留其他 route 的列。对于当前无法表达 route 局部投影的扁平行模型，至少需在规格中声明 MVP 限制并提供测试覆盖。
+- 位置：`src/service/ExportService.cpp:479`、`src/service/ExportService.cpp:505`、`src/service/ExportService.cpp:978`、`src/service/ExportService.cpp:998`
+- 描述：当前 `resolveAHeaders()` 在 NOT_FOUND 或 NULL H 且 `exportOnMissing=="error"` 时记录 `failedAHeaders`，随后投影阶段只把这些 A 列写空，仍写出整行。OpenSpec 当前主规格要求 `"error"` 产生 `E_REVERSE_LOOKUP_NOT_FOUND` 后受影响行不写出；`"null"`/`"skip"` 才是空 A 单元格继续写。当前行为会把本应失败跳过的数据静默导出为缺业务键行。
+- 规格依据：`openspec/specs/export-reverse-lookup/spec.md` 的 `exportOnMissing` 与 “Export remains row-resilient” 要求：`error` 模式 bad row skipped，`null/skip` 模式 empty A cells。
+- 修复方案：区分三种模式：`error` 设置 row/route skip；`null` 写空且不报 row-level error；`skip` 写空且不计错误。若项目决定采用“只清空列”的弱语义，需要先同步更新 OpenSpec，再以新规格评审。
 
 ## Medium 问题
 
 ### M-01：`SyncConfig::Builder` 校验仍不完整
 
-- 位置：`include/dbridge/sync/SyncConfig.h:281`
-- 描述：当前只校验少量必填项和部分正数。仍未拒绝重复 peer、空 peer id、center 与 role 不一致、Edge 未配置 center、soft 阈值大于 hard 阈值、`outboxMaxBytesPerPeer/baselineSizeWarnBytes/changelogRetention/gapTimeoutMs` 非法值等。
-- 规格依据：设计 §4.4 要求 `SyncConfig::Builder` 包含全部字段并做完整性校验。
-- 修复方案：补全拓扑、阈值、目录、rank 映射的字段级校验；返回明确错误文本和错误码，测试覆盖非法组合。
+- 位置：`include/dbridge/sync/SyncConfig.h:327`、`include/dbridge/sync/SyncConfig.h:340`、`include/dbridge/sync/SyncConfig.h:377`
+- 描述：Builder 已校验重复 peer、空 peer、Edge center 和部分正数；但仍未校验 `peerLagSoftSeq <= peerLagHardSeq`、`peerLagSoftBytes <= peerLagHardBytes`、`peerLagSoftMs <= peerLagHardMs`，也未校验 hard 阈值、`outboxMaxArtifactsPerPeer`、`baselineSizeWarnBytes`、`changelogRetention` 等正数。非法配置会让 dead-peer eviction、GC 或载荷预算行为不可预测。
+- 规格依据：设计文档 §1/§4.4 要求 Builder 完整性校验。
+- 修复方案：补全所有数值字段正数校验与软硬阈值关系校验；Center/Edge 拓扑规则也应明确：Center 不应要求 `centerNodeId`，Edge 的 center 应在 peer 列表或传输路由中可达。
 
-### M-02：同步 schema eligibility 仍窄于规格
+### M-02：同步 eligibility 仍拒绝规格允许的复合主键 / WITHOUT ROWID 表
 
 - 位置：`src/sync/schema/SchemaEligibility.cpp:78`
-- 描述：实现仍显式拒绝 composite PRIMARY KEY，只是换成了更明确的 `E_SYNC_COMPOSITE_PK_NOT_SUPPORTED`。规格允许 ordinary rowid 或 WITHOUT ROWID，只要求有明确 sync key / UPSERT target。
-- 规格依据：设计 §5.1/G-04 要求校验同步表 eligibility，而非强制单列 PK。
-- 修复方案：若这是 MVP 限制，应在公开文档和能力表中声明；长期应把 SelectionResolver、FkClosureBuilder、RowWinnerStore、UpsertExecutor 的 PK 表示升级为列元组。
+- 描述：实现对 composite PRIMARY KEY 直接拒绝，并建议改为单列 surrogate PK。错误消息已清楚，但能力仍窄于同步设计：规格要求的是明确 sync key / UPSERT target，而不是强制单列 PK。
+- 规格依据：设计文档 §5.1/G-04 要求 ordinary rowid 或 WITHOUT ROWID 表可被 eligibility 判断，只要有明确冲突目标。
+- 修复方案：若维持 MVP 限制，应在能力矩阵和同步公开文档中显式声明；长期需将 `RowMutation.pkColumns`、`RowWinnerStore`、`SelectionResolver`、`UpsertExecutor` 等路径按列元组建模。
 
-### M-03：ACK flush 不保证独立满足 `ackMaxDelayMs`
+### M-03：payload header 的 `senderPeer` 追加方式不是真正向后兼容
 
-- 位置：`src/sync/transport/AckChannel.cpp:15`、`src/sync/transport/AckChannel.cpp:65`、`src/sync/SyncWorker.cpp:393`
-- 描述：`scheduleChangesetAck()` 只在距离上次 flush 超过 `ackMaxDelayMs` 时写出；否则依赖主循环下一次 broadcast flush。若 `broadcastIntervalMs > ackMaxDelayMs` 且无其他事件，ACK 可能晚于配置上限。
-- 规格依据：设计 §5.11/FR-4/F-14 要求 ACK 在 `ackMaxDelayMs` 内必发。
-- 修复方案：主循环等待时间还应考虑 pending ACK 的 deadline，或 `AckChannel` 暴露 `nextFlushDeadlineMs()`，让 worker 在 ACK 截止前唤醒并 flush。
+- 位置：`src/sync/payload/PayloadCodec.cpp:64`、`src/sync/payload/PayloadCodec.cpp:71`
+- 描述：`readHeader()` 无条件尝试读取 `senderPeer`。旧 payload 在 header 后紧跟 compressed body；这里会把 body 的 `QByteArray` 序列化内容按 `QString` 读取，可能推进流位置并导致后续 body 读取失败。注释称 `ReadPastEnd` 可兼容旧 payload，但 `QDataStream` 对不同类型无字段标签，不能用这种方式可靠探测可选字段。
+- 规格依据：设计文档 §5.11/§13.1 要求传输制品 schema 稳定；混版本或积压 payload 不应因头字段追加而损坏。
+- 修复方案：提升 codec version，或在 header 中加入 flags/field-count；旧 version 按旧字段数量解析，新 version 再读取 `senderPeer`。
 
-### M-04：selection push/changelog 缺少 push_id 元数据，无法精确实现半截屏障
+### M-04：`ImportService` 写入阶段无法区分“route-local row error”和“非 route row error”的混合情况
 
-- 位置：`src/sync/SyncDDL.h:13`、`src/sync/capture/ChangelogStore.cpp:139`、`src/sync/SyncWorker.cpp:1072`
-- 描述：`__sync_changelog` 没有 `push_id/chunk_seq/push_status` 或等价来源字段，广播层只能通过 `origin` 查 `push_progress`。这既会阻塞无关变更，也无法证明失败/未完成 push 的已落片不会泄漏。
-- 规格依据：设计 §5.5 要求中心在本 push 完成前不得向下游广播“本 push 的直选变更”。
-- 修复方案：Branch B seal changelog 时写入 `push_id/chunk_seq`；广播层按 entry.push_id 精确判断 done。对 local write 和普通 forwarded changeset，该字段为空，不参与 push 屏障。
+- 位置：`src/service/ImportService.cpp:623`、`src/service/ImportService.cpp:667`
+- 描述：当前逻辑只判断 `failedExcelRows.contains(row) && ctx.failedRouteIndices.isEmpty()`。如果同一 Excel 行同时存在一个 route-local 错误和一个非 route 绑定的映射/验证错误，`ctx.failedRouteIndices` 非空会让整行继续进入 route 过滤，非 route 错误可能被忽略。
+- 规格依据：导入设计要求结构/类型等基础错误在落盘前阻断对应无效数据；row-lookup/fk-injection 才是 route-local 抑制。
+- 修复方案：ErrorCollector 或 RowContext 应携带 `routeIndex`/`scope`。写入阶段只在所有 row errors 都能归属到 failed route 集合时继续；否则整行跳过或按对应 route 精确跳过。
 
 ## 修复优先级汇总表
 
 | 编号 | 文件 | 严重度 | 一句话描述 |
 | --- | --- | --- | --- |
-| C-01 | `src/sync/SyncWorker.cpp:1504` | Critical | Foreground ACK 窗口只按本地 origin 反推，不能等待本轮实际发送载荷 |
-| C-02 | `src/sync/anchor/OutboundAckStore.cpp:112` | Critical | 单一 local_seq 重发下界会跳过没有 ACK 行的未确认 origin |
-| C-03 | `src/sync/baseline/BaselineManager.cpp:90` | Critical | baseline vector 缺 stream_epoch，且不以 applied_vector 为权威来源 |
-| C-04 | `src/sync/SyncWorker.cpp:1104` | Critical | 广播转发 changeset 时改写原始 stream_epoch |
-| C-05 | `src/sync/SyncWorker.cpp:544` | Critical | 转发 changeset 的 ACK 发给业务 origin，发送端锚点不会前移 |
-| H-01 | `src/sync/SyncWorker.cpp:1068` | High | selection push 在中心侧不会完成解锁，且广播过滤不是 per-push |
-| H-02 | `src/service/ImportService.cpp:623` | High | `failedRouteIndices` 被整行 `failedExcelRows` 覆盖，兄弟 route 仍被跳过 |
-| H-03 | `src/batch/BatchTransfer.cpp:272` | High | 批量导出绕过 `validateForExport()` |
-| H-04 | `src/service/ExportService.cpp:941` | High | 反向 lookup row-level 错误跳过整行而非声明 route |
-| M-01 | `include/dbridge/sync/SyncConfig.h:281` | Medium | `SyncConfig::Builder` 仍缺完整拓扑和阈值校验 |
-| M-02 | `src/sync/schema/SchemaEligibility.cpp:78` | Medium | 同步 eligibility 仍拒绝规格允许的复合 PK/WITHOUT ROWID 模型 |
-| M-03 | `src/sync/transport/AckChannel.cpp:65` | Medium | ACK flush 依赖 broadcast tick，可能超过 `ackMaxDelayMs` |
-| M-04 | `src/sync/SyncDDL.h:13` | Medium | changelog 缺 push_id，无法精确实现 selection push 半截屏障 |
+| C-01 | `src/sync/baseline/BaselineManager.cpp:149` | Critical | baseline cuts 缺源节点本地 origin cut，应用后 applied vector 可能回到 0 |
+| C-02 | `src/sync/SyncWorker.cpp:1095` | Critical | 转发流 ACK 查询使用本地 epoch，远端 origin 会无限重播 |
+| C-03 | `src/sync/payload/PayloadCodec.cpp:161` | Critical | `rawPayload` 未赋值，schema mismatch quarantine 保存空 payload |
+| H-01 | `src/sync/SyncWorker.cpp:1106` | High | selection push 屏障按 origin 粗过滤，未按 entry.push_id 精确过滤 |
+| H-02 | `src/validation/ForeignKeyPreflight.cpp:150` | High | FK preflight route 失败未回填 route 集合，仍整行跳过 |
+| H-03 | `src/service/ExportService.cpp:505` | High | reverse lookup `error` 模式写出空 A 列行，偏离当前 OpenSpec |
+| M-01 | `include/dbridge/sync/SyncConfig.h:327` | Medium | SyncConfig 仍缺软硬阈值和部分数值字段完整性校验 |
+| M-02 | `src/sync/schema/SchemaEligibility.cpp:78` | Medium | eligibility 仍拒绝复合 PK / WITHOUT ROWID 能力范围 |
+| M-03 | `src/sync/payload/PayloadCodec.cpp:71` | Medium | `senderPeer` 可选字段解析方式无法兼容旧 payload |
+| M-04 | `src/service/ImportService.cpp:667` | Medium | ImportService 不能区分 route-local 与非 route row error 的混合行 |
+
+本轮仍存在 Critical/High 阻断性问题，不建议通过。

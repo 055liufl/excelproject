@@ -128,6 +128,9 @@ class SyncWorker : public QThread {
                          QList<PendingAckEntry>* ackedEntries = nullptr);
     qint64 computePeerAckedSeq(const QString& peer);
     qint64 nextLocalOriginSeq();
+    // H-01 fix: roll back localOriginSeq_ to prevSeq when a transaction is aborted,
+    // preventing seq gaps that cause AppliedVectorStore::check() to report false gaps.
+    void rollbackOriginSeq(qint64 prevSeq);
     bool isPeerEvicted(const QString& peer);
     qint64 peerLastAckMs(const QString& peer);
     qint64 peerLagBytes(const QString& peer, qint64 afterLocalSeq);

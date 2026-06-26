@@ -762,6 +762,9 @@ bool SyncWorker::processSelectionPushArtifact(const DecodeResult& dec, const QSt
     // RowWinnerStore to mis-sort by seq.  Center rank is used consistently.
     p.origin = config_.nodeId();
     p.epoch = streamEpoch_;
+    // H-01 fix: save prevSeq so we can roll back if execute() fails (transaction rollback
+    // leaves localOriginSeq_ advanced, which would create a gap seen as false GAP by peers).
+    const qint64 prevSeqPush = localOriginSeq_;
     p.seq = nextLocalOriginSeq();
     p.schemaVer = hdr.schemaVer;
     p.schemaFp = hdr.schemaFingerprint;
@@ -774,6 +777,8 @@ bool SyncWorker::processSelectionPushArtifact(const DecodeResult& dec, const QSt
 
     WriteResult res = tpl_->execute(p);
     if (!res.ok) {
+        // H-01 fix: transaction was rolled back inside execute(); restore seq counter.
+        rollbackOriginSeq(prevSeqPush);
         emit errorOccurred(
             {res.errorCode, Severity::Error, "selection_push", hdr.origin, res.errorMsg});
         return false;
@@ -1447,12 +1452,16 @@ ImportResult SyncWorker::submitImportSync(const ImportOptions& opts, const QStri
             qint64 localSeq = 0;
             QString sealErr;
             const QString fp = guard_ ? guard_->fingerprint() : QString();
+            // H-01 fix: save prevSeq so any failure path can roll back the counter,
+            // keeping origin_seq contiguous even when the transaction is rolled back.
+            const qint64 prevSeqImport = localOriginSeq_;
             const qint64 originSeq = nextLocalOriginSeq();
             // C-02 fix: check sealInto() return value.
             if (!rec_->sealInto(hPtr_, *clog_, *wconnPtr_, txn, config_.nodeId(), streamEpoch_,
                                 config_.schemaVersion(), fp, 0, originSeq, &localSeq, &sealErr)) {
                 rec_->abort();
                 txn.rollback();
+                rollbackOriginSeq(prevSeqImport);  // H-01 fix
                 result.ok = false;
                 RowError e;
                 e.code = QLatin1String(err::E_SYNC_INIT);
@@ -1473,6 +1482,7 @@ ImportResult SyncWorker::submitImportSync(const ImportOptions& opts, const QStri
                 if (!ts_->resetFromBaseline(*wconnPtr_, canonicalSyncTables_, streamEpoch_, fp,
                                             &tsErr)) {
                     txn.rollback();
+                    rollbackOriginSeq(prevSeqImport);  // H-01 fix
                     result.ok = false;
                     RowError e;
                     e.code = QLatin1String(err::E_SYNC_INIT);
@@ -1487,6 +1497,7 @@ ImportResult SyncWorker::submitImportSync(const ImportOptions& opts, const QStri
             // C-02 fix: check txn.commit() return value.
             QString commitErr;
             if (!txn.commit(&commitErr)) {
+                rollbackOriginSeq(prevSeqImport);  // H-01 fix: commit failed = txn rolled back
                 result.ok = false;
                 RowError e;
                 e.code = QLatin1String(err::E_SYNC_INIT);
@@ -1515,6 +1526,12 @@ ImportResult SyncWorker::submitImportSync(const ImportOptions& opts, const QStri
 
 qint64 SyncWorker::nextLocalOriginSeq() {
     return ++localOriginSeq_;
+}
+
+// H-01 fix: restore localOriginSeq_ to prevSeq after a transaction rollback so that
+// the next successful write receives a contiguous seq (no gap).
+void SyncWorker::rollbackOriginSeq(qint64 prevSeq) {
+    localOriginSeq_ = prevSeq;
 }
 
 void SyncWorker::drainQuarantine() {
@@ -1559,6 +1576,8 @@ bool SyncWorker::submitCaptureWriteSync(const QList<RowMutation>& mutations,
         p.kind = WriteKind::LocalWrite;
         p.origin = config_.nodeId();
         p.epoch = streamEpoch_;
+        // H-01 fix: save prevSeq so we can roll back if execute() rolls back the transaction.
+        const qint64 prevSeqCapture = localOriginSeq_;
         p.seq = nextLocalOriginSeq();
         p.schemaVer = config_.schemaVersion();
         p.schemaFp = guard_ ? guard_->fingerprint() : QString();
@@ -1566,6 +1585,8 @@ bool SyncWorker::submitCaptureWriteSync(const QList<RowMutation>& mutations,
         p.syncTables = syncTables.isEmpty() ? canonicalSyncTables_ : syncTables;
 
         WriteResult res = tpl_->execute(p);
+        if (!res.ok)
+            rollbackOriginSeq(prevSeqCapture);  // H-01 fix
         sp->set_value(qMakePair(res.ok, res.errorMsg.isEmpty() ? res.errorCode : res.errorMsg));
     });
 

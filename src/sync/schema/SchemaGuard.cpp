@@ -23,7 +23,8 @@ bool SchemaGuard::verifyPayload(qint64 payloadVer, const QString& payloadFp, QSt
                        .arg(localVer_);
         return false;
     }
-    if (payloadFp != localFp_) {
+    // M-02 fix: skip fingerprint comparison when verifySchemaFingerprint is disabled.
+    if (verifyFingerprint_ && payloadFp != localFp_) {
         if (err)
             *err = QStringLiteral("schema fingerprint mismatch: payload=%1 local=%2")
                        .arg(payloadFp)

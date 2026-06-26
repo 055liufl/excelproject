@@ -1,4 +1,5 @@
 #pragma once
+#include <QSet>
 #include <QString>
 #include <QStringList>
 #include <QVariant>
@@ -27,6 +28,9 @@ struct RowContext {
     int excelRow = 0;
     QString classId;
     QVector<RoutePayload> payloads;
+    // H-04 fix: indices into payloads[] that failed FK injection; their descendants are also
+    // skipped in the write phase, while unaffected siblings still proceed.
+    QSet<int> failedRouteIndices;
 };
 
 }  // namespace dbridge::detail

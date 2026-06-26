@@ -39,33 +39,32 @@ bool QuarantineStore::quarantine(QSqlDatabase& db, const QString& origin, qint64
     return true;
 }
 
-QList<QByteArray> QuarantineStore::drainReady(QSqlDatabase& db, qint64 currentSchemaVer) {
-    QList<QByteArray> result;
+QList<QPair<qint64, QByteArray>> QuarantineStore::drainReady(QSqlDatabase& db,
+                                                             qint64 currentSchemaVer) {
+    QList<QPair<qint64, QByteArray>> result;
 
-    // Collect in ascending order so callers can replay in-order.
+    // H-01 fix: order by id ASC (arrival order) so cross-origin replay preserves insertion
+    // sequence.
     QSqlQuery sel(db);
     sel.prepare(
         QStringLiteral("SELECT id, payload FROM __sync_quarantine "
                        "WHERE payload_schema_ver <= ? "
-                       "ORDER BY origin_seq ASC"));
+                       "ORDER BY id ASC"));
     sel.addBindValue(currentSchemaVer);
     if (!sel.exec())
         return result;
 
-    QList<qint64> ids;
-    while (sel.next()) {
-        ids.append(sel.value(0).toLongLong());
-        result.append(sel.value(1).toByteArray());
-    }
+    while (sel.next())
+        result.append(qMakePair(sel.value(0).toLongLong(), sel.value(1).toByteArray()));
 
-    // Delete the drained rows.
-    for (qint64 id : qAsConst(ids)) {
-        QSqlQuery del(db);
-        del.prepare(QStringLiteral("DELETE FROM __sync_quarantine WHERE id = ?"));
-        del.addBindValue(id);
-        del.exec();
-    }
     return result;
+}
+
+void QuarantineStore::markReplayed(QSqlDatabase& db, qint64 id) {
+    QSqlQuery del(db);
+    del.prepare(QStringLiteral("DELETE FROM __sync_quarantine WHERE id = ?"));
+    del.addBindValue(id);
+    del.exec();
 }
 
 }  // namespace dbridge::sync

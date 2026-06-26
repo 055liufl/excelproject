@@ -142,12 +142,14 @@ bool ChangesetApplier::apply(sqlite3* h, QSqlDatabase& wconn, const QByteArray& 
 // ---------------------------------------------------------------------------
 
 int ChangesetApplier::filterCb(void* ctx, const char* tblName) {
+    // M-04 fix: unconditionally reject __sync_* internal tables BEFORE consulting the
+    // allow-list.  This prevents a misconfigured allow-list from accidentally allowing
+    // writes to sync meta tables, regardless of the syncTables configuration.
+    if (qstrncmp(tblName, "__sync_", 7) == 0)
+        return 0;
     auto* c = static_cast<ConflictCtx*>(ctx);
     if (!c->syncTables)
         return 1;  // accept all when list is empty
-    // Always reject internal __sync_* meta tables.
-    if (qstrncmp(tblName, "__sync_", 7) == 0)
-        return 0;
     return c->syncTables->contains(QString::fromUtf8(tblName)) ? 1 : 0;
 }
 

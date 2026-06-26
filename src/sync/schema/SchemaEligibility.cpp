@@ -1,5 +1,7 @@
 #include "SchemaEligibility.h"
 
+#include "dbridge/Errors.h"
+
 #include <QMap>
 #include <QSqlError>
 #include <QSqlQuery>
@@ -73,12 +75,13 @@ bool SchemaEligibility::verify(QSqlDatabase& db, const QStringList& syncTables,
             reject(QStringLiteral("PRIMARY KEY column(s) are nullable"));
             continue;
         }
-        // H-02 fix: reject composite PK tables. SelectionResolver, FkClosureBuilder, and
-        // ChangesetApplier all assume a single-column PK. Allowing composite-PK tables would
-        // silently produce wrong FK closures and incorrect selection-push semantics.
+        // M-03 fix: return a distinct error code for composite PK rejection so callers can
+        // detect this specific limitation rather than a generic unsupported-schema failure.
         if (info.pkCols.size() > 1) {
-            reject(QStringLiteral("composite PRIMARY KEY (%1 columns) is not supported for sync; "
-                                  "add a surrogate single-column PK or use a UNIQUE index instead")
+            reject(QLatin1String(err::E_SYNC_COMPOSITE_PK_NOT_SUPPORTED) +
+                   QStringLiteral(": composite PRIMARY KEY (%1 columns) is not supported for "
+                                  "sync; add a surrogate single-column PK or use a UNIQUE index "
+                                  "instead")
                        .arg(info.pkCols.size()));
             continue;
         }

@@ -1,5 +1,6 @@
 #pragma once
 #include <QByteArray>
+#include <QHash>
 #include <QList>
 #include <QSqlDatabase>
 #include <QString>
@@ -19,7 +20,10 @@ class BaselineManager {
    public:
     struct BaselineArtifact {
         QByteArray data;          // serialized baseline data (compressed)
-        qint64 sourceMaxSeq = 0;  // max local_seq at export time
+        qint64 sourceMaxSeq = 0;  // max local_seq at export time (diagnostic only)
+        // C-03 fix: per-origin max origin_seq at export time, used to reset applied_vector
+        // to the correct authoritative truncation point (MAX(origin_seq) per origin).
+        QHash<QString, qint64> originMaxSeq;
     };
 
     // Export all rows from syncTables into a BaselineArtifact.

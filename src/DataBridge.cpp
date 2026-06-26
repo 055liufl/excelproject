@@ -10,7 +10,9 @@
 
 #include "DataBridgePrivate.h"
 #include "profile/ProfileLoader.h"
+#include "profile/ProfileValidator.h"
 #include "schema/SchemaCatalog.h"
+#include "service/ErrorCollector.h"
 
 namespace dbridge {
 
@@ -342,6 +344,18 @@ ExportResult DataBridge::exportExcel(const QString& xlsxPath, const ExportOption
         e.message = QStringLiteral("Schema refresh failed: ") + schErr;
         result.errors.append(e);
         return result;
+    }
+
+    // H-03 fix: run export-mode profile validation before export so columnOrder, rawSql,
+    // and table/column existence errors surface early.
+    {
+        detail::ErrorCollector valErrors;
+        detail::ProfileValidator validator;
+        if (!validator.validateForExport(it.value(), d_->catalog_, &valErrors)) {
+            ExportResult valResult;
+            valResult.errors = valErrors.list();
+            return valResult;
+        }
     }
 
     return d_->exportSvc_.run(it.value(), d_->catalog_, xlsxPath, options, d_->db_);

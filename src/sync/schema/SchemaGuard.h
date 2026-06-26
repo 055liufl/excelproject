@@ -10,6 +10,11 @@ namespace dbridge::sync {
 // rejects any payload whose (schemaVer, schemaFp) diverges from that baseline.
 class SchemaGuard {
    public:
+    // M-02 fix: accept verifyFingerprint flag at construction; when false, fingerprint
+    // comparison is skipped in verifyPayload() (version mismatch still rejects).
+    explicit SchemaGuard(bool verifyFingerprint = true) : verifyFingerprint_(verifyFingerprint) {
+    }
+
     void setLocal(qint64 localVer, const QString& localFp);
 
     // Returns true if payload matches the local baseline.
@@ -28,6 +33,7 @@ class SchemaGuard {
    private:
     qint64 localVer_ = 0;
     QString localFp_;
+    bool verifyFingerprint_ = true;
 };
 
 }  // namespace dbridge::sync

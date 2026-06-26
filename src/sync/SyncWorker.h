@@ -129,6 +129,9 @@ class SyncWorker : public QThread {
     qint64 peerLagBytes(const QString& peer, qint64 afterLocalSeq);
     void evaluatePeers();
     bool runBaselineFallbackFor(const QString& artifactName);
+    // M-06 fix: replay quarantined payloads that became eligible after a schema upgrade
+    // or baseline apply.  Must be called on the worker thread with wconnPtr_ valid.
+    void drainQuarantine();
 
     // --- Data members ---
     SyncConfig config_;
@@ -190,6 +193,11 @@ class SyncWorker : public QThread {
     // (set inside the enqueueSelectionPush lambda, read in processAckArtifact — both run on the
     // same worker thread, no additional locking needed).
     QString pendingPushId_;
+
+    // C-01 fix: all (peer, origin, epoch, targetSeq) entries that must be ACKed before
+    // the foreground sync() is considered complete. Empty when no ACK window is active.
+    // Accessed only on the worker thread (set in enqueueDrain, read in processAckArtifact).
+    QList<PendingAckEntry> pendingAckWindow_;
 
     QSet<QString> baselineRequestsInFlight_;
 };

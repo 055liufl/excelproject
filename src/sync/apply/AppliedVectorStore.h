@@ -27,6 +27,12 @@ class AppliedVectorStore {
     bool reset(QSqlDatabase& db, const QString& origin, qint64 epoch, qint64 baselineGeneration,
                QString* err);
 
+    // C-03 fix: reset to a specific origin_seq (the authoritative truncation point at
+    // baseline export time).  Unlike reset() which always writes applied_seq=0, this
+    // method writes the actual max origin_seq so subsequent gap detection starts correctly.
+    bool resetTo(QSqlDatabase& db, const QString& origin, qint64 epoch, qint64 originSeq,
+                 qint64 baselineGeneration, QString* err);
+
     // Return current applied_seq (-1 if row not found).
     qint64 current(QSqlDatabase& db, const QString& origin, qint64 epoch);
 

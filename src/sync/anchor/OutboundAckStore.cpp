@@ -109,6 +109,31 @@ bool OutboundAckStore::updateLastSent(QSqlDatabase& db, const QString& peer, qin
     return true;
 }
 
+qint64 OutboundAckStore::minUnackedLocalSeq(QSqlDatabase& db, const QString& peer, qint64 epoch) {
+    // For each origin that this peer has started ACKing, find the local_seq of the first
+    // changelog entry whose origin_seq > acked_seq (i.e. not yet confirmed).
+    // Return the minimum of those, minus 1, so readRangeAll(afterLocalSeq=result) will
+    // include all un-ACKed entries.  If no ACK rows exist, return -1 (read from beginning).
+    QSqlQuery q(db);
+    q.prepare(
+        QStringLiteral("SELECT COALESCE(MIN(cl.local_seq), -1) - 1 "
+                       "FROM __sync_changelog cl "
+                       "JOIN __sync_outbound_ack oa "
+                       "  ON oa.origin = cl.origin "
+                       "  AND oa.stream_epoch = cl.stream_epoch "
+                       "  AND oa.peer = ? "
+                       "  AND oa.origin != '__broadcast__' "
+                       "WHERE cl.stream_epoch = ? "
+                       "  AND cl.origin_seq > oa.acked_seq"));
+    q.addBindValue(peer);
+    q.addBindValue(epoch);
+    if (!q.exec() || !q.next())
+        return -1;
+    if (q.value(0).isNull())
+        return -1;
+    return q.value(0).toLongLong();
+}
+
 bool OutboundAckStore::setPendingBaseline(QSqlDatabase& db, const QString& peer, bool pending,
                                           QString* err) {
     QSqlQuery q(db);

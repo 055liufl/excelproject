@@ -90,6 +90,31 @@ bool AppliedVectorStore::reset(QSqlDatabase& db, const QString& origin, qint64 e
     return true;
 }
 
+bool AppliedVectorStore::resetTo(QSqlDatabase& db, const QString& origin, qint64 epoch,
+                                 qint64 originSeq, qint64 baselineGeneration, QString* err) {
+    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+    QSqlQuery q(db);
+    q.prepare(
+        QStringLiteral("INSERT INTO __sync_applied_vector "
+                       "(origin, stream_epoch, applied_seq, baseline_generation, updated_ms) "
+                       "VALUES (?, ?, ?, ?, ?) "
+                       "ON CONFLICT(origin, stream_epoch) DO UPDATE SET "
+                       "  applied_seq          = excluded.applied_seq, "
+                       "  baseline_generation  = excluded.baseline_generation, "
+                       "  updated_ms           = excluded.updated_ms"));
+    q.addBindValue(origin);
+    q.addBindValue(epoch);
+    q.addBindValue(originSeq);
+    q.addBindValue(baselineGeneration);
+    q.addBindValue(nowMs);
+    if (!q.exec()) {
+        if (err)
+            *err = q.lastError().text();
+        return false;
+    }
+    return true;
+}
+
 qint64 AppliedVectorStore::current(QSqlDatabase& db, const QString& origin, qint64 epoch) {
     qint64 appliedSeq = -1;
     qint64 baselineGen = 0;

@@ -29,6 +29,12 @@ class OutboundAckStore {
     // Returns -1 if no record exists yet.
     qint64 lastSentLocalSeq(QSqlDatabase& db, const QString& peer, qint64 epoch);
 
+    // C-02 fix: return the minimum local_seq in __sync_changelog that has NOT yet been
+    // confirmed by this peer across all origins.  Used as the broadcast read lower-bound
+    // so un-ACKed changesets are always eligible for re-send.  Returns -1 if nothing has
+    // been sent (start from the beginning).
+    qint64 minUnackedLocalSeq(QSqlDatabase& db, const QString& peer, qint64 epoch);
+
     // Advance the broadcast send-watermark for peer.  Only moves forward
     // (MAX semantics).  Creates the sentinel row if absent (J-01 fix).
     bool updateLastSent(QSqlDatabase& db, const QString& peer, qint64 epoch,

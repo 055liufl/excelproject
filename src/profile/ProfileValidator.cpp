@@ -327,8 +327,36 @@ bool ProfileValidator::validateRoutes(const QVector<RouteSpec>& routes,
     return ok;
 }
 
+bool ProfileValidator::validateForExport(const ProfileSpec& profile, const SchemaCatalog& catalog,
+                                         ErrorCollector* errors) {
+    // H-03 fix: build a synthetic excelHeaders list that contains every column source
+    // declared in the profile so that header-existence checks always pass.
+    // Discriminator and Excel-header checks are import-only concerns — skip them here.
+    QStringList syntheticHeaders;
+    auto collectHeaders = [&](const QVector<RouteSpec>& routes) {
+        for (const auto& route : routes) {
+            for (const auto& col : route.columns)
+                syntheticHeaders.append(col.source);
+            for (const auto& lk : route.lookups) {
+                for (const auto& mp : lk.match)
+                    syntheticHeaders.append(mp.second);
+            }
+        }
+    };
+    if (profile.mode == ProfileMode::Mixed) {
+        for (const auto& cls : profile.classes)
+            collectHeaders(cls.routes);
+        if (!profile.discriminatorSource.isEmpty())
+            syntheticHeaders.append(profile.discriminatorSource);
+    } else {
+        collectHeaders(profile.routes);
+    }
+    return validate(profile, catalog, syntheticHeaders, errors, /*importMode=*/false);
+}
+
 bool ProfileValidator::validate(const ProfileSpec& profile, const SchemaCatalog& catalog,
-                                const QStringList& excelHeaders, ErrorCollector* errors) {
+                                const QStringList& excelHeaders, ErrorCollector* errors,
+                                bool importMode) {
     bool ok = true;
 
     if (profile.name.isEmpty()) {
@@ -348,12 +376,13 @@ bool ProfileValidator::validate(const ProfileSpec& profile, const SchemaCatalog&
     }
 
     if (profile.mode == ProfileMode::Mixed) {
-        if (profile.discriminatorSource.isEmpty()) {
+        // M-05 fix: discriminator.source is only required for import; skip for export.
+        if (importMode && profile.discriminatorSource.isEmpty()) {
             errors->addTable(profile.sheet, QString::fromLatin1(err::E_PROFILE_PARSE),
                              QStringLiteral("mixed mode requires discriminator.source"));
             ok = false;
         }
-        if (!profile.discriminatorSource.isEmpty() &&
+        if (importMode && !profile.discriminatorSource.isEmpty() &&
             !excelHeaders.contains(profile.discriminatorSource)) {
             errors->addTable(profile.sheet, QString::fromLatin1(err::E_HEADER_NOT_FOUND),
                              QStringLiteral("Discriminator source '") +

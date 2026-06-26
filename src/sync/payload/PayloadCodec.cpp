@@ -110,6 +110,11 @@ QByteArray PayloadCodec::encodeBaselineResponse(const PayloadHeader& h,
     for (const QString& table : body.tables)
         tablesArr.append(table);
 
+    // C-03 fix: serialize per-origin max origin_seq map.
+    QJsonObject originMaxSeqObj;
+    for (auto it = body.originMaxSeq.cbegin(); it != body.originMaxSeq.cend(); ++it)
+        originMaxSeqObj[it.key()] = QString::number(it.value());
+
     QJsonObject root;
     root[QStringLiteral("origin")] = body.origin;
     root[QStringLiteral("requestOrigin")] = body.requestOrigin;
@@ -119,6 +124,7 @@ QByteArray PayloadCodec::encodeBaselineResponse(const PayloadHeader& h,
     root[QStringLiteral("pendingArtifactName")] = body.pendingArtifactName;
     root[QStringLiteral("baselineData")] = QString::fromLatin1(body.baselineData.toBase64());
     root[QStringLiteral("sourceMaxSeq")] = QString::number(body.sourceMaxSeq);
+    root[QStringLiteral("originMaxSeq")] = originMaxSeqObj;
     QByteArray json = QJsonDocument(root).toJson(QJsonDocument::Compact);
 
     QByteArray buf;
@@ -244,6 +250,10 @@ bool PayloadCodec::decode(const QByteArray& data, DecodeResult* out, QString* er
         br.sourceMaxSeq = root[QStringLiteral("sourceMaxSeq")].toString().toLongLong();
         for (const QJsonValue& tv : root[QStringLiteral("tables")].toArray())
             br.tables.append(tv.toString());
+        // C-03 fix: deserialize per-origin max origin_seq map.
+        QJsonObject originMaxSeqObj = root[QStringLiteral("originMaxSeq")].toObject();
+        for (auto it = originMaxSeqObj.begin(); it != originMaxSeqObj.end(); ++it)
+            br.originMaxSeq.insert(it.key(), it.value().toString().toLongLong());
         return true;
     }
     if (err)

@@ -199,7 +199,8 @@ bool FkClosureBuilder::topoSort(QList<Entry>& entries,
 bool FkClosureBuilder::build(QSqlDatabase& rconn,
                              const QList<SelectionResolver::ResolveResult>& selected,
                              const dbridge::detail::SchemaCatalog& catalog, ConsistencyCache& cache,
-                             qint64 maxSize, QList<Entry>* out, QString* err) {
+                             qint64 maxSize, QList<Entry>* out, QString* err, bool includeFkDeps,
+                             bool pruneConsistent) {
     QList<Entry> work;
     work.reserve(selected.size());
     QSet<QString> seen;
@@ -218,10 +219,11 @@ bool FkClosureBuilder::build(QSqlDatabase& rconn,
         work.append(std::move(e));
     }
 
-    // Expand FK closure (pruneConsistent=true by default; caller controls via
-    // SyncSelection but we receive already-resolved rows, so we always expand here).
-    if (!buildClosure(rconn, catalog, cache, /*pruneConsistent=*/true, work, seen, err))
-        return false;
+    // H-02 fix: only expand FK closure when includeFkDeps is true; honour pruneConsistent flag.
+    if (includeFkDeps) {
+        if (!buildClosure(rconn, catalog, cache, pruneConsistent, work, seen, err))
+            return false;
+    }
 
     if (static_cast<qint64>(work.size()) > maxSize) {
         if (err)

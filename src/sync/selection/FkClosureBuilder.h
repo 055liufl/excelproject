@@ -25,9 +25,11 @@ class FkClosureBuilder {
     // Build closure from directly-selected rows.
     // catalog provides FK graph. cache is used to prune consistent deps.
     // maxSize: fail with E_SYNC_SELECTION_TOO_LARGE if exceeded.
+    // H-02 fix: includeFkDeps and pruneConsistent honour the SyncSelection flags.
     bool build(QSqlDatabase& rconn, const QList<SelectionResolver::ResolveResult>& selected,
                const dbridge::detail::SchemaCatalog& catalog, ConsistencyCache& cache,
-               qint64 maxSize, QList<Entry>* out, QString* err);
+               qint64 maxSize, QList<Entry>* out, QString* err, bool includeFkDeps = true,
+               bool pruneConsistent = true);
 
    private:
     // Recursively expand FK dependencies into work list.

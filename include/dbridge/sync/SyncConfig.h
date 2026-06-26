@@ -294,6 +294,47 @@ class DBRIDGE_EXPORT SyncConfig::Builder {
                 *err = QStringLiteral("outboxDir and inboxDir are required");
             return {};
         }
+        // M-01 fix: additional validation.
+        if (cfg_.peerNodes_.contains(cfg_.nodeId_)) {
+            if (err)
+                *err = QStringLiteral("nodeId must not appear in peerNodes");
+            return {};
+        }
+        if (cfg_.ackMaxDelayMs_ <= 0) {
+            if (err)
+                *err = QStringLiteral("ackMaxDelayMs must be positive");
+            return {};
+        }
+        if (cfg_.broadcastIntervalMs_ <= 0) {
+            if (err)
+                *err = QStringLiteral("broadcastIntervalMs must be positive");
+            return {};
+        }
+        if (cfg_.broadcastThreshold_ <= 0) {
+            if (err)
+                *err = QStringLiteral("broadcastThreshold must be positive");
+            return {};
+        }
+        if (cfg_.maxSelectionSize_ <= 0) {
+            if (err)
+                *err = QStringLiteral("maxSelectionSize must be positive");
+            return {};
+        }
+        if (cfg_.pushChunkBudgetBytes_ <= 0) {
+            if (err)
+                *err = QStringLiteral("pushChunkBudgetBytes must be positive");
+            return {};
+        }
+        if (cfg_.peerLagSoftMs_ <= 0) {
+            if (err)
+                *err = QStringLiteral("peerLagSoftMs must be positive");
+            return {};
+        }
+        if (cfg_.schemaVersion_ < 1) {
+            if (err)
+                *err = QStringLiteral("schemaVersion must be >= 1");
+            return {};
+        }
         cfg_.valid_ = true;
         return cfg_;
     }

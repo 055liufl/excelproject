@@ -1,5 +1,6 @@
 #pragma once
 #include <QByteArray>
+#include <QHash>
 #include <QList>
 #include <QString>
 #include <QStringList>
@@ -118,6 +119,8 @@ struct BaselineResponsePayload {
     QString pendingArtifactName;
     QByteArray baselineData;
     qint64 sourceMaxSeq = 0;
+    // C-03 fix: per-origin max origin_seq at baseline export time.
+    QHash<QString, qint64> originMaxSeq;
 };
 
 struct DecodeResult {
@@ -146,6 +149,15 @@ struct PushChunkAck {
     QString checksum;
     bool ok = false;
     QString toPeer;  // H-04 fix: peer to which this ACK is routed (= original push origin)
+};
+
+// Tracks which peers and (origin, epoch, target_seq) tuples must all be ACKed
+// before a foreground sync() call is considered complete.
+struct PendingAckEntry {
+    QString peer;
+    QString origin;
+    qint64 epoch = 0;
+    qint64 targetSeq = 0;
 };
 
 enum class UpsertMode { DoUpdate, DoNothing };

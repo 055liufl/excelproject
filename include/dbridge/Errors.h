@@ -69,6 +69,8 @@ inline constexpr const char* E_SYNC_PUSH_SCHEMA_MOVED = "E_SYNC_PUSH_SCHEMA_MOVE
 inline constexpr const char* E_BUSY = "E_BUSY";
 inline constexpr const char* E_SYNC_WRITE_BLOCKED = "E_SYNC_WRITE_BLOCKED";
 inline constexpr const char* E_SYNC_UNSUPPORTED_SCHEMA = "E_SYNC_UNSUPPORTED_SCHEMA";
+inline constexpr const char* E_SYNC_COMPOSITE_PK_NOT_SUPPORTED =
+    "E_SYNC_COMPOSITE_PK_NOT_SUPPORTED";
 inline constexpr const char* E_SYNC_ACK_TIMEOUT = "E_SYNC_ACK_TIMEOUT";
 inline constexpr const char* E_SYNC_REBASE_FAILED = "E_SYNC_REBASE_FAILED";
 inline constexpr const char* E_SYNC_BASELINE_FAILED = "E_SYNC_BASELINE_FAILED";

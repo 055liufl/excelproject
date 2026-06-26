@@ -73,7 +73,8 @@ SyncWorker::SyncWorker(SyncConfig config, std::shared_ptr<InboundTableGate> inbo
     ts_ = std::make_unique<TableStateStore>();
     clog_ = std::make_unique<ChangelogStore>();
     rec_ = std::make_unique<SessionRecorder>();
-    guard_ = std::make_unique<SchemaGuard>();
+    // M-02 fix: pass verifySchemaFingerprint flag from config.
+    guard_ = std::make_unique<SchemaGuard>(config_.verifySchemaFingerprint());
     applier_ = std::make_unique<ChangesetApplier>();
     outbox_ = std::make_unique<OutboxWriter>(config_.outboxDir());
     ledger_ = std::make_unique<InboxLedger>();
@@ -345,13 +346,16 @@ void SyncWorker::run() {
     // re-quarantines. We drain once at init (not every scan) because the worker's schema version
     // is fixed for its lifetime, so re-draining at runtime would only churn incompatible rows.
     {
-        const QList<QByteArray> readyPayloads =
-            quarantine_->drainReady(wconn, config_.schemaVersion());
-        for (const QByteArray& payload : readyPayloads) {
+        const auto readyPayloads = quarantine_->drainReady(wconn, config_.schemaVersion());
+        for (const auto& entry : readyPayloads) {
+            const qint64 qid = entry.first;
+            const QByteArray& payload = entry.second;
             DecodeResult qdec;
             QString qerr;
-            if (codec_->decode(payload, &qdec, &qerr) && qdec.kind == PayloadKind::Changeset)
-                processChangesetArtifact(qdec, QString());
+            if (codec_->decode(payload, &qdec, &qerr) && qdec.kind == PayloadKind::Changeset) {
+                if (processChangesetArtifact(qdec, QString()))
+                    quarantine_->markReplayed(wconn, qid);
+            }
         }
     }
 
@@ -726,12 +730,10 @@ bool SyncWorker::processSelectionPushArtifact(const DecodeResult& dec, const QSt
 
     WriteParams p;
     p.kind = WriteKind::InboundSelectionPush;
-    // C-03 fix: attribute the changelog entry to the local node (not the remote sender) and
-    // allocate a fresh local origin seq. Using the sender's originSeq=0 (or any fixed seq)
-    // causes UNIQUE(origin, stream_epoch, origin_seq) collisions when multiple chunks arrive
-    // from the same sender in the same epoch. The changelog entry records "this node applied a
-    // selection push" — it is a local event, not a forwarding of the remote changeset.
-    p.origin = config_.nodeId();
+    // C-04 fix: preserve the remote sender's origin so the downstream broadcast can attribute
+    // the change to its true source.  A fresh local origin_seq is still allocated to avoid
+    // UNIQUE(origin, stream_epoch, origin_seq) collisions with the sender's own seq space.
+    p.origin = hdr.origin;
     p.epoch = streamEpoch_;
     p.seq = nextLocalOriginSeq();
     p.schemaVer = hdr.schemaVer;
@@ -800,6 +802,7 @@ bool SyncWorker::processBaselineRequestArtifact(const DecodeResult& dec,
     resp.pendingArtifactName = req.pendingArtifactName;
     resp.baselineData = art.data;
     resp.sourceMaxSeq = art.sourceMaxSeq;
+    resp.originMaxSeq = art.originMaxSeq;  // C-03 fix
 
     PayloadHeader hdr;
     hdr.origin = config_.nodeId();
@@ -842,6 +845,7 @@ bool SyncWorker::processBaselineResponseArtifact(const DecodeResult& dec,
     BaselineManager::BaselineArtifact art;
     art.data = resp.baselineData;
     art.sourceMaxSeq = resp.sourceMaxSeq;
+    art.originMaxSeq = resp.originMaxSeq;  // C-03 fix: carry per-origin applied vector
 
     ConsistencyCache cache;
     qint64 newAnchorSeq = 0;
@@ -857,6 +861,10 @@ bool SyncWorker::processBaselineResponseArtifact(const DecodeResult& dec,
 
     // Remove from in-flight tracking so the next gap scan doesn't re-request.
     baselineRequestsInFlight_.remove(resp.pendingArtifactName);
+
+    // M-06 fix: drain quarantine after baseline apply so payloads that were quarantined
+    // due to schema version mismatch can now be replayed with the updated applied_vector.
+    drainQuarantine();
 
     // Trigger rescan so any artifacts that were deferred waiting for this baseline are now applied.
     enqueue([this]() { scanInbox(); });
@@ -903,12 +911,35 @@ bool SyncWorker::processAckArtifact(const QString& path, const QString& name) {
         if (!peer.isEmpty())
             ackStore_->updateAcked(*wconnPtr_, peer, csAck.origin, csAck.streamEpoch,
                                    csAck.appliedSeq, nullptr);
-        // J-02: ACK arrival satisfies any pending foreground sync() wait → Completed.
-        if (ackWaiting_.exchange(false)) {
-            SyncProgress p;
-            p.state = SyncState::Completed;
-            p.percent = 100;
-            emit progressUpdated(p);
+        // C-01 fix: only complete foreground sync() when ALL expected peers have ACKed their
+        // respective (origin, epoch, targetSeq). Check each entry in pendingAckWindow_ against
+        // the current acked_seq; complete only when every entry is satisfied.
+        if (ackWaiting_.load() && !pendingAckWindow_.isEmpty()) {
+            bool allAcked = true;
+            for (const PendingAckEntry& entry : qAsConst(pendingAckWindow_)) {
+                const qint64 acked =
+                    ackStore_->ackedSeq(*wconnPtr_, entry.peer, entry.origin, entry.epoch);
+                if (acked < entry.targetSeq) {
+                    allAcked = false;
+                    break;
+                }
+            }
+            if (allAcked && ackWaiting_.exchange(false)) {
+                pendingAckWindow_.clear();
+                SyncProgress p;
+                p.state = SyncState::Completed;
+                p.percent = 100;
+                emit progressUpdated(p);
+            }
+        } else if (ackWaiting_.load() && pendingAckWindow_.isEmpty()) {
+            // No window was built (e.g. empty broadcast) — should not happen after C-01 fix,
+            // but fall back to old behaviour to avoid permanent block.
+            if (ackWaiting_.exchange(false)) {
+                SyncProgress p;
+                p.state = SyncState::Completed;
+                p.percent = 100;
+                emit progressUpdated(p);
+            }
         }
         evaluatePeers();
         return true;
@@ -1011,15 +1042,12 @@ bool SyncWorker::broadcast(QString* outErr) {
 }
 
 bool SyncWorker::broadcastTopeer(const QString& peer, QString* outErr) {
-    // J-01 fix: use readRangeAll(excludeOrigin=peer) so we:
-    //   (a) never echo peer's own changes back to it, and
-    //   (b) always include our own local changes (which readRange(origin=peer) missed).
-    // The watermark is now local_seq-based (lastSentLocalSeq) rather than per-origin-based.
-    qint64 afterLocalSeq = ackStore_->lastSentLocalSeq(*wconnPtr_, peer, streamEpoch_);
-    if (afterLocalSeq < 0) {
-        // First time: start from -1 so all existing entries are eligible.
+    // C-02 fix: use minUnackedLocalSeq as the read lower-bound so that un-ACKed changesets
+    // are always eligible for re-send.  lastSentLocalSeq is only advanced for diagnostics.
+    // Falls back to -1 (read from beginning) when no ACK rows exist yet.
+    qint64 afterLocalSeq = ackStore_->minUnackedLocalSeq(*wconnPtr_, peer, streamEpoch_);
+    if (afterLocalSeq < -1)
         afterLocalSeq = -1;
-    }
 
     // Read pending entries from changelog
     QList<ChangelogStore::EntryFull> entries = clog_->readRangeAll(
@@ -1036,6 +1064,20 @@ bool SyncWorker::broadcastTopeer(const QString& peer, QString* outErr) {
             ackStore_->ackedSeq(*wconnPtr_, peer, entry.origin, streamEpoch_);
         if (!routing_->shouldRoute(peer, entry.origin, entry.originSeq, peerOriginAcked))
             continue;
+
+        // C-04 fix: skip changelog entries produced by a selection push that has not yet
+        // been fully ACKed by all recipients.  Entries whose origin is a remote peer and
+        // whose push_progress row is still streaming/pending must not be broadcast until the
+        // push is marked 'done'.
+        if (entry.origin != config_.nodeId()) {
+            QSqlQuery pushQ(*wconnPtr_);
+            pushQ.prepare(
+                QStringLiteral("SELECT COUNT(*) FROM __sync_push_progress "
+                               "WHERE origin = ? AND status != 'done' AND status != 'failed'"));
+            pushQ.addBindValue(entry.origin);
+            if (pushQ.exec() && pushQ.next() && pushQ.value(0).toInt() > 0)
+                continue;
+        }
 
         // I-16: Rebase the changeset onto any stored rebase buffer before broadcast.
         QByteArray changesetToSend = entry.changeset;
@@ -1365,6 +1407,22 @@ qint64 SyncWorker::nextLocalOriginSeq() {
     return ++localOriginSeq_;
 }
 
+void SyncWorker::drainQuarantine() {
+    if (!wconnPtr_ || !quarantine_ || !codec_)
+        return;
+    const auto readyPayloads = quarantine_->drainReady(*wconnPtr_, config_.schemaVersion());
+    for (const auto& entry : readyPayloads) {
+        const qint64 qid = entry.first;
+        const QByteArray& payload = entry.second;
+        DecodeResult qdec;
+        QString qerr;
+        if (codec_->decode(payload, &qdec, &qerr) && qdec.kind == PayloadKind::Changeset) {
+            if (processChangesetArtifact(qdec, QString()))
+                quarantine_->markReplayed(*wconnPtr_, qid);
+        }
+    }
+}
+
 // C-05 fix: routes RowMutations through CapturedWriteTemplate (session capture + changelog seal)
 // instead of directly through UpsertExecutor. This ensures comparison-session saves produce
 // changelog entries that are broadcast to peers, matching the semantics of a normal local write.
@@ -1423,6 +1481,7 @@ void SyncWorker::cancelAckWait() {
     ackWaiting_ = false;
     ackDeadlineMs_ = 0;
     pendingPushId_.clear();
+    pendingAckWindow_.clear();
 }
 
 // C-02: Enqueue an immediate drain cycle on the worker thread.
@@ -1441,6 +1500,38 @@ bool SyncWorker::enqueueDrain(QString* err) {
         if (!taskErr.isEmpty()) {
             emit errorOccurred({err::E_SYNC_TRANSPORT, Severity::Error, QStringLiteral("sync"),
                                 config_.nodeId(), taskErr});
+        }
+        // C-01 fix: build the PendingAckWindow from what we actually broadcast.
+        // For each peer we just sent to, record (peer, localNode, epoch, maxOriginSeq)
+        // so processAckArtifact() waits for ALL peers to ACK before completing.
+        if (wrote && wconnPtr_) {
+            pendingAckWindow_.clear();
+            for (const QString& p : config_.peerNodes()) {
+                if (isPeerEvicted(p))
+                    continue;
+                const qint64 lastSent = ackStore_->lastSentLocalSeq(*wconnPtr_, p, streamEpoch_);
+                if (lastSent < 0)
+                    continue;
+                // Find the maximum origin_seq we sent (for our own origin).
+                // We query the acked_seq the peer will need to reach.
+                const qint64 targetAcked =
+                    ackStore_->ackedSeq(*wconnPtr_, p, config_.nodeId(), streamEpoch_);
+                // We need the peer to ACK up to localOriginSeq_ (the highest local seq broadcast).
+                // Use localOriginSeq_ as the target: the peer must report appliedSeq >= this value.
+                if (localOriginSeq_ > 0 && localOriginSeq_ > targetAcked) {
+                    PendingAckEntry entry;
+                    entry.peer = p;
+                    entry.origin = config_.nodeId();
+                    entry.epoch = streamEpoch_;
+                    entry.targetSeq = localOriginSeq_;
+                    pendingAckWindow_.append(entry);
+                }
+            }
+            if (pendingAckWindow_.isEmpty()) {
+                // Nothing actually needed ACKing (e.g. all already acked) — cancel wait.
+                ackWaiting_ = false;
+                ackDeadlineMs_ = 0;
+            }
         }
         sp->set_value(wrote);
     });
@@ -1503,8 +1594,9 @@ void SyncWorker::enqueueSelectionPush(const SyncSelection& selection,
         FkClosureBuilder builder;
         QList<FkClosureBuilder::Entry> manifest;
         QString buildErr;
+        // H-02 fix: pass SyncSelection flags so includeFkDeps and pruneConsistent are honoured.
         if (!builder.build(rconn, resolved, catalog, cache, config_.maxSelectionSize(), &manifest,
-                           &buildErr)) {
+                           &buildErr, selection.includeFkDeps(), selection.pruneConsistent())) {
             cleanupRconn();
             const char* code =
                 buildErr.contains(QLatin1String("cycle"))   ? err::E_SYNC_FK_CYCLE_UNSUPPORTED

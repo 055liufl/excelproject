@@ -72,7 +72,7 @@ bool BaselineManager::serializeTables(QSqlDatabase& rconn, const QStringList& ta
         }
     }
 
-    // Max local_seq from changelog.
+    // Max local_seq from changelog (diagnostic).
     {
         QSqlQuery seqQ(rconn);
         seqQ.prepare(QStringLiteral("SELECT MAX(local_seq) FROM __sync_changelog"));
@@ -85,6 +85,18 @@ bool BaselineManager::serializeTables(QSqlDatabase& rconn, const QStringList& ta
 
     *out = qCompress(raw, 6);
     return true;
+}
+
+// C-03 fix: query MAX(origin_seq) GROUP BY origin from __sync_changelog and return the map.
+static QHash<QString, qint64> queryOriginMaxSeq(QSqlDatabase& rconn) {
+    QHash<QString, qint64> result;
+    QSqlQuery q(rconn);
+    if (!q.exec(
+            QStringLiteral("SELECT origin, MAX(origin_seq) FROM __sync_changelog GROUP BY origin")))
+        return result;
+    while (q.next())
+        result.insert(q.value(0).toString(), q.value(1).toLongLong());
+    return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -202,6 +214,9 @@ bool BaselineManager::exportBaseline(QSqlDatabase& rconn, const QStringList& tab
     }
     out->data = data;
     out->sourceMaxSeq = maxSeq;
+    // C-03 fix: capture per-origin max origin_seq so applyBaseline can reset applied_vector
+    // to the correct authoritative truncation point.
+    out->originMaxSeq = queryOriginMaxSeq(rconn);
     return true;
 }
 
@@ -258,13 +273,29 @@ bool BaselineManager::applyBaseline(QSqlDatabase& wconn, sqlite3* /*h*/,
         pragmaOn.exec(QStringLiteral("PRAGMA foreign_keys=ON"));
     };
 
-    // Reset applied vector for this origin/epoch.
-    // baselineGeneration = sourceMaxSeq serves as the generation stamp.
-    if (!av.reset(wconn, origin, epoch, art.sourceMaxSeq, err)) {
-        txn.rollback();
-        restoreFk();
-        wrapErr(err);
-        return false;
+    // C-03 fix: reset applied_vector per origin to the authoritative origin_seq captured
+    // at export time.  For origins present in originMaxSeq use resetTo(); for the primary
+    // origin use the supplied origin parameter as fallback.
+    {
+        // Reset the primary origin (the baseline provider).
+        const qint64 primaryOriginSeq = art.originMaxSeq.value(origin, 0);
+        if (!av.resetTo(wconn, origin, epoch, primaryOriginSeq, art.sourceMaxSeq, err)) {
+            txn.rollback();
+            restoreFk();
+            wrapErr(err);
+            return false;
+        }
+        // Reset all other origins captured in the export.
+        for (auto it = art.originMaxSeq.cbegin(); it != art.originMaxSeq.cend(); ++it) {
+            if (it.key() == origin)
+                continue;
+            if (!av.resetTo(wconn, it.key(), epoch, it.value(), art.sourceMaxSeq, err)) {
+                txn.rollback();
+                restoreFk();
+                wrapErr(err);
+                return false;
+            }
+        }
     }
 
     // H-05 fix: pass the caller-supplied schemaFp so DiffEngine::tableDiffs() can match

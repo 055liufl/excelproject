@@ -552,12 +552,16 @@ ImportResult ImportService::run(const ProfileSpec& profile, const SchemaCatalog&
         QSet<int> lookupFailed = applyLookups(ctx.payloads, *routesPtr, lookupCache, catalog,
                                               reader, r, sheetName, &errors);
 
-        // FK injection (§6.6 NULL strict, §6.7 cascade suppression)
+        // H-04 fix: capture failedRouteIndices so write phase skips only affected payloads
+        // (and their descendants) rather than the entire Excel row.
         FkInjector fkInjector;
-        fkInjector.inject(ctx.payloads, *routesPtr, r, sheetName, &errors, std::move(lookupFailed));
+        ctx.failedRouteIndices = fkInjector.inject(ctx.payloads, *routesPtr, r, sheetName, &errors,
+                                                   std::move(lookupFailed));
 
-        // Batch uniqueness check
+        // Batch uniqueness check — only on payloads that did not fail injection
         for (int pi = 0; pi < ctx.payloads.size(); ++pi) {
+            if (ctx.failedRouteIndices.contains(pi))
+                continue;
             const RoutePayload& payload = ctx.payloads[pi];
             bool hasChildren = routeHasChildren(payload.table, *routesPtr);
             batchUniq.check(payload, r, hasChildren, &errors, sheetName);
@@ -625,12 +629,61 @@ ImportResult ImportService::run(const ProfileSpec& profile, const SchemaCatalog&
     SqlBuilder sqlBuilder;
     QHash<QString, QSqlQuery> preparedQueries;
 
+    // H-04 fix: compute descendant closure so that failing an FK-inject on a parent also skips
+    // its children in the write phase.
+    auto buildDescendantFailSet = [](const QVector<RoutePayload>& payloads,
+                                     const QVector<RouteSpec>& routes,
+                                     const QSet<int>& directFailed) -> QSet<int> {
+        if (directFailed.isEmpty())
+            return {};
+        QHash<QString, int> tableToIdx;
+        for (int i = 0; i < payloads.size(); ++i)
+            tableToIdx[payloads[i].table] = i;
+        QSet<int> failed = directFailed;
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (int i = 0; i < routes.size(); ++i) {
+                if (failed.contains(i))
+                    continue;
+                if (!routes[i].parent.isEmpty()) {
+                    const int parentIdx = tableToIdx.value(routes[i].parent, -1);
+                    if (parentIdx >= 0 && failed.contains(parentIdx)) {
+                        failed.insert(i);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        return failed;
+    };
+
     bool writeOk = true;
     for (const auto& ctx : contexts) {
         if (failedExcelRows.contains(ctx.excelRow))
             continue;
 
-        for (const auto& payload : ctx.payloads) {
+        // H-04 fix: determine the routes for this context.
+        const QVector<RouteSpec>* routesForCtx = nullptr;
+        if (profile.mode == ProfileMode::Mixed) {
+            auto it = topoRoutes.find(ctx.classId);
+            if (it != topoRoutes.end())
+                routesForCtx = &it.value();
+        } else {
+            auto it = topoRoutes.find(QString());
+            if (it != topoRoutes.end())
+                routesForCtx = &it.value();
+        }
+
+        QSet<int> skipPayloadIndices;
+        if (routesForCtx && !ctx.failedRouteIndices.isEmpty())
+            skipPayloadIndices =
+                buildDescendantFailSet(ctx.payloads, *routesForCtx, ctx.failedRouteIndices);
+
+        for (int pi = 0; pi < ctx.payloads.size(); ++pi) {
+            if (skipPayloadIndices.contains(pi))
+                continue;
+            const auto& payload = ctx.payloads[pi];
             if (payload.dbColumns.isEmpty())
                 continue;
 

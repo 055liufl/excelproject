@@ -20,6 +20,10 @@
 #include "sync/conflict/RebaseEngine.h"
 #include "sync/conflict/RoutingTable.h"
 #include "sync/schema/SchemaEligibility.h"
+#include "sync/selection/ChunkStreamer.h"
+#include "sync/selection/ConsistencyCache.h"
+#include "sync/selection/FkClosureBuilder.h"
+#include "sync/selection/SelectionResolver.h"
 #include <future>
 
 namespace dbridge::sync {
@@ -297,6 +301,20 @@ void SyncWorker::scanInbox() {
 
     for (const QString& path : found)
         processArtifact(path);
+
+    // M-01 fix: check for artifacts stuck in 'seen' beyond the gap timeout.
+    // These represent persistent gaps in the changeset stream that will never self-heal
+    // without a baseline reset.
+    constexpr qint64 kDefaultGapTimeoutMs = 30 * 1000;  // 30 s; future: from SyncConfig
+    QStringList stale = ledger_->stalePending(*wconnPtr_, kDefaultGapTimeoutMs);
+    if (!stale.isEmpty()) {
+        emit errorOccurred(
+            {err::E_SYNC_GAP, Severity::Error, QStringLiteral("scanInbox"), QString(),
+             QStringLiteral("Changeset gap unresolved after %1ms; %2 artifact(s) pending. "
+                            "Baseline fallback required.")
+                 .arg(kDefaultGapTimeoutMs)
+                 .arg(stale.size())});
+    }
 }
 
 bool SyncWorker::processArtifact(const QString& path) {
@@ -421,6 +439,23 @@ bool SyncWorker::processSelectionPushArtifact(const DecodeResult& dec, const QSt
     const PayloadHeader& hdr = dec.header;
     const SelectionPushBody& body = dec.selection;
 
+    // M-05 fix: ensure __sync_push_progress row exists before any chunk processing.
+    // Insert on first chunk arrival (ON CONFLICT DO NOTHING is idempotent for subsequent chunks).
+    if (!hdr.pushId.isEmpty()) {
+        QSqlQuery ins(*wconnPtr_);
+        ins.prepare(
+            QStringLiteral("INSERT OR IGNORE INTO __sync_push_progress "
+                           "(push_id, origin, peer, total_chunks, schema_ver, status, updated_ms) "
+                           "VALUES (?, ?, ?, ?, ?, 'receiving', ?)"));
+        ins.addBindValue(hdr.pushId);
+        ins.addBindValue(hdr.origin);
+        ins.addBindValue(config_.nodeId());
+        ins.addBindValue(body.totalChunks > 0 ? body.totalChunks : 1);
+        ins.addBindValue(hdr.schemaVer);
+        ins.addBindValue(QDateTime::currentMSecsSinceEpoch());
+        ins.exec();  // non-fatal if table doesn't exist yet (pre-DDL edge case)
+    }
+
     // J-04: Reject the entire push if the sender's schema version has moved.
     if (hdr.schemaVer != config_.schemaVersion()) {
         QSqlQuery q(*wconnPtr_);
@@ -532,10 +567,58 @@ bool SyncWorker::processAckArtifact(const QString& path, const QString& name) {
         }
         return true;
     }
-    // Try chunk ACK
+    // C-05 fix: process PushChunkAck — record per-chunk status and check for push completion.
     PushChunkAck chunkAck;
     if (codec_->decodeChunkAck(data, &chunkAck)) {
-        // Record chunk ack in push_chunk_progress (full implementation deferred).
+        if (chunkAck.pushId.isEmpty())
+            return false;
+
+        const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+
+        // Record this chunk's ACK in push_chunk_progress.
+        QSqlQuery markQ(*wconnPtr_);
+        markQ.prepare(
+            QStringLiteral("INSERT INTO __sync_push_chunk_progress "
+                           "(push_id, chunk_seq, status, checksum, applied_ms) "
+                           "VALUES (?, ?, 'applied', ?, ?) "
+                           "ON CONFLICT(push_id, chunk_seq) DO UPDATE SET "
+                           "  status='applied', checksum=excluded.checksum, "
+                           "  applied_ms=excluded.applied_ms"));
+        markQ.addBindValue(chunkAck.pushId);
+        markQ.addBindValue(chunkAck.chunkSeq);
+        markQ.addBindValue(chunkAck.checksum);
+        markQ.addBindValue(nowMs);
+        markQ.exec();
+
+        // Check whether all chunks have been ACKed.
+        if (chunkAck.totalChunks > 0) {
+            QSqlQuery countQ(*wconnPtr_);
+            countQ.prepare(
+                QStringLiteral("SELECT COUNT(*) FROM __sync_push_chunk_progress "
+                               "WHERE push_id=? AND status='applied'"));
+            countQ.addBindValue(chunkAck.pushId);
+            if (countQ.exec() && countQ.next()) {
+                int ackedCount = countQ.value(0).toInt();
+                if (ackedCount >= chunkAck.totalChunks) {
+                    // All chunks ACKed — mark push_progress done and complete foreground op.
+                    QSqlQuery doneQ(*wconnPtr_);
+                    doneQ.prepare(
+                        QStringLiteral("UPDATE __sync_push_progress "
+                                       "SET status='done', updated_ms=? WHERE push_id=?"));
+                    doneQ.addBindValue(nowMs);
+                    doneQ.addBindValue(chunkAck.pushId);
+                    doneQ.exec();
+
+                    // Transition foreground state to Completed (design §5.4 / FR-11).
+                    if (ackWaiting_.exchange(false)) {
+                        SyncProgress p;
+                        p.state = SyncState::Completed;
+                        p.percent = 100;
+                        emit progressUpdated(p);
+                    }
+                }
+            }
+        }
         return true;
     }
     return false;
@@ -566,8 +649,12 @@ void SyncWorker::broadcastTopeer(const QString& peer) {
     qint64 bytesSent = 0;
     qint64 lastSentLocal = afterLocalSeq;
     for (const auto& entry : entries) {
-        // Routing check (pass afterLocalSeq as the baseline acked seq for routing decisions).
-        if (!routing_->shouldRoute(peer, entry.origin, entry.originSeq, afterLocalSeq))
+        // H-02 fix: shouldRoute must compare entry.originSeq against the per-(peer,origin)
+        // acked_seq, NOT against afterLocalSeq which is a local_seq watermark in a different
+        // sequence namespace.  Mixing them causes phantom misses and double-sends.
+        const qint64 peerOriginAcked =
+            ackStore_->ackedSeq(*wconnPtr_, peer, entry.origin, streamEpoch_);
+        if (!routing_->shouldRoute(peer, entry.origin, entry.originSeq, peerOriginAcked))
             continue;
 
         // I-16: Rebase the changeset onto any stored rebase buffer before broadcast.
@@ -580,7 +667,9 @@ void SyncWorker::broadcastTopeer(const QString& peer) {
                                  &rebaseErr)) {
                 changesetToSend = rebased;
             } else {
-                emit errorOccurred({err::E_SYNC_REBASE_FAILED, Severity::Warning,
+                // M-03 fix: rebase failure is Error (not Warning) so SyncEngine's
+                // onWorkerError transitions foreground state to Failed when applicable.
+                emit errorOccurred({err::E_SYNC_REBASE_FAILED, Severity::Error,
                                     QStringLiteral("broadcast"), peer, rebaseErr});
                 continue;  // skip this entry — don't send un-rebased
             }
@@ -703,6 +792,126 @@ ImportResult SyncWorker::submitImportSync(const ImportOptions& opts, const QStri
 void SyncWorker::startAckWait() {
     ackWaiting_ = true;
     ackDeadlineMs_ = QDateTime::currentMSecsSinceEpoch() + config_.ackMaxDelayMs();
+}
+
+// C-02: Enqueue an immediate drain cycle on the worker thread.
+void SyncWorker::enqueueDrain() {
+    enqueue([this]() {
+        scanInbox();  // apply any pending inbound payloads
+        broadcast();  // pack & write outbox artifacts for all peers
+    });
+}
+
+// C-01: Enqueue a selection push — SelectionResolver → FkClosureBuilder → ChunkStreamer
+//        → PayloadCodec → OutboxWriter (design §5.5 / §7.3).
+void SyncWorker::enqueueSelectionPush(const SyncSelection& selection,
+                                      const detail::SchemaCatalog& catalog) {
+    enqueue([this, selection, catalog]() {
+        if (!wconnPtr_) {
+            emit errorOccurred({err::E_SYNC_INIT, Severity::Error, QStringLiteral("syncSelected"),
+                                QString(), QStringLiteral("Worker wconn not ready")});
+            return;
+        }
+
+        // Step 1: open a short-lived read-only connection for snapshot reads.
+        const QString rConnName = config_.sqlitePath() + QStringLiteral("_sel_ro_") +
+                                  QUuid::createUuid().toString(QUuid::WithoutBraces).left(8);
+        QSqlDatabase rconn = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), rConnName);
+        rconn.setDatabaseName(config_.sqlitePath());
+        auto cleanupRconn = [&] {
+            if (rconn.isOpen())
+                rconn.close();
+            QSqlDatabase::removeDatabase(rConnName);
+        };
+        if (!rconn.open()) {
+            cleanupRconn();
+            emit errorOccurred({err::E_SYNC_INIT, Severity::Error, QStringLiteral("syncSelected"),
+                                QString(), QStringLiteral("Cannot open read connection")});
+            return;
+        }
+
+        // Step 2: resolve PK set.
+        SelectionResolver resolver;
+        QList<SelectionResolver::ResolveResult> resolved;
+        QString resolveErr;
+        if (!resolver.resolvePk(rconn, selection, &resolved, &resolveErr)) {
+            cleanupRconn();
+            emit errorOccurred({err::E_SYNC_SELECTION_EMPTY, Severity::Error,
+                                QStringLiteral("syncSelected"), QString(), resolveErr});
+            return;
+        }
+        if (resolved.isEmpty()) {
+            cleanupRconn();
+            emit errorOccurred({err::E_SYNC_SELECTION_EMPTY, Severity::Error,
+                                QStringLiteral("syncSelected"), QString(),
+                                QStringLiteral("Selection resolved to zero rows")});
+            return;
+        }
+
+        // Step 3: FK closure + topo sort.
+        ConsistencyCache cache;
+        FkClosureBuilder builder;
+        QList<FkClosureBuilder::Entry> manifest;
+        QString buildErr;
+        if (!builder.build(rconn, resolved, catalog, cache, config_.maxSelectionSize(), &manifest,
+                           &buildErr)) {
+            cleanupRconn();
+            const char* code =
+                buildErr.contains(QLatin1String("cycle"))   ? err::E_SYNC_FK_CYCLE_UNSUPPORTED
+                : buildErr.contains(QLatin1String("large")) ? err::E_SYNC_SELECTION_TOO_LARGE
+                                                            : err::E_SYNC_FK_CLOSURE_MISSING;
+            emit errorOccurred(
+                {code, Severity::Error, QStringLiteral("syncSelected"), QString(), buildErr});
+            return;
+        }
+        cleanupRconn();  // release read snapshot promptly (design §5.5/E-11)
+
+        // Step 4: chunk into outbox artifacts.
+        ChunkStreamer streamer;
+        QList<ChunkStreamer::Chunk> chunks;
+        QString streamErr;
+        if (!streamer.stream(manifest, config_.nodeId(), QString(), config_.pushChunkBudgetBytes(),
+                             *codec_, &chunks, &streamErr)) {
+            emit errorOccurred({err::E_SYNC_SELECTION_TOO_LARGE, Severity::Error,
+                                QStringLiteral("syncSelected"), QString(), streamErr});
+            return;
+        }
+
+        // Step 5: encode and write each chunk to the outbox.
+        for (const ChunkStreamer::Chunk& chunk : chunks) {
+            PayloadHeader hdr;
+            hdr.origin = config_.nodeId();
+            hdr.originSeq = 0;  // SelectionPush has no changelog seq
+            hdr.streamEpoch = streamEpoch_;
+            hdr.schemaVer = config_.schemaVersion();
+            hdr.pushId = chunk.pushId;
+            hdr.chunkSeq = chunk.chunkSeq;
+            hdr.totalChunks = chunk.totalChunks;
+
+            SelectionPushBody body;
+            body.totalChunks = chunk.totalChunks;
+            body.frozenEntries = chunk.entries;
+            for (const QVariantMap& row : chunk.rows)
+                body.rows.append(row);
+
+            QByteArray payload = codec_->encodeSelectionPush(hdr, body);
+            const QString artifactName = QStringLiteral("%1_sel_%2_%3.payload")
+                                             .arg(config_.nodeId(), chunk.pushId)
+                                             .arg(chunk.chunkSeq, 4, 10, QLatin1Char('0'));
+            QString writeErr;
+            if (!outbox_->write(artifactName, payload, &writeErr)) {
+                emit errorOccurred({err::E_SYNC_TRANSPORT, Severity::Error,
+                                    QStringLiteral("syncSelected"), QString(), writeErr});
+                return;
+            }
+        }
+
+        // Report outbox write as "Exporting" — ACK wait was armed by SyncEngine.
+        SyncProgress p;
+        p.state = SyncState::Exporting;
+        p.percent = -1;
+        emit progressUpdated(p);
+    });
 }
 
 }  // namespace dbridge::sync

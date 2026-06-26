@@ -62,18 +62,20 @@ QString SqlBuilder::buildAutoJoinSelect(const QVector<RouteSpec>& routes,
         }
 
         if (&route != &routes[0] && !route.fkInject.isEmpty()) {
-            // Use the first fkInject group to determine the JOIN condition for export.
-            // For composite keys, AND-join all pairs in the group.
-            const FkInjectSpec& fk = route.fkInject[0];
-            QStringList onParts;
-            for (const auto& pair : fk.pairs) {
-                onParts.append(route.table + QLatin1Char('.') + pair.second +
-                               QStringLiteral(" = ") + fk.fromTable + QLatin1Char('.') +
-                               pair.first);
-            }
-            if (!onParts.isEmpty()) {
-                joinClauses.append(QStringLiteral("LEFT JOIN ") + route.table +
-                                   QStringLiteral(" ON ") + onParts.join(QStringLiteral(" AND ")));
+            // M-06 fix: iterate ALL fkInject groups (not just [0]).
+            // Each group represents a distinct parent table; generate one JOIN per group.
+            // Multiple groups on the same child route yield multiple JOINs (e.g. multi-parent).
+            for (const FkInjectSpec& fk : route.fkInject) {
+                QStringList onParts;
+                for (const auto& pair : fk.pairs) {
+                    onParts.append(QStringLiteral("\"%1\".\"%2\" = \"%3\".\"%4\"")
+                                       .arg(route.table, pair.second, fk.fromTable, pair.first));
+                }
+                if (!onParts.isEmpty()) {
+                    joinClauses.append(
+                        QStringLiteral("LEFT JOIN \"%1\" ON %2")
+                            .arg(route.table, onParts.join(QStringLiteral(" AND "))));
+                }
             }
         }
     }

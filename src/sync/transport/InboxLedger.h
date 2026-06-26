@@ -28,6 +28,10 @@ class InboxLedger {
 
     // Return all artifact names with status == 'seen' (pending consumption).
     QStringList pendingSeen(QSqlDatabase& db);
+
+    // M-01: Return artifact names that have been 'seen' longer than gapTimeoutMs.
+    // These represent gaps that should trigger E_SYNC_GAP / baseline fallback.
+    QStringList stalePending(QSqlDatabase& db, qint64 gapTimeoutMs);
 };
 
 }  // namespace dbridge::sync

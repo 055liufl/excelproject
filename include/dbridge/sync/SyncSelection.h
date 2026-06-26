@@ -55,7 +55,11 @@ class DBRIDGE_EXPORT SyncSelection::Builder {
             sel_.records_.append({table, pk});
         return *this;
     }
+    // H-01 fix: raw SQL WHERE is not yet supported (design §4.4: MVP = PK set only).
+    // Storing the expression to produce a consistent error at build() time (not silently).
     Builder& addWhere(const QString& table, const QString& whereExpr) {
+        if (!whereExpr.isEmpty())
+            rawWhereAttempts_.append(table);
         sel_.whereClauses_.append({table, whereExpr});
         return *this;
     }
@@ -69,6 +73,16 @@ class DBRIDGE_EXPORT SyncSelection::Builder {
     }
 
     SyncSelection build(QString* err = nullptr) {
+        // H-01 fix: reject raw-SQL addWhere() calls — only PK-set selection is supported in MVP.
+        if (!rawWhereAttempts_.isEmpty()) {
+            if (err)
+                *err = QStringLiteral(
+                           "E_SYNC_SELECTION_EMPTY: addWhere() with raw SQL is not "
+                           "supported in MVP (design §4.4); use addRecord()/addRecords() "
+                           "for table '%1'")
+                           .arg(rawWhereAttempts_.first());
+            return SyncSelection{};
+        }
         if (sel_.isEmpty()) {
             if (err)
                 *err = QStringLiteral("E_SYNC_SELECTION_EMPTY: selection is empty");
@@ -78,6 +92,7 @@ class DBRIDGE_EXPORT SyncSelection::Builder {
 
    private:
     SyncSelection sel_;
+    QStringList rawWhereAttempts_;
 };
 
 }  // namespace dbridge::sync

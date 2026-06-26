@@ -195,7 +195,71 @@ WriteResult CapturedWriteTemplate::branchBC(const WriteParams& p) {
         return result;
     }
 
-    // Execute row mutations via UpsertExecutor (I-08: replaces hand-rolled execMutation loop).
+    // H-05 fix: pre-scan row existence and old-hash BEFORE the UPSERT.
+    // After UPSERT the old row is gone; reading "old" content post-write gives the new value.
+    struct PreScan {
+        bool rowExists = false;
+        QByteArray beforeHash;  // empty when row didn't exist (INSERT case)
+        QByteArray pkHash;
+        QByteArray afterHash;
+    };
+    auto buildWhereParts = [](const RowMutation& m) {
+        QStringList parts;
+        for (const QString& pk : m.pkColumns)
+            parts << QStringLiteral("\"%1\"=?").arg(pk);
+        return parts;
+    };
+    auto bindPkValues = [](QSqlQuery& q, const RowMutation& m) {
+        for (const QString& pk : m.pkColumns) {
+            int idx = m.columns.indexOf(pk);
+            if (idx >= 0)
+                q.addBindValue(m.values[idx]);
+        }
+    };
+
+    QList<PreScan> preScan;
+    preScan.reserve(p.mutations.size());
+    for (const RowMutation& m : p.mutations) {
+        PreScan ps;
+        // pkHash
+        QByteArray pkMat;
+        for (int i = 0; i < m.columns.size(); ++i) {
+            if (m.pkColumns.contains(m.columns[i])) {
+                pkMat.append(m.values[i].toString().toUtf8());
+                pkMat.append('\0');
+            }
+        }
+        ps.pkHash = QCryptographicHash::hash(pkMat, QCryptographicHash::Sha256).left(16);
+        // afterHash (from new values in RowMutation)
+        QByteArray contentMat;
+        for (const QVariant& v : m.values) {
+            contentMat.append(v.toString().toUtf8());
+            contentMat.append('\0');
+        }
+        ps.afterHash = QCryptographicHash::hash(contentMat, QCryptographicHash::Sha256).left(16);
+        // rowExists + beforeHash: query BEFORE UPSERT
+        if (!m.pkColumns.isEmpty() && !m.table.isEmpty()) {
+            QStringList wp = buildWhereParts(m);
+            QSqlQuery existQ(wconn_);
+            existQ.prepare(QStringLiteral("SELECT * FROM \"%1\" WHERE %2 LIMIT 1")
+                               .arg(m.table, wp.join(QLatin1String(" AND "))));
+            bindPkValues(existQ, m);
+            if (existQ.exec() && existQ.next()) {
+                ps.rowExists = true;
+                QByteArray oldMat;
+                QSqlRecord rec = existQ.record();
+                for (int ci = 0; ci < rec.count(); ++ci) {
+                    oldMat.append(existQ.value(ci).toString().toUtf8());
+                    oldMat.append('\0');
+                }
+                ps.beforeHash =
+                    QCryptographicHash::hash(oldMat, QCryptographicHash::Sha256).left(16);
+            }
+        }
+        preScan.append(ps);
+    }
+
+    // Execute row mutations via UpsertExecutor (I-08).
     UpsertExecutor upsertEx;
     QList<dbridge::RowError> rowErrors;
     if (!upsertEx.apply(wconn_, p.mutations, &rowErrors, &err)) {
@@ -208,7 +272,7 @@ WriteResult CapturedWriteTemplate::branchBC(const WriteParams& p) {
 
     // Seal changeset into changelog
     qint64 localSeq = 0;
-    qint64 parentSeq = 0;  // caller may enrich later
+    qint64 parentSeq = 0;
     qint64 originSeq = isInbound ? p.seq : 0;
     const QString origin = isInbound ? p.origin : nodeId_;
     const qint64 epoch = isInbound ? p.epoch : streamEpoch_;
@@ -237,81 +301,23 @@ WriteResult CapturedWriteTemplate::branchBC(const WriteParams& p) {
         upsert.exec();
     }
 
-    // Update table_state from RowMutations (I-08).
+    // Update table_state from RowMutations using pre-scanned (correct) old-row info (H-05).
     QList<TableMutation> tmuts;
     tmuts.reserve(p.mutations.size());
-    for (const RowMutation& m : p.mutations) {
+    for (int i = 0; i < p.mutations.size(); ++i) {
+        const RowMutation& m = p.mutations[i];
+        const PreScan& ps = preScan[i];
         TableMutation tm;
         tm.table = m.table;
-        // J-16: Determine insert vs update by querying whether the row exists before UPSERT.
-        // For DoNothing mode, treat as potential insert (safe: no-op if row exists).
-        // For DoUpdate mode, check if PK already exists to distinguish insert from update.
-        bool rowExists = false;
-        if (!m.pkColumns.isEmpty() && !m.table.isEmpty()) {
-            QStringList whereParts;
-            for (const QString& pk : m.pkColumns)
-                whereParts << QStringLiteral("\"%1\"=?").arg(pk);
-            QSqlQuery existQ(wconn_);
-            existQ.prepare(QStringLiteral("SELECT 1 FROM \"%1\" WHERE %2 LIMIT 1")
-                               .arg(m.table, whereParts.join(QLatin1String(" AND "))));
-            for (const QString& pk : m.pkColumns) {
-                int idx = m.columns.indexOf(pk);
-                if (idx >= 0)
-                    existQ.addBindValue(m.values[idx]);
-            }
-            rowExists = existQ.exec() && existQ.next();
-        }
-        tm.isInsert = !rowExists;
+        tm.isInsert = !ps.rowExists;
         tm.isDelete = false;
-
-        // Build pkHash from PK columns.
-        QByteArray pkMat;
-        for (int i = 0; i < m.columns.size(); ++i) {
-            if (m.pkColumns.contains(m.columns[i])) {
-                pkMat.append(m.values[i].toString().toUtf8());
-                pkMat.append('\0');
-            }
-        }
-        QByteArray pkH = QCryptographicHash::hash(pkMat, QCryptographicHash::Sha256).left(16);
-        tm.pkHash = QString::fromLatin1(pkH.toHex());
-
-        // Content hash from all values.
-        QByteArray contentMat;
-        for (const QVariant& v : m.values) {
-            contentMat.append(v.toString().toUtf8());
-            contentMat.append('\0');
-        }
-        tm.afterHash = QCryptographicHash::hash(contentMat, QCryptographicHash::Sha256).left(16);
-
-        // For update: fetch old row hash to enable correct checksum delta.
-        if (rowExists && !m.pkColumns.isEmpty() && !tm.isInsert) {
-            QStringList whereParts;
-            for (const QString& pk : m.pkColumns)
-                whereParts << QStringLiteral("\"%1\"=?").arg(pk);
-            QSqlQuery oldQ(wconn_);
-            oldQ.prepare(QStringLiteral("SELECT * FROM \"%1\" WHERE %2 LIMIT 1")
-                             .arg(m.table, whereParts.join(QLatin1String(" AND "))));
-            for (const QString& pk : m.pkColumns) {
-                int idx = m.columns.indexOf(pk);
-                if (idx >= 0)
-                    oldQ.addBindValue(m.values[idx]);
-            }
-            if (oldQ.exec() && oldQ.next()) {
-                QByteArray oldMat;
-                QSqlRecord rec = oldQ.record();
-                for (int ci = 0; ci < rec.count(); ++ci) {
-                    oldMat.append(oldQ.value(ci).toString().toUtf8());
-                    oldMat.append('\0');
-                }
-                tm.beforeHash =
-                    QCryptographicHash::hash(oldMat, QCryptographicHash::Sha256).left(16);
-            }
-        }
+        tm.pkHash = QString::fromLatin1(ps.pkHash.toHex());
+        tm.afterHash = ps.afterHash;
+        tm.beforeHash = ps.beforeHash;  // correctly from pre-UPSERT scan
         tmuts.append(tm);
     }
 
     if (!tmuts.isEmpty()) {
-        // Non-fatal: log swallowed; table_state can be rebuilt from baseline.
         ts_.applyMutations(wconn_, tmuts, isInbound ? p.epoch : streamEpoch_,
                            isInbound ? p.schemaFp : schemaFp_, isInbound ? p.seq : 0, &err);
         err.clear();

@@ -11,6 +11,7 @@
 #include "schema/SchemaIntrospector.h"
 #include "service/ExportService.h"
 #include "service/ImportService.h"
+#include <atomic>
 
 namespace dbridge::detail {
 
@@ -32,7 +33,8 @@ class DataBridgePrivate {
     QSqlDatabase db_;
     QString connName_;
     bool dbOpen_ = false;
-    bool syncActive_ = false;  // J-09: set by SyncEngine; blocks importExcel() direct writes
+    std::atomic<bool> syncActive_{
+        false};  // L-01 fix: atomic to avoid data race between SyncEngine init and importExcel
     SchemaCatalog catalog_;
     QHash<QString, ProfileSpec> profiles_;
 

@@ -89,4 +89,20 @@ QStringList InboxLedger::pendingSeen(QSqlDatabase& db) {
     return result;
 }
 
+// M-01 fix: surface artifacts stuck in 'seen' longer than the gap timeout threshold.
+QStringList InboxLedger::stalePending(QSqlDatabase& db, qint64 gapTimeoutMs) {
+    const qint64 cutoff = QDateTime::currentMSecsSinceEpoch() - gapTimeoutMs;
+    QStringList result;
+    QSqlQuery q(db);
+    q.prepare(
+        QStringLiteral("SELECT artifact_name FROM __sync_inbox_ledger "
+                       "WHERE status = 'seen' AND first_seen_ms < ?"));
+    q.addBindValue(cutoff);
+    if (!q.exec())
+        return result;
+    while (q.next())
+        result.append(q.value(0).toString());
+    return result;
+}
+
 }  // namespace dbridge::sync

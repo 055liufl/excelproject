@@ -140,15 +140,10 @@ bool SyncEngine::sync(QString* err) {
     // The worker task triggers a broadcast cycle; ACK arrival or timeout drives state to
     // Completed/Failed via onWorkerError (E_SYNC_ACK_TIMEOUT) in the main loop.
     setProgress(SyncState::Exporting, -1);
-    worker_->startAckWait();
-    worker_->enqueue([this]() {
-        // Trigger an immediate broadcast cycle (worker loop would do it on next interval).
-        // Do NOT set Completed here — that happens when ACK arrives.
-        // DO release gate here so the calling thread is unblocked; state stays Exporting.
-        ctx_->gate.release();
-        // No Completed yet: caller polls state() and waits for ACK-driven transition.
-    });
-    // Note: gate released inside worker task; do NOT release here.
+    // C-02 fix: enqueue a real manual drain — scanInbox + broadcast before arming ACK timer.
+    worker_->enqueueDrain();
+    worker_->startAckWait();  // arm timeout AFTER drain is queued
+    // Gate released by ACK arrival (Completed) or timeout (Failed) via onWorkerError.
     return true;
 }
 
@@ -202,17 +197,21 @@ bool SyncEngine::syncSelected(const SyncSelection& selection, QString* err) {
     if (!ctx_->gate.tryAcquire(err))
         return false;
 
-    // Enqueue selection push resolution on the worker thread
-    // (full implementation would call SelectionResolver + FkClosureBuilder + ChunkStreamer)
-    // I-05 fix: capture selection by value to avoid dangling reference after return.
-    worker_->enqueue([this, sel = selection]() {
-        Q_UNUSED(sel)
-        // Placeholder: actual selection push logic goes here via SyncSelectionPushService
-        // (assembles SelectionResolver -> FkClosureBuilder -> ChunkStreamer -> OutboxWriter)
-        Q_UNUSED(this)
-    });
+    // C-01 fix: snapshot the catalog on the calling thread (safe), then enqueue the full
+    // SelectionResolver → FkClosureBuilder → ChunkStreamer → OutboxWriter chain on the worker.
+    detail::SchemaCatalog catalogSnapshot;
+    QString snapErr;
+    if (!bridge_.snapshotProfileCatalog(QString(), nullptr, &catalogSnapshot, &snapErr)) {
+        ctx_->gate.release();
+        if (err)
+            *err = QStringLiteral("Cannot snapshot schema catalog: ") + snapErr;
+        return false;
+    }
 
-    ctx_->gate.release();
+    setProgress(SyncState::Capturing);
+    worker_->startAckWait();  // arm ACK deadline before enqueueing so no race window
+    worker_->enqueueSelectionPush(selection, catalogSnapshot);
+    // Gate stays held until ACK (Completed) or timeout (Failed) via onWorkerError.
     return true;
 }
 

@@ -1,6 +1,7 @@
 #pragma once
 #include "dbridge/DataBridge.h"
 #include "dbridge/sync/SyncConfig.h"
+#include "dbridge/sync/SyncSelection.h"
 #include "dbridge/sync/SyncTypes.h"
 
 #include <QMutex>
@@ -74,6 +75,14 @@ class SyncWorker : public QThread {
     // I-19: Notify worker that a foreground sync() is waiting for ACK.
     // The worker will emit E_SYNC_ACK_TIMEOUT if no ACK arrives within ackMaxDelayMs.
     void startAckWait();
+
+    // C-02: Enqueue an immediate drain cycle (scan inbox + broadcast) on the worker.
+    void enqueueDrain();
+
+    // C-01: Enqueue a selection push on the worker thread.
+    // catalog is a pre-snapshot from the calling thread (safe cross-thread).
+    // Returns immediately; progress/errors are reported via signals.
+    void enqueueSelectionPush(const SyncSelection& selection, const detail::SchemaCatalog& catalog);
 
    signals:
     void progressUpdated(dbridge::sync::SyncProgress p);

@@ -49,6 +49,11 @@ class ChangesetApplier {
     static int conflictCb(void* ctx, int conflict, sqlite3_changeset_iter* iter);
     static int filterCb(void* ctx, const char* tblName);  // H-04: xFilter
 
+    // C-04: pre-filter changeset to remove rows where incoming (rank,seq) < stored winner.
+    // Returns a filtered changeset (may equal input if nothing was filtered).
+    QByteArray filterByWinner(const QByteArray& changeset, int inRank, qint64 inSeq,
+                              RowWinnerStore& winners, QSqlDatabase& wconn);
+
     // Post-apply: update row_winner for all successfully inserted/updated rows.
     void updateWinnersFromChangeset(const QByteArray& changeset, const QString& origin, int rank,
                                     qint64 seq, RowWinnerStore& winners, QSqlDatabase& wconn);

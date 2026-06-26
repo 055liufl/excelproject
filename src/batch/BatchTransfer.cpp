@@ -8,6 +8,8 @@
 #include <QUuid>
 #include <QtConcurrent/QtConcurrent>
 
+#include "profile/ProfileValidator.h"
+#include "service/ErrorCollector.h"
 #include "service/ExportService.h"
 #include "service/ImportService.h"
 #include "sync/SyncContext.h"
@@ -257,6 +259,27 @@ void BatchTransfer::runExport(const ExportOptions& opts, const QString& dbPath,
     }
 
     ExportResult result;
+
+    // H-03 fix: validate the export profile before opening a DB connection.
+    // BatchTransfer previously bypassed the export-mode profile validation that
+    // DataBridge::exportExcel performs, allowing invalid profiles (bad column order, missing
+    // tables, etc.) to reach ExportService and produce confusing downstream errors.  Validate here
+    // and surface errors early.
+    {
+        detail::ErrorCollector valErrors;
+        detail::ProfileValidator validator;
+        if (!validator.validateForExport(profile, catalog, &valErrors)) {
+            for (const auto& e : valErrors.list())
+                result.errors.append(e);
+            QMutexLocker lock(&mutex_);
+            exportResult_ = result;
+            exportErrors_ = result.errors;
+            exportProgress_.percent = 100;
+            exportState_ = TransferState::Failed;
+            return;
+        }
+    }
+
     const QString connName =
         QStringLiteral("dbridge_bt_export_") + QUuid::createUuid().toString(QUuid::WithoutBraces);
     {

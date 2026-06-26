@@ -75,14 +75,15 @@ bool SchemaEligibility::verify(QSqlDatabase& db, const QStringList& syncTables,
             reject(QStringLiteral("PRIMARY KEY column(s) are nullable"));
             continue;
         }
-        // M-03 fix: return a distinct error code for composite PK rejection so callers can
-        // detect this specific limitation rather than a generic unsupported-schema failure.
+        // M-02 fix: composite PK rejection must clearly state the MVP limitation so developers
+        // understand this is a known constraint, not a general sync bug.
         if (info.pkCols.size() > 1) {
-            reject(QLatin1String(err::E_SYNC_COMPOSITE_PK_NOT_SUPPORTED) +
-                   QStringLiteral(": composite PRIMARY KEY (%1 columns) is not supported for "
-                                  "sync; add a surrogate single-column PK or use a UNIQUE index "
-                                  "instead")
-                       .arg(info.pkCols.size()));
+            reject(
+                QLatin1String(err::E_SYNC_COMPOSITE_PK_NOT_SUPPORTED) +
+                QStringLiteral(": composite PRIMARY KEY (%1 columns) is not supported — "
+                               "MVP phase supports only single-column INTEGER or TEXT PRIMARY KEY; "
+                               "add a surrogate single-column PK or use a UNIQUE index instead")
+                    .arg(info.pkCols.size()));
             continue;
         }
         if (!hasUpsertTarget(db, tbl, &localErr)) {

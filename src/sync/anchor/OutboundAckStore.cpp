@@ -110,21 +110,21 @@ bool OutboundAckStore::updateLastSent(QSqlDatabase& db, const QString& peer, qin
 }
 
 qint64 OutboundAckStore::minUnackedLocalSeq(QSqlDatabase& db, const QString& peer, qint64 epoch) {
-    // For each origin that this peer has started ACKing, find the local_seq of the first
-    // changelog entry whose origin_seq > acked_seq (i.e. not yet confirmed).
-    // Return the minimum of those, minus 1, so readRangeAll(afterLocalSeq=result) will
-    // include all un-ACKed entries.  If no ACK rows exist, return -1 (read from beginning).
+    // C-02 fix: use LEFT JOIN so origins without an ACK row are treated as acked_seq = -1
+    // (i.e. nothing has been confirmed yet) rather than being silently excluded.
+    // With an inner JOIN, an origin that never appeared in outbound_ack would be missed
+    // entirely, causing broadcastToPeer to skip its changelog entries.
     QSqlQuery q(db);
     q.prepare(
         QStringLiteral("SELECT COALESCE(MIN(cl.local_seq), -1) - 1 "
                        "FROM __sync_changelog cl "
-                       "JOIN __sync_outbound_ack oa "
+                       "LEFT JOIN __sync_outbound_ack oa "
                        "  ON oa.origin = cl.origin "
                        "  AND oa.stream_epoch = cl.stream_epoch "
                        "  AND oa.peer = ? "
                        "  AND oa.origin != '__broadcast__' "
                        "WHERE cl.stream_epoch = ? "
-                       "  AND cl.origin_seq > oa.acked_seq"));
+                       "  AND cl.origin_seq > COALESCE(oa.acked_seq, -1)"));
     q.addBindValue(peer);
     q.addBindValue(epoch);
     if (!q.exec() || !q.next())

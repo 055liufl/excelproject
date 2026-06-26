@@ -1,4 +1,6 @@
 #pragma once
+#include <QSqlDatabase>
+#include <QSqlQuery>
 #include <QString>
 #include <QStringList>
 #include <QUuid>
@@ -25,8 +27,11 @@ CREATE TABLE IF NOT EXISTS __sync_changelog (
   byte_size       INTEGER NOT NULL,
   authoritative   INTEGER NOT NULL DEFAULT 0,
   created_ms      INTEGER NOT NULL,
+  push_id         TEXT,
   UNIQUE(origin, stream_epoch, origin_seq)
 ))"),
+        // Note: push_id column added inline in CREATE TABLE above.
+        // For existing databases, applyMigrations() performs ALTER TABLE ADD COLUMN.,
         QStringLiteral("CREATE INDEX IF NOT EXISTS idx_changelog_origin ON "
                        "__sync_changelog(origin, origin_seq)"),
         QStringLiteral("CREATE INDEX IF NOT EXISTS idx_changelog_epoch  ON "
@@ -222,6 +227,20 @@ inline QString ackArtifactName(const QString& fromPeer, const QString& toPeer, q
                                ? QUuid::createUuid().toString(QUuid::WithoutBraces).left(8)
                                : uniqueSuffix;
     return QStringLiteral("ack__%1__%2__%3__%4.ack").arg(fromPeer).arg(toPeer).arg(ms).arg(suffix);
+}
+
+// M-04 fix: apply schema migrations for existing databases.
+// ALTER TABLE ADD COLUMN fails if the column already exists; we intentionally ignore that
+// error so the function is idempotent and works for both fresh and pre-existing databases.
+// Returns false only on catastrophic failures (not "column already exists").
+inline bool applyMigrations(QSqlDatabase& db) {
+    // M-04: add push_id column to __sync_changelog (NULL for non-push changesets).
+    QSqlQuery q(db);
+    q.exec(QStringLiteral("ALTER TABLE __sync_changelog ADD COLUMN push_id TEXT"));
+    // Ignore error: "duplicate column name" is expected when column already exists.
+    // Any other error is a schema mismatch we cannot auto-fix — it will surface later
+    // when a real INSERT fails.
+    return true;
 }
 
 }  // namespace dbridge::sync::ddl

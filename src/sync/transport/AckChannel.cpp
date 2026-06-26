@@ -4,6 +4,7 @@
 #include <QStringList>
 
 #include "../SyncDDL.h"
+#include <limits>
 
 namespace dbridge::sync {
 
@@ -67,6 +68,15 @@ bool AckChannel::maybeFlush(PayloadCodec& codec, QString* err) {
     if (nowMs - lastFlushMs_ >= ackMaxDelayMs_)
         return flush(codec, err);
     return true;
+}
+
+qint64 AckChannel::nextDeadlineMs() const {
+    // M-03 fix: if there are no pending ACKs, no deadline — return INT64_MAX so the main loop
+    // uses its normal broadcastIntervalMs sleep.  When ACKs are pending, return the time at
+    // which they must be flushed to meet the ackMaxDelayMs SLA.
+    if (pendingChangeset_.isEmpty() && pendingChunk_.isEmpty())
+        return std::numeric_limits<qint64>::max();
+    return lastFlushMs_ + ackMaxDelayMs_;
 }
 
 }  // namespace dbridge::sync

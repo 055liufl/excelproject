@@ -362,6 +362,43 @@ WriteResult CapturedWriteTemplate::branchBC(const WriteParams& p) {
             result.errorMsg = upsert.lastError().text();
             return result;
         }
+
+        // H-01 fix: after marking this chunk applied, check whether ALL chunks for this push
+        // are now applied. If so, promote push_progress.status to 'done'.
+        // This is critical for center nodes which receive every chunk from the originator
+        // but never send push-chunk ACKs back to themselves — without this, the push barrier
+        // in broadcastToPeer (status != 'done') permanently blocks downstream broadcast.
+        {
+            QSqlQuery doneQ(wconn_);
+            doneQ.prepare(
+                QStringLiteral("SELECT pp.total_chunks, "
+                               "  (SELECT COUNT(*) FROM __sync_push_chunk_progress "
+                               "   WHERE push_id = pp.push_id AND status = 'applied') "
+                               "  AS applied_chunks "
+                               "FROM __sync_push_progress pp "
+                               "WHERE pp.push_id = ? AND pp.status != 'done' "
+                               "  AND pp.status != 'failed'"));
+            doneQ.addBindValue(p.pushId);
+            if (doneQ.exec() && doneQ.next()) {
+                const int total = doneQ.value(0).toInt();
+                const int applied = doneQ.value(1).toInt();
+                if (total > 0 && applied >= total) {
+                    QSqlQuery markDone(wconn_);
+                    markDone.prepare(
+                        QStringLiteral("UPDATE __sync_push_progress "
+                                       "SET status = 'done', updated_ms = ? "
+                                       "WHERE push_id = ?"));
+                    markDone.addBindValue(nowMs);
+                    markDone.addBindValue(p.pushId);
+                    if (!markDone.exec()) {
+                        txn.rollback();
+                        result.errorCode = QLatin1String(err::E_SYNC_TRANSPORT);
+                        result.errorMsg = markDone.lastError().text();
+                        return result;
+                    }
+                }
+            }
+        }
     }
 
     // Update table_state from RowMutations using pre-scanned (correct) old-row info (H-05).

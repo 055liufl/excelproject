@@ -1,9 +1,12 @@
 #pragma once
+#include "dbridge/sync/SyncTypes.h"
+
 #include <QByteArray>
 #include <QHash>
 #include <QList>
 #include <QSqlDatabase>
 #include <QString>
+#include <QVector>
 
 #include "../apply/AppliedVectorStore.h"
 #include "../apply/RowWinnerStore.h"
@@ -21,9 +24,10 @@ class BaselineManager {
     struct BaselineArtifact {
         QByteArray data;          // serialized baseline data (compressed)
         qint64 sourceMaxSeq = 0;  // max local_seq at export time (diagnostic only)
-        // C-03 fix: per-origin max origin_seq at export time, used to reset applied_vector
-        // to the correct authoritative truncation point (MAX(origin_seq) per origin).
-        QHash<QString, qint64> originMaxSeq;
+        // C-03 fix: per-origin applied-vector snapshot at export time (includes stream_epoch).
+        // Replaces the previous QHash<QString,qint64> which lacked stream_epoch, causing
+        // applyBaseline() to call av.resetTo() with the local epoch instead of each origin's own.
+        QVector<BaselineOriginCut> originCuts;
     };
 
     // Export all rows from syncTables into a BaselineArtifact.

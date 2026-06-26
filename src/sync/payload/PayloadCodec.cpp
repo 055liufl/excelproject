@@ -15,7 +15,8 @@ namespace dbridge::sync {
 void PayloadCodec::writeHeader(QDataStream& ds, const PayloadHeader& h) {
     ds << h.origin << h.originSeq << h.parentSeq << h.schemaFingerprint << h.schemaVer
        << h.streamEpoch << h.routeTag << h.pushId << static_cast<qint32>(h.chunkSeq)
-       << static_cast<qint32>(h.totalChunks);
+       << static_cast<qint32>(h.totalChunks)
+       << h.senderPeer;  // C-05 fix: physical sender so receivers can ACK back to the right node
 }
 
 bool PayloadCodec::readHeader(QDataStream& ds, PayloadHeader* h, QString* err) {
@@ -24,10 +25,20 @@ bool PayloadCodec::readHeader(QDataStream& ds, PayloadHeader* h, QString* err) {
         h->streamEpoch >> h->routeTag >> h->pushId >> cs >> tc;
     h->chunkSeq = cs;
     h->totalChunks = tc;
-    if (ds.status() != QDataStream::Ok) {
+    // C-05 fix: senderPeer was added after the original fields; read it gracefully.
+    // If the stream is already at end (old payload), senderPeer remains empty — that is fine
+    // because old payloads always had origin == sender (no forwarding).
+    if (ds.status() == QDataStream::Ok)
+        ds >> h->senderPeer;
+    if (ds.status() != QDataStream::Ok && ds.status() != QDataStream::ReadPastEnd) {
         if (err)
             *err = QStringLiteral("payload header read error");
         return false;
+    }
+    // Reset status so callers see Ok after optional field read.
+    if (ds.status() == QDataStream::ReadPastEnd) {
+        // Tolerate old payloads that lack senderPeer.
+        h->senderPeer.clear();
     }
     return true;
 }
@@ -110,10 +121,17 @@ QByteArray PayloadCodec::encodeBaselineResponse(const PayloadHeader& h,
     for (const QString& table : body.tables)
         tablesArr.append(table);
 
-    // C-03 fix: serialize per-origin max origin_seq map.
-    QJsonObject originMaxSeqObj;
-    for (auto it = body.originMaxSeq.cbegin(); it != body.originMaxSeq.cend(); ++it)
-        originMaxSeqObj[it.key()] = QString::number(it.value());
+    // C-03 fix: serialize per-origin applied-vector cuts (origin + stream_epoch + appliedSeq).
+    // Format: JSON array of {"o": origin, "e": epoch, "s": appliedSeq} objects.
+    // The old "originMaxSeq" key (QHash without epoch) is no longer written.
+    QJsonArray originCutsArr;
+    for (const BaselineOriginCut& cut : body.originCuts) {
+        QJsonObject obj;
+        obj[QStringLiteral("o")] = cut.origin;
+        obj[QStringLiteral("e")] = QString::number(cut.streamEpoch);
+        obj[QStringLiteral("s")] = QString::number(cut.appliedSeq);
+        originCutsArr.append(obj);
+    }
 
     QJsonObject root;
     root[QStringLiteral("origin")] = body.origin;
@@ -124,7 +142,7 @@ QByteArray PayloadCodec::encodeBaselineResponse(const PayloadHeader& h,
     root[QStringLiteral("pendingArtifactName")] = body.pendingArtifactName;
     root[QStringLiteral("baselineData")] = QString::fromLatin1(body.baselineData.toBase64());
     root[QStringLiteral("sourceMaxSeq")] = QString::number(body.sourceMaxSeq);
-    root[QStringLiteral("originMaxSeq")] = originMaxSeqObj;
+    root[QStringLiteral("originCuts")] = originCutsArr;
     QByteArray json = QJsonDocument(root).toJson(QJsonDocument::Compact);
 
     QByteArray buf;
@@ -250,10 +268,15 @@ bool PayloadCodec::decode(const QByteArray& data, DecodeResult* out, QString* er
         br.sourceMaxSeq = root[QStringLiteral("sourceMaxSeq")].toString().toLongLong();
         for (const QJsonValue& tv : root[QStringLiteral("tables")].toArray())
             br.tables.append(tv.toString());
-        // C-03 fix: deserialize per-origin max origin_seq map.
-        QJsonObject originMaxSeqObj = root[QStringLiteral("originMaxSeq")].toObject();
-        for (auto it = originMaxSeqObj.begin(); it != originMaxSeqObj.end(); ++it)
-            br.originMaxSeq.insert(it.key(), it.value().toString().toLongLong());
+        // C-03 fix: deserialize per-origin applied-vector cuts (includes stream_epoch).
+        for (const QJsonValue& cv : root[QStringLiteral("originCuts")].toArray()) {
+            const QJsonObject obj = cv.toObject();
+            BaselineOriginCut cut;
+            cut.origin = obj[QStringLiteral("o")].toString();
+            cut.streamEpoch = obj[QStringLiteral("e")].toString().toLongLong();
+            cut.appliedSeq = obj[QStringLiteral("s")].toString().toLongLong();
+            br.originCuts.append(cut);
+        }
         return true;
     }
     if (err)

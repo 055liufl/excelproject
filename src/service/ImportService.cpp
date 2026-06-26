@@ -660,8 +660,17 @@ ImportResult ImportService::run(const ProfileSpec& profile, const SchemaCatalog&
 
     bool writeOk = true;
     for (const auto& ctx : contexts) {
-        if (failedExcelRows.contains(ctx.excelRow))
+        // H-02 fix: only skip the entire Excel row when it has mapping/validation errors that
+        // make its payload data fundamentally invalid.  If the row's errors are all FK-inject
+        // failures (tracked per-route in ctx.failedRouteIndices), do NOT skip the whole row —
+        // sibling routes whose FK injection succeeded must still be written.
+        // Strategy: if failedExcelRows contains this row but the row also has failedRouteIndices
+        // that can account for all the errors, proceed to route-level filtering below.
+        // If failedExcelRows contains this row with NO failedRouteIndices (pure mapping/validation
+        // failure), skip entirely — the payload data itself is unusable.
+        if (failedExcelRows.contains(ctx.excelRow) && ctx.failedRouteIndices.isEmpty())
             continue;
+        // Rows with failedRouteIndices fall through; skipPayloadIndices below handles them.
 
         // H-04 fix: determine the routes for this context.
         const QVector<RouteSpec>* routesForCtx = nullptr;

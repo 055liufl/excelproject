@@ -31,11 +31,11 @@ bool ChangelogStore::appendForward(QSqlDatabase& db, const QString& origin,
                                    const QString& sourcePeer, qint64 originSeq, qint64 epoch,
                                    qint64 schemaVer, const QString& schemaFp,
                                    const QByteArray& changesetBlob, qint64* localSeqOut,
-                                   QString* err) {
+                                   QString* err, const QString& pushId) {
     // forwarded changesets: kind="forward", parentSeq=0, authoritative=false
     return insertRow(db, QStringLiteral("forward"), origin, sourcePeer, originSeq, /*parentSeq=*/0,
                      epoch, schemaVer, schemaFp, changesetBlob, /*authoritative=*/false,
-                     localSeqOut, err);
+                     localSeqOut, err, pushId);
 }
 
 QList<ChangelogStore::Entry> ChangelogStore::readRange(QSqlDatabase& db, const QString& peer,
@@ -72,8 +72,10 @@ QList<ChangelogStore::EntryFull> ChangelogStore::readRangeAll(QSqlDatabase& db,
                                                               const QString& excludeOrigin,
                                                               qint64 afterLocalSeq, int limit) {
     QSqlQuery q(db);
+    // C-04 fix: also SELECT stream_epoch so broadcastToPeer can use each entry's original epoch
+    // rather than overwriting every forwarded origin with the local node's epoch.
     q.prepare(
-        QStringLiteral("SELECT local_seq, origin, origin_seq, changeset, byte_size "
+        QStringLiteral("SELECT local_seq, origin, origin_seq, stream_epoch, changeset, byte_size "
                        "FROM __sync_changelog "
                        "WHERE origin != ? AND local_seq > ? "
                        "ORDER BY local_seq ASC "
@@ -90,8 +92,9 @@ QList<ChangelogStore::EntryFull> ChangelogStore::readRangeAll(QSqlDatabase& db,
         e.localSeq = q.value(0).toLongLong();
         e.origin = q.value(1).toString();
         e.originSeq = q.value(2).toLongLong();
-        e.changeset = q.value(3).toByteArray();
-        e.byteSize = q.value(4).toLongLong();
+        e.streamEpoch = q.value(3).toLongLong();
+        e.changeset = q.value(4).toByteArray();
+        e.byteSize = q.value(5).toLongLong();
         result.append(e);
     }
     return result;
@@ -126,7 +129,7 @@ bool ChangelogStore::insertRow(QSqlDatabase& db, const QString& kind, const QStr
                                const QString& sourcePeer, qint64 originSeq, qint64 parentSeq,
                                qint64 epoch, qint64 schemaVer, const QString& schemaFp,
                                const QByteArray& changeset, bool authoritative, qint64* localSeqOut,
-                               QString* err) {
+                               QString* err, const QString& pushId) {
     const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
     const QString checksum = blobChecksum(changeset);
     const qint64 byteSize = changeset.size();
@@ -135,12 +138,13 @@ bool ChangelogStore::insertRow(QSqlDatabase& db, const QString& kind, const QStr
     // H-01 fix: plain INSERT (not OR IGNORE) so a duplicate (origin,epoch,origin_seq) triggers
     // a real error that can be caught by the caller. Silently ignoring duplicates would let the
     // caller believe the changelog was updated when it was not, causing broadcast/ACK drift.
+    // M-04 fix: include push_id column for selection push changesets (NULL for normal changesets).
     q.prepare(
         QStringLiteral("INSERT INTO __sync_changelog "
                        "(kind, origin, source_peer, origin_seq, parent_seq, stream_epoch, "
                        " schema_ver, schema_fingerprint, changeset, payload_checksum, "
-                       " byte_size, authoritative, created_ms) "
-                       "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"));
+                       " byte_size, authoritative, created_ms, push_id) "
+                       "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"));
     q.addBindValue(kind);
     q.addBindValue(origin);
     q.addBindValue(sourcePeer.isEmpty() ? QVariant(QVariant::String) : QVariant(sourcePeer));
@@ -154,6 +158,8 @@ bool ChangelogStore::insertRow(QSqlDatabase& db, const QString& kind, const QStr
     q.addBindValue(byteSize);
     q.addBindValue(authoritative ? 1 : 0);
     q.addBindValue(nowMs);
+    // M-04 fix: NULL for plain changesets, pushId for selection-push changesets.
+    q.addBindValue(pushId.isEmpty() ? QVariant(QVariant::String) : QVariant(pushId));
 
     if (!q.exec()) {
         if (err)

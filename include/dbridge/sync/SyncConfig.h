@@ -4,6 +4,8 @@
 
 #include <QStringList>
 
+#include <algorithm>
+
 namespace dbridge::sync {
 
 class DBRIDGE_EXPORT SyncConfig {
@@ -295,9 +297,56 @@ class DBRIDGE_EXPORT SyncConfig::Builder {
             return {};
         }
         // M-01 fix: additional validation.
+        // peerNodes must not contain the local nodeId.
         if (cfg_.peerNodes_.contains(cfg_.nodeId_)) {
             if (err)
                 *err = QStringLiteral("nodeId must not appear in peerNodes");
+            return {};
+        }
+        // peerNodes must not contain empty strings.
+        for (const QString& p : cfg_.peerNodes_) {
+            if (p.isEmpty()) {
+                if (err)
+                    *err = QStringLiteral("peerNodes must not contain empty strings");
+                return {};
+            }
+        }
+        // peerNodes must not contain duplicates.
+        {
+            QStringList sorted = cfg_.peerNodes_;
+            std::sort(sorted.begin(), sorted.end());
+            for (int i = 1; i < sorted.size(); ++i) {
+                if (sorted[i] == sorted[i - 1]) {
+                    if (err)
+                        *err = QStringLiteral("peerNodes contains duplicate entry '%1'")
+                                   .arg(sorted[i]);
+                    return {};
+                }
+            }
+        }
+        // Edge nodes must specify a centerNode.
+        if (cfg_.role_ == NodeRole::Edge && cfg_.centerNodeId_.isEmpty()) {
+            if (err)
+                *err = QStringLiteral("centerNodeId is required for Edge role");
+            return {};
+        }
+        // centerNode must not appear in peerNodes (for non-Edge roles).
+        if (cfg_.role_ != NodeRole::Edge && !cfg_.centerNodeId_.isEmpty() &&
+            cfg_.peerNodes_.contains(cfg_.centerNodeId_)) {
+            if (err)
+                *err = QStringLiteral("centerNodeId must not appear in peerNodes");
+            return {};
+        }
+        // outboxMaxBytesPerPeer must be positive.
+        if (cfg_.outboxMaxBytesPerPeer_ <= 0) {
+            if (err)
+                *err = QStringLiteral("outboxMaxBytesPerPeer must be positive");
+            return {};
+        }
+        // gapTimeoutMs must be positive.
+        if (cfg_.gapTimeoutMs_ <= 0) {
+            if (err)
+                *err = QStringLiteral("gapTimeoutMs must be positive");
             return {};
         }
         if (cfg_.ackMaxDelayMs_ <= 0) {

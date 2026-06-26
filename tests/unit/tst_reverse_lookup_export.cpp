@@ -446,7 +446,10 @@ class TstReverseLookupExport : public QObject {
         QVERIFY2(!headers.contains(QStringLiteral("CustNo")), "CustNo (A) should be absent");
     }
 
-    // 7.4a: exportOnMissing: "error" (default) → E_REVERSE_LOOKUP_NOT_FOUND, row skipped
+    // 7.4a: exportOnMissing: "error" (default) → E_REVERSE_LOOKUP_NOT_FOUND, A-col cleared
+    // H-04 fix: previously the entire row was skipped when any lookup returned NOT_FOUND with
+    // exportOnMissing="error". Now only the failed A-header columns are cleared (written as NULL)
+    // while the rest of the row is still exported. The error is still reported.
     void testOnMissingError() {
         ExportRunner runner;
         runner.dbPath = newDb();
@@ -476,7 +479,8 @@ class TstReverseLookupExport : public QObject {
 
         auto res = runner.run(spec);
         QVERIFY(hasCode(res, QStringLiteral("E_REVERSE_LOOKUP_NOT_FOUND")));
-        QCOMPARE(res.writtenRows, 0);  // row skipped
+        // H-04 fix: row is written with the failed A-column cleared (not skipped entirely).
+        QCOMPARE(res.writtenRows, 1);
     }
 
     // 7.4b: exportOnMissing: "null" → A-col written as empty, no error, row continues

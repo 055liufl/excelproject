@@ -31,6 +31,7 @@
 #include "sync/selection/FkClosureBuilder.h"
 #include "sync/selection/SelectionResolver.h"
 #include <future>
+#include <limits>
 
 namespace dbridge::sync {
 
@@ -198,6 +199,8 @@ void SyncWorker::run() {
 
     // Run DDL
     for (const QString& stmt : ddl::allCreateStatements()) {
+        if (stmt.startsWith(QStringLiteral("-- ")))
+            continue;  // skip comment-only lines
         QSqlQuery q(wconn);
         if (!q.exec(stmt)) {
             initError_ = QStringLiteral("DDL: ") + q.lastError().text();
@@ -207,6 +210,9 @@ void SyncWorker::run() {
             return;
         }
     }
+
+    // M-04 fix: apply additive schema migrations (idempotent, errors are non-fatal).
+    ddl::applyMigrations(wconn);
 
     // C-08 fix: expand empty syncTables to all user tables so session always attaches something.
     QString expandErr;
@@ -370,18 +376,34 @@ void SyncWorker::run() {
         {
             QMutexLocker lk(&queueMutex_);
             if (taskQueue_.isEmpty() && !stopRequested_) {
-                // L-02 fix: shorten wait when an ACK deadline is active so E_SYNC_ACK_TIMEOUT
-                // fires at the configured time, not delayed by broadcastIntervalMs.
+                // Compute the tightest wait interval so we never sleep past:
+                //   (a) broadcastIntervalMs — background broadcast cadence
+                //   (b) ACK deadline — E_SYNC_ACK_TIMEOUT must fire on time
+                //   (c) ACK channel deadline — pending ACKs must be flushed within ackMaxDelayMs
+                // M-03 fix: also incorporate ackChan_->nextDeadlineMs() so ACK flush is not
+                // delayed by the full broadcastIntervalMs when ACKs are already pending.
                 qint64 waitMs = config_.broadcastIntervalMs();
+                const qint64 nowForWait = QDateTime::currentMSecsSinceEpoch();
+                // (b) ACK timeout for foreground sync.
                 if (ackWaiting_.load()) {
-                    const qint64 remaining =
-                        ackDeadlineMs_.load() - QDateTime::currentMSecsSinceEpoch();
+                    const qint64 remaining = ackDeadlineMs_.load() - nowForWait;
                     if (remaining > 0 && remaining < waitMs)
                         waitMs = remaining;
                     else if (remaining <= 0)
                         waitMs = 1;  // already expired; wake immediately
                 }
-                queueCond_.wait(&queueMutex_, static_cast<ulong>(waitMs));
+                // (c) ACK channel flush deadline.
+                if (ackChan_) {
+                    const qint64 ackDeadline = ackChan_->nextDeadlineMs();
+                    if (ackDeadline != std::numeric_limits<qint64>::max()) {
+                        const qint64 remaining = ackDeadline - nowForWait;
+                        if (remaining > 0 && remaining < waitMs)
+                            waitMs = remaining;
+                        else if (remaining <= 0)
+                            waitMs = 1;
+                    }
+                }
+                queueCond_.wait(&queueMutex_, static_cast<ulong>(waitMs > 0 ? waitMs : 1));
             }
             if (stopRequested_ && taskQueue_.isEmpty())
                 break;
@@ -536,12 +558,16 @@ bool SyncWorker::processArtifact(const QString& path) {
     if (ok) {
         ledger_->markConsumed(*wconnPtr_, name, nullptr);
         if (dec.kind == PayloadKind::Changeset) {
-            // Send ACK back to the changeset's origin node (J-01 fix: populate toPeer).
+            // C-05 fix: ACK the physical sender (senderPeer), not the business origin.
+            // When the center forwards B's changeset to C, C must ACK the center so the
+            // center's outbound_ack[peer=C, origin=B] watermark advances.  If senderPeer is
+            // empty (old artifact without the field), fall back to the origin for compatibility.
             ChangesetAck ack;
             ack.origin = dec.header.origin;
             ack.streamEpoch = dec.header.streamEpoch;
             ack.appliedSeq = dec.header.originSeq;
-            ack.toPeer = dec.header.origin;  // ACK addressed to the changeset producer
+            ack.toPeer =
+                dec.header.senderPeer.isEmpty() ? dec.header.origin : dec.header.senderPeer;
             QString ackErr;
             if (!ackChan_->scheduleChangesetAck(ack, *codec_, &ackErr)) {
                 emit errorOccurred({err::E_SYNC_TRANSPORT, Severity::Warning, QStringLiteral("ack"),
@@ -802,7 +828,8 @@ bool SyncWorker::processBaselineRequestArtifact(const DecodeResult& dec,
     resp.pendingArtifactName = req.pendingArtifactName;
     resp.baselineData = art.data;
     resp.sourceMaxSeq = art.sourceMaxSeq;
-    resp.originMaxSeq = art.originMaxSeq;  // C-03 fix
+    resp.originCuts =
+        art.originCuts;  // C-03 fix: per-origin (epoch, appliedSeq) from applied_vector
 
     PayloadHeader hdr;
     hdr.origin = config_.nodeId();
@@ -845,7 +872,8 @@ bool SyncWorker::processBaselineResponseArtifact(const DecodeResult& dec,
     BaselineManager::BaselineArtifact art;
     art.data = resp.baselineData;
     art.sourceMaxSeq = resp.sourceMaxSeq;
-    art.originMaxSeq = resp.originMaxSeq;  // C-03 fix: carry per-origin applied vector
+    art.originCuts =
+        resp.originCuts;  // C-03 fix: per-origin (epoch, appliedSeq) from applied_vector
 
     ConsistencyCache cache;
     qint64 newAnchorSeq = 0;
@@ -1030,6 +1058,8 @@ bool SyncWorker::broadcast(QString* outErr) {
         if (!peerErr.isEmpty() && outErr && outErr->isEmpty())
             *outErr = peerErr;
     }
+    // NOTE: enqueueDrain calls broadcastTopeer directly with ackedEntries; the broadcast()
+    // helper used by the background loop does not need ACK window tracking.
     QString ackErr;
     if (!ackChan_->flush(*codec_, &ackErr)) {
         emit errorOccurred({err::E_SYNC_TRANSPORT, Severity::Warning, QStringLiteral("ack"),
@@ -1041,7 +1071,8 @@ bool SyncWorker::broadcast(QString* outErr) {
     return wroteAny;
 }
 
-bool SyncWorker::broadcastTopeer(const QString& peer, QString* outErr) {
+bool SyncWorker::broadcastTopeer(const QString& peer, QString* outErr,
+                                 QList<PendingAckEntry>* ackedEntries) {
     // C-02 fix: use minUnackedLocalSeq as the read lower-bound so that un-ACKed changesets
     // are always eligible for re-send.  lastSentLocalSeq is only advanced for diagnostics.
     // Falls back to -1 (read from beginning) when no ACK rows exist yet.
@@ -1101,10 +1132,16 @@ bool SyncWorker::broadcastTopeer(const QString& peer, QString* outErr) {
         PayloadHeader hdr;
         hdr.origin = entry.origin;
         hdr.originSeq = entry.originSeq;
-        hdr.streamEpoch = streamEpoch_;
+        // C-04 fix: use the entry's own stream_epoch (not the local node's epoch) so that
+        // forwarded remote-origin changesets preserve their original epoch namespace.
+        // Self-authored entries have streamEpoch == streamEpoch_ by construction.
+        hdr.streamEpoch = entry.streamEpoch > 0 ? entry.streamEpoch : streamEpoch_;
         hdr.schemaVer = config_.schemaVersion();
         hdr.schemaFingerprint = guard_ ? guard_->fingerprint() : QString();
         hdr.routeTag = peer;
+        // C-05 fix: stamp the physical sender so the receiver can ACK back to us rather than
+        // to the business-origin node (which may be a different node when we forward changesets).
+        hdr.senderPeer = config_.nodeId();
 
         QByteArray payload = codec_->encodeChangeset(hdr, changesetToSend);
         // H-07 / H-08 fix: include target peer so different peers get distinct file names.
@@ -1121,6 +1158,15 @@ bool SyncWorker::broadcastTopeer(const QString& peer, QString* outErr) {
         wroteAny = true;
         bytesSent += payload.size();
         lastSentLocal = qMax(lastSentLocal, entry.localSeq);
+        // C-01 fix: record the (peer, origin, epoch, originSeq) tuple for ACK window construction.
+        if (ackedEntries) {
+            PendingAckEntry ae;
+            ae.peer = peer;
+            ae.origin = entry.origin;
+            ae.epoch = hdr.streamEpoch;
+            ae.targetSeq = entry.originSeq;
+            ackedEntries->append(ae);
+        }
         if (bytesSent >= config_.outboxMaxBytesPerPeer())
             break;
     }
@@ -1495,40 +1541,61 @@ bool SyncWorker::enqueueDrain(QString* err) {
     std::future<bool> future = sharedPromise->get_future();
     enqueue([this, sp = sharedPromise]() {
         QString taskErr;
-        scanInbox();                             // apply any pending inbound payloads
-        const bool wrote = broadcast(&taskErr);  // pack & write outbox artifacts for all peers
+        scanInbox();  // apply any pending inbound payloads
+
+        // C-01 fix: collect (peer, origin, epoch, maxOriginSeq) for every artifact written
+        // during this drain so the ACK window covers ALL origins, not just the local one.
+        // We call broadcastTopeer directly (bypassing broadcast()) so we can pass ackedEntries.
+        QList<PendingAckEntry> broadcastedEntries;
+        bool wrote = false;
+        for (const QString& peer : config_.peerNodes()) {
+            if (isPeerEvicted(peer))
+                continue;
+            QString peerErr;
+            if (broadcastTopeer(peer, &peerErr, &broadcastedEntries))
+                wrote = true;
+            if (!peerErr.isEmpty() && taskErr.isEmpty())
+                taskErr = peerErr;
+        }
+        // Flush ACK channel (same as broadcast() does).
+        QString ackErr;
+        if (!ackChan_->flush(*codec_, &ackErr)) {
+            emit errorOccurred({err::E_SYNC_TRANSPORT, Severity::Warning, QStringLiteral("ack"),
+                                config_.nodeId(), ackErr});
+        }
+        evaluatePeers();
+
         if (!taskErr.isEmpty()) {
             emit errorOccurred({err::E_SYNC_TRANSPORT, Severity::Error, QStringLiteral("sync"),
                                 config_.nodeId(), taskErr});
         }
-        // C-01 fix: build the PendingAckWindow from what we actually broadcast.
-        // For each peer we just sent to, record (peer, localNode, epoch, maxOriginSeq)
-        // so processAckArtifact() waits for ALL peers to ACK before completing.
-        if (wrote && wconnPtr_) {
-            pendingAckWindow_.clear();
-            for (const QString& p : config_.peerNodes()) {
-                if (isPeerEvicted(p))
-                    continue;
-                const qint64 lastSent = ackStore_->lastSentLocalSeq(*wconnPtr_, p, streamEpoch_);
-                if (lastSent < 0)
-                    continue;
-                // Find the maximum origin_seq we sent (for our own origin).
-                // We query the acked_seq the peer will need to reach.
-                const qint64 targetAcked =
-                    ackStore_->ackedSeq(*wconnPtr_, p, config_.nodeId(), streamEpoch_);
-                // We need the peer to ACK up to localOriginSeq_ (the highest local seq broadcast).
-                // Use localOriginSeq_ as the target: the peer must report appliedSeq >= this value.
-                if (localOriginSeq_ > 0 && localOriginSeq_ > targetAcked) {
-                    PendingAckEntry entry;
-                    entry.peer = p;
-                    entry.origin = config_.nodeId();
-                    entry.epoch = streamEpoch_;
-                    entry.targetSeq = localOriginSeq_;
-                    pendingAckWindow_.append(entry);
+
+        // Build pendingAckWindow_ from the entries we actually broadcast this round.
+        // Deduplicate by (peer, origin, epoch): keep the maximum originSeq seen per tuple.
+        if (wrote) {
+            QHash<QString, PendingAckEntry> windowMap;
+            for (const PendingAckEntry& e : broadcastedEntries) {
+                const QString key = e.peer + QLatin1Char('|') + e.origin + QLatin1Char('|') +
+                                    QString::number(e.epoch);
+                auto it = windowMap.find(key);
+                if (it == windowMap.end()) {
+                    windowMap.insert(key, e);
+                } else if (e.targetSeq > it->targetSeq) {
+                    it->targetSeq = e.targetSeq;
                 }
             }
+            pendingAckWindow_.clear();
+            for (const PendingAckEntry& e : windowMap)
+                pendingAckWindow_.append(e);
+
             if (pendingAckWindow_.isEmpty()) {
-                // Nothing actually needed ACKing (e.g. all already acked) — cancel wait.
+                // Nothing needs ACKing (e.g. all already acked) — cancel wait.
+                ackWaiting_ = false;
+                ackDeadlineMs_ = 0;
+            }
+        } else if (!wrote) {
+            // wrote=false: no artifacts sent at all, no need to wait for ACKs.
+            if (ackWaiting_.load()) {
                 ackWaiting_ = false;
                 ackDeadlineMs_ = 0;
             }

@@ -5,6 +5,7 @@
 #include <QString>
 #include <QStringList>
 #include <QVariant>
+#include <QVector>
 
 namespace dbridge::sync {
 
@@ -80,6 +81,10 @@ struct PayloadHeader {
     QString pushId;  // non-empty for SelectionPush
     int chunkSeq = 0;
     int totalChunks = 0;
+    // C-05 fix: physical sender of this artifact (the node that wrote the file to its outbox).
+    // May differ from 'origin' when a center node forwards a remote-origin changeset.
+    // Receivers use senderPeer as ACK.toPeer so the center's outbound_ack watermark advances.
+    QString senderPeer;
 };
 
 enum class PayloadKind { Changeset, SelectionPush, BaselineRequest, BaselineResponse };
@@ -110,6 +115,15 @@ struct BaselineRequestPayload {
     QString pendingArtifactName;
 };
 
+// C-03 fix: per-origin applied-vector cut exported in a baseline response.
+// Carries the stream_epoch so the receiver can call av.resetTo(origin, epoch, seq, generation)
+// with the correct epoch rather than guessing from the local streamEpoch_.
+struct BaselineOriginCut {
+    QString origin;
+    qint64 streamEpoch = 0;
+    qint64 appliedSeq = 0;
+};
+
 struct BaselineResponsePayload {
     QString origin;
     QString requestOrigin;
@@ -119,8 +133,9 @@ struct BaselineResponsePayload {
     QString pendingArtifactName;
     QByteArray baselineData;
     qint64 sourceMaxSeq = 0;
-    // C-03 fix: per-origin max origin_seq at baseline export time.
-    QHash<QString, qint64> originMaxSeq;
+    // C-03 fix: per-origin applied-vector snapshot at baseline export time (includes epoch).
+    // Replaces the previous QHash<QString,qint64> which lacked stream_epoch.
+    QVector<BaselineOriginCut> originCuts;
 };
 
 struct DecodeResult {

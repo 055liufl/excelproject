@@ -25,6 +25,12 @@ class AckChannel {
     // Immediately write all queued ACKs to the outbox.
     bool flush(PayloadCodec& codec, QString* err = nullptr);
 
+    // M-03 fix: return the earliest time at which a pending ACK batch must be flushed
+    // (lastFlushTime + ackMaxDelayMs), so the SyncWorker main loop can use it to compute
+    // a tighter sleep interval instead of always sleeping broadcastIntervalMs.
+    // Returns INT64_MAX when no ACKs are pending.
+    qint64 nextDeadlineMs() const;
+
    private:
     bool maybeFlush(PayloadCodec& codec, QString* err);
 

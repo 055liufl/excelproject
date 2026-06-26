@@ -121,7 +121,11 @@ class SyncWorker : public QThread {
     bool processAckArtifact(const QString& path, const QString& artifactName);
 
     // --- Broadcast helpers ---
-    bool broadcastTopeer(const QString& peer, QString* outErr = nullptr);
+    // C-01 fix: ackedEntries collects (peer, origin, epoch, maxOriginSeq) for every artifact
+    // successfully written during this call, so enqueueDrain can build a complete ACK window
+    // that covers ALL origins broadcast (not just the local node's origin).
+    bool broadcastTopeer(const QString& peer, QString* outErr = nullptr,
+                         QList<PendingAckEntry>* ackedEntries = nullptr);
     qint64 computePeerAckedSeq(const QString& peer);
     qint64 nextLocalOriginSeq();
     bool isPeerEvicted(const QString& peer);

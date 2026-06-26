@@ -19,9 +19,12 @@ class ChangelogStore {
                 bool authoritative, qint64* localSeqOut, QString* err);
 
     // Branch A: store incoming raw blob verbatim (forwarded changeset).
+    // M-04 fix: accepts optional pushId (empty for plain changesets, non-empty for selection push
+    // changesets) so the broadcast layer can filter entries by push_id barrier.
     bool appendForward(QSqlDatabase& db, const QString& origin, const QString& sourcePeer,
                        qint64 originSeq, qint64 epoch, qint64 schemaVer, const QString& schemaFp,
-                       const QByteArray& changesetBlob, qint64* localSeqOut, QString* err);
+                       const QByteArray& changesetBlob, qint64* localSeqOut, QString* err,
+                       const QString& pushId = QString());
 
     // Read entries after a peer anchor for broadcasting.
     struct Entry {
@@ -39,6 +42,7 @@ class ChangelogStore {
         qint64 localSeq = 0;
         QString origin;
         qint64 originSeq = 0;
+        qint64 streamEpoch = 0;  // C-04 fix: preserve original stream_epoch per origin
         QByteArray changeset;
         qint64 byteSize = 0;
     };
@@ -62,7 +66,8 @@ class ChangelogStore {
     bool insertRow(QSqlDatabase& db, const QString& kind, const QString& origin,
                    const QString& sourcePeer, qint64 originSeq, qint64 parentSeq, qint64 epoch,
                    qint64 schemaVer, const QString& schemaFp, const QByteArray& changeset,
-                   bool authoritative, qint64* localSeqOut, QString* err);
+                   bool authoritative, qint64* localSeqOut, QString* err,
+                   const QString& pushId = QString());  // M-04 fix
 
     // Compute SHA-256 hex of a changeset blob (for payload_checksum).
     static QString blobChecksum(const QByteArray& data);

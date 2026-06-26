@@ -434,15 +434,18 @@ void collectHValues(const QVector<RouteSpec>& routes, const SchemaCatalog& catal
 }
 
 // Resolve A-header values for a single row using the ReverseCache.
-// Returns QHash<A-header → resolved value>. On error or miss, respects exportOnMissing.
-// Returns false (skip row entirely) only when ambiguous.
-// On NOT_FOUND + "error": emits error, sets rowSkip=true.
+// Returns QHash<A-header → resolved value>. On NOT_FOUND + "error": emits error and records
+// the failed A-header names in *failedAHeaders (so the caller can write NULL for those columns
+// while keeping other columns).  Sets *rowSkip=true only for AMBIGUOUS results, which are
+// whole-row errors (the data is fundamentally inconsistent and no partial write makes sense).
+// H-04 fix: previously any lookup error set rowSkip=true and skipped the entire row.
 QHash<QString, QVariant> resolveAHeaders(const QVector<RouteSpec>& routes,
                                          const SchemaCatalog& catalog,
                                          const QHash<QString, QVariant>& rowData,
                                          const ReverseCache& cache, const QString& sheet,
                                          int rowIndex, const QString& classId,
-                                         ErrorCollector* errors, bool* rowSkip) {
+                                         ErrorCollector* errors, bool* rowSkip,
+                                         QSet<QString>* failedAHeaders = nullptr) {
     QHash<QString, QVariant> aVals;
     *rowSkip = false;
 
@@ -484,9 +487,14 @@ QHash<QString, QVariant> resolveAHeaders(const QVector<RouteSpec>& routes,
                                 ctx + QStringLiteral("route '") + route.table +
                                     QStringLiteral("' lookup '") + lk.name +
                                     QStringLiteral("': H column is NULL — treating as no match"));
-                    *rowSkip = true;
+                    // H-04 fix: mark only the A-headers from this lookup as failed.
+                    // The row continues to be written; only the affected columns are cleared.
+                    if (failedAHeaders) {
+                        for (const auto& mp : lk.match)
+                            failedAHeaders->insert(mp.second);
+                    }
                 }
-                // null/skip: leave A-headers absent (will write NULL)
+                // null/skip/error: leave A-headers absent (will write NULL)
                 continue;
             }
 
@@ -510,16 +518,24 @@ QHash<QString, QVariant> resolveAHeaders(const QVector<RouteSpec>& routes,
                                     QStringLiteral("': no match in '") + lk.fromTable +
                                     QStringLiteral("' for (") + hDesc.join(QStringLiteral(", ")) +
                                     QStringLiteral(")"));
-                    *rowSkip = true;
+                    // H-04 fix: mark only the A-headers from this lookup as failed.
+                    // The row continues to be written; only the affected columns are cleared.
+                    // (Previously any NOT_FOUND + "error" would skip the entire row.)
+                    if (failedAHeaders) {
+                        for (const auto& mp : lk.match)
+                            failedAHeaders->insert(mp.second);
+                    }
                 }
-                // null/skip: leave A-headers absent (will write NULL), no error
+                // null/skip/error: leave A-headers absent (will write NULL), no error
                 continue;
             }
 
             const ReverseHit& hit = it.value();
 
             if (hit.hitCount > 1) {
-                // AMBIGUOUS — always an error regardless of exportOnMissing
+                // AMBIGUOUS — always a whole-row error regardless of exportOnMissing.
+                // The data is fundamentally ambiguous: we cannot pick one of multiple matches,
+                // so we must skip the entire row (not just the lookup columns).
                 QString ctx = classId.isEmpty()
                                   ? QString()
                                   : QStringLiteral("class '") + classId + QStringLiteral("' ");
@@ -532,7 +548,7 @@ QHash<QString, QVariant> resolveAHeaders(const QVector<RouteSpec>& routes,
                                 tkey.replace(QLatin1Char('\x1F'), QLatin1Char(',')) +
                                 QStringLiteral("); deduplicate '") + lk.fromTable +
                                 QStringLiteral("'"));
-                *rowSkip = true;
+                *rowSkip = true;  // AMBIGUOUS: whole row must be skipped
                 continue;
             }
 
@@ -756,11 +772,14 @@ ExportResult ExportService::run(const ProfileSpec& profile, const SchemaCatalog&
         for (const auto& mr : allRows) {
             // 6.2: per-row resolution uses class-specific routes
             bool rowSkip = false;
+            QSet<QString> failedAHeaders;
             QHash<QString, QVariant> aVals;
             if (needReverseLookupMixed) {
                 const QVector<RouteSpec>& clsRoutes = classSortedRoutes[mr.classId];
-                aVals = resolveAHeaders(clsRoutes, catalog, mr.data, revCache, sheetName,
-                                        rowCount + 1, mr.classId, &errors, &rowSkip);
+                // H-04 fix: collect per-lookup failures in failedAHeaders instead of whole rowSkip.
+                aVals =
+                    resolveAHeaders(clsRoutes, catalog, mr.data, revCache, sheetName, rowCount + 1,
+                                    mr.classId, &errors, &rowSkip, &failedAHeaders);
             }
             if (rowSkip)
                 continue;
@@ -772,13 +791,18 @@ ExportResult ExportService::run(const ProfileSpec& profile, const SchemaCatalog&
                 } else if (mixedAllHColReplace.contains(h)) {
                     rowVals.append(QVariant());  // should not appear in finalHeaders
                 } else if (needReverseLookupMixed && mixedAllAHeaders.contains(h)) {
-                    // D5: ColumnSpec.source value wins if non-NULL
-                    QVariant srcVal = mr.data.value(h);
-                    QVariant val = (!srcVal.isNull()) ? srcVal : aVals.value(h, QVariant());
-                    if (!val.isNull() && temporal.contains(h))
-                        val = convertTemporalForExport(val, temporal[h], sheetName, h, &errors,
-                                                       rowCount + 1);
-                    rowVals.append(val);
+                    if (failedAHeaders.contains(h)) {
+                        // H-04 fix: only null out the columns whose lookup failed.
+                        rowVals.append(QVariant());
+                    } else {
+                        // D5: ColumnSpec.source value wins if non-NULL
+                        QVariant srcVal = mr.data.value(h);
+                        QVariant val = (!srcVal.isNull()) ? srcVal : aVals.value(h, QVariant());
+                        if (!val.isNull() && temporal.contains(h))
+                            val = convertTemporalForExport(val, temporal[h], sheetName, h, &errors,
+                                                           rowCount + 1);
+                        rowVals.append(val);
+                    }
                 } else {
                     QVariant val = mr.data.value(h, QVariant());
                     if (!val.isNull() && temporal.contains(h))
@@ -935,9 +959,12 @@ ExportResult ExportService::run(const ProfileSpec& profile, const SchemaCatalog&
             // 5.5-5.7: Project rows.
             for (const auto& rowData : rowDataList) {
                 bool rowSkip = false;
+                QSet<QString> failedAHeaders;
+                // H-04 fix: pass failedAHeaders to collect per-lookup failures instead of skipping
+                // the whole row on NOT_FOUND.  rowSkip is only set for AMBIGUOUS results.
                 QHash<QString, QVariant> aVals =
                     resolveAHeaders(sorted, catalog, rowData, revCache, sheetName, rowCount + 1,
-                                    QString(), &errors, &rowSkip);
+                                    QString(), &errors, &rowSkip, &failedAHeaders);
                 if (rowSkip)
                     continue;
 
@@ -948,12 +975,18 @@ ExportResult ExportService::run(const ProfileSpec& profile, const SchemaCatalog&
                         // H-col-to-replace: should not appear in finalHeaders, skip
                         val = QVariant();
                     } else if (aHeaders.contains(h)) {
-                        // 5.6: D5 — ColumnSpec.source value wins if present and non-NULL
-                        QVariant srcVal = rowData.value(h);
-                        if (!srcVal.isNull())
-                            val = srcVal;
-                        else
-                            val = aVals.value(h, QVariant());
+                        if (failedAHeaders.contains(h)) {
+                            // H-04 fix: this A-header's lookup failed — write NULL for this
+                            // column only; other columns in the same row are unaffected.
+                            val = QVariant();
+                        } else {
+                            // 5.6: D5 — ColumnSpec.source value wins if present and non-NULL
+                            QVariant srcVal = rowData.value(h);
+                            if (!srcVal.isNull())
+                                val = srcVal;
+                            else
+                                val = aVals.value(h, QVariant());
+                        }
                     } else {
                         val = rowData.value(h, QVariant());
                     }

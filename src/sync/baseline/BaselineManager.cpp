@@ -87,15 +87,22 @@ bool BaselineManager::serializeTables(QSqlDatabase& rconn, const QStringList& ta
     return true;
 }
 
-// C-03 fix: query MAX(origin_seq) GROUP BY origin from __sync_changelog and return the map.
-static QHash<QString, qint64> queryOriginMaxSeq(QSqlDatabase& rconn) {
-    QHash<QString, qint64> result;
+// C-03 fix: query the applied_vector (not changelog MAX) so the baseline carries authoritative
+// applied sequences per (origin, stream_epoch) rather than the highest-seen changeset seq.
+// Using the applied_vector prevents a race where a changeset arrived but was not yet applied.
+static QVector<BaselineOriginCut> queryOriginCuts(QSqlDatabase& rconn) {
+    QVector<BaselineOriginCut> result;
     QSqlQuery q(rconn);
     if (!q.exec(
-            QStringLiteral("SELECT origin, MAX(origin_seq) FROM __sync_changelog GROUP BY origin")))
+            QStringLiteral("SELECT origin, stream_epoch, applied_seq FROM __sync_applied_vector")))
         return result;
-    while (q.next())
-        result.insert(q.value(0).toString(), q.value(1).toLongLong());
+    while (q.next()) {
+        BaselineOriginCut cut;
+        cut.origin = q.value(0).toString();
+        cut.streamEpoch = q.value(1).toLongLong();
+        cut.appliedSeq = q.value(2).toLongLong();
+        result.append(cut);
+    }
     return result;
 }
 
@@ -214,9 +221,9 @@ bool BaselineManager::exportBaseline(QSqlDatabase& rconn, const QStringList& tab
     }
     out->data = data;
     out->sourceMaxSeq = maxSeq;
-    // C-03 fix: capture per-origin max origin_seq so applyBaseline can reset applied_vector
-    // to the correct authoritative truncation point.
-    out->originMaxSeq = queryOriginMaxSeq(rconn);
+    // C-03 fix: capture per-origin applied_vector snapshot so applyBaseline can call
+    // av.resetTo(origin, epoch, seq, generation) with the correct epoch per origin.
+    out->originCuts = queryOriginCuts(rconn);
     return true;
 }
 
@@ -273,23 +280,26 @@ bool BaselineManager::applyBaseline(QSqlDatabase& wconn, sqlite3* /*h*/,
         pragmaOn.exec(QStringLiteral("PRAGMA foreign_keys=ON"));
     };
 
-    // C-03 fix: reset applied_vector per origin to the authoritative origin_seq captured
-    // at export time.  For origins present in originMaxSeq use resetTo(); for the primary
-    // origin use the supplied origin parameter as fallback.
+    // C-03 fix: reset applied_vector per (origin, epoch) using the authoritative cuts captured
+    // at export time. Each cut carries its own stream_epoch so we call resetTo() with the
+    // correct epoch instead of the local node's epoch (which may differ for remote origins).
     {
-        // Reset the primary origin (the baseline provider).
-        const qint64 primaryOriginSeq = art.originMaxSeq.value(origin, 0);
-        if (!av.resetTo(wconn, origin, epoch, primaryOriginSeq, art.sourceMaxSeq, err)) {
-            txn.rollback();
-            restoreFk();
-            wrapErr(err);
-            return false;
+        bool primaryReset = false;
+        for (const BaselineOriginCut& cut : art.originCuts) {
+            // Use each cut's own epoch — this is the critical fix for multi-origin baselines.
+            if (!av.resetTo(wconn, cut.origin, cut.streamEpoch, cut.appliedSeq, art.sourceMaxSeq,
+                            err)) {
+                txn.rollback();
+                restoreFk();
+                wrapErr(err);
+                return false;
+            }
+            if (cut.origin == origin)
+                primaryReset = true;
         }
-        // Reset all other origins captured in the export.
-        for (auto it = art.originMaxSeq.cbegin(); it != art.originMaxSeq.cend(); ++it) {
-            if (it.key() == origin)
-                continue;
-            if (!av.resetTo(wconn, it.key(), epoch, it.value(), art.sourceMaxSeq, err)) {
+        // If the primary origin was not in the cuts (empty baseline), reset it to seq=0.
+        if (!primaryReset) {
+            if (!av.resetTo(wconn, origin, epoch, 0, art.sourceMaxSeq, err)) {
                 txn.rollback();
                 restoreFk();
                 wrapErr(err);

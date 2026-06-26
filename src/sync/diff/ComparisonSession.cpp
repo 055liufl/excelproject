@@ -36,6 +36,27 @@ ComparisonSession::ComparisonSession(QSqlDatabase& rconn, QSqlDatabase& wconn, T
 // initialize
 // ---------------------------------------------------------------------------
 
+// C-10 fix: public API overload — convert RemoteTableSnapshot to internal types.
+bool ComparisonSession::initialize(const QList<RemoteTableSnapshot>& remoteSnapshots,
+                                   QString* err) {
+    QStringList tables;
+    QHash<QString, DiffEngine::RemoteMeta> remoteMetas;
+    QHash<QString, QList<QVariantMap>> remoteRows;
+
+    for (const RemoteTableSnapshot& snap : remoteSnapshots) {
+        tables.append(snap.table);
+        DiffEngine::RemoteMeta meta;
+        meta.schemaFp = snap.meta.schemaFingerprint;
+        meta.checksum = snap.meta.contentChecksum;
+        meta.rowCount = snap.meta.rowCount;
+        remoteMetas.insert(snap.table, meta);
+        if (!snap.rows.isEmpty())
+            remoteRows.insert(snap.table, snap.rows);
+    }
+
+    return initialize(tables, remoteMetas, remoteRows, err);
+}
+
 bool ComparisonSession::initialize(const QStringList& tables,
                                    const QHash<QString, DiffEngine::RemoteMeta>& remoteMetas,
                                    const QHash<QString, QList<QVariantMap>>& remoteRows,
@@ -278,6 +299,9 @@ bool ComparisonSession::save(QString* err) {
 void ComparisonSession::discard() {
     staging_.discard();
     gate_.releaseAll();
+    // H-09 fix: trigger rescan so pending 'seen' artifacts deferred during session are processed.
+    if (context_ && context_->rescanFn)
+        context_->rescanFn();
 }
 
 // ---------------------------------------------------------------------------
@@ -428,6 +452,10 @@ class OwningComparisonSession : public IComparisonSession {
     QList<RowDiff> fetchRemoteRows(const QString& t, const QString& tok, int ps,
                                    const QString& snap) const override {
         return inner_->fetchRemoteRows(t, tok, ps, snap);
+    }
+    bool initialize(const QList<RemoteTableSnapshot>& remoteSnapshots,
+                    QString* err = nullptr) override {
+        return inner_->initialize(remoteSnapshots, err);
     }
     bool save(QString* err) override {
         return inner_->save(err);

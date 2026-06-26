@@ -32,6 +32,10 @@ class ComparisonSession : public IComparisonSession {
                     const QHash<QString, DiffEngine::RemoteMeta>& remoteMetas,
                     const QHash<QString, QList<QVariantMap>>& remoteRows, QString* err);
 
+    // C-10 fix: IComparisonSession::initialize override accepting public API type.
+    bool initialize(const QList<RemoteTableSnapshot>& remoteSnapshots,
+                    QString* err = nullptr) override;
+
     // IComparisonSession implementation
     QList<TableDiff> tableDiffs() const override;
     QList<RowDiff> rowDiffs(const QString& table, int offset, int limit) const override;

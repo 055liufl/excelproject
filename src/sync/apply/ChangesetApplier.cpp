@@ -265,14 +265,20 @@ void ChangesetApplier::updateWinnersFromChangeset(const QByteArray& changeset,
                             vals << it.value().toVariant();
                         }
                         if (!cols.isEmpty()) {
+                            // C-08 fix: cols now use real column names from winning_content JSON.
                             QSqlQuery restoreQ(wconn);
                             restoreQ.prepare(
                                 QStringLiteral("INSERT OR REPLACE INTO \"%1\" (%2) VALUES (%3)")
-                                    .arg(tableName, cols.join(QLatin1Char(',')),
+                                    .arg(QString(tableName).replace(QLatin1Char('"'),
+                                                                    QLatin1String("\"\"")),
+                                         cols.join(QLatin1Char(',')),
                                          placeholders.join(QLatin1Char(','))));
                             for (const QVariant& v : vals)
                                 restoreQ.addBindValue(v);
-                            restoreQ.exec();  // best-effort; failure logged implicitly
+                            if (!restoreQ.exec()) {
+                                // Restore failed — clear winner so high-rank node can re-deliver.
+                                winners.clear(wconn, tableName, pkHashStr, nullptr);
+                            }
                         }
                     }
                     // Winner entry stays — row is restored, no need to clear.
@@ -288,15 +294,32 @@ void ChangesetApplier::updateWinnersFromChangeset(const QByteArray& changeset,
         QByteArray contentH =
             QCryptographicHash::hash(contentMaterial, QCryptographicHash::Sha256).left(16);
 
-        // Build JSON snapshot of the new row values (column_index → value string).
-        // Used by the DELETE recovery path to restore if a low-rank DELETE arrives later.
+        // C-08 fix: use real column names (not indices) so the DELETE recovery path can build
+        // a valid INSERT SQL. Fetch column name order from PRAGMA table_info keyed by 'cid'.
+        QStringList colNames;
+        {
+            QSqlQuery ti(wconn);
+            ti.prepare(
+                QStringLiteral("PRAGMA table_info(\"%1\")")
+                    .arg(QString(tableName).replace(QLatin1Char('"'), QLatin1String("\"\""))));
+            if (ti.exec()) {
+                QMap<int, QString> cidToName;
+                while (ti.next())
+                    cidToName.insert(ti.value(0).toInt(), ti.value(1).toString());
+                for (int i = 0; i < nCol; ++i)
+                    colNames.append(cidToName.value(i, QStringLiteral("_col_%1").arg(i)));
+            }
+        }
+
         QJsonObject rowJson;
         for (int ci = 0; ci < nCol; ++ci) {
             sqlite3_value* newVal = nullptr;
             sqlite3changeset_new(iter, ci, &newVal);
             if (!newVal)
                 continue;
-            const QString colKey = QString::number(ci);
+            // Use real column name; fall back to "col_N" if PRAGMA failed.
+            const QString colKey =
+                (ci < colNames.size()) ? colNames[ci] : QStringLiteral("col_%1").arg(ci);
             switch (sqlite3_value_type(newVal)) {
                 case SQLITE_TEXT:
                     rowJson[colKey] = QString::fromUtf8(

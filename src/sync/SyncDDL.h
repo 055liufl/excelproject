@@ -158,18 +158,33 @@ CREATE TABLE IF NOT EXISTS __sync_inbox_ledger (
     };
 }
 
-// Canonical artifact naming helpers
-inline QString changesetArtifactName(const QString& origin, qint64 epoch, qint64 seq) {
-    return QStringLiteral("%1__%2__%3__changeset.payload")
+// Canonical artifact naming helpers.
+// H-08 fix: include target peer so the same changelog entry written for different peers
+// produces distinct file names (same outbox dir cannot hold two files with the same name).
+inline QString changesetArtifactName(const QString& origin, qint64 epoch, qint64 seq,
+                                     const QString& targetPeer = QString()) {
+    if (targetPeer.isEmpty())
+        return QStringLiteral("%1__%2__%3__changeset.payload")
+            .arg(origin)
+            .arg(epoch)
+            .arg(seq, 12, 10, QLatin1Char('0'));
+    return QStringLiteral("%1__%2__%3__%4__changeset.payload")
         .arg(origin)
         .arg(epoch)
-        .arg(seq, 12, 10, QLatin1Char('0'));
+        .arg(seq, 12, 10, QLatin1Char('0'))
+        .arg(targetPeer);
 }
 
-inline QString selectionPushArtifactName(const QString& pushId, int chunkSeq) {
-    return QStringLiteral("%1__%2__selectionpush.payload")
+inline QString selectionPushArtifactName(const QString& pushId, int chunkSeq,
+                                         const QString& targetPeer = QString()) {
+    if (targetPeer.isEmpty())
+        return QStringLiteral("%1__%2__selectionpush.payload")
+            .arg(pushId)
+            .arg(chunkSeq, 6, 10, QLatin1Char('0'));
+    return QStringLiteral("%1__%2__%3__selectionpush.payload")
         .arg(pushId)
-        .arg(chunkSeq, 6, 10, QLatin1Char('0'));
+        .arg(chunkSeq, 6, 10, QLatin1Char('0'))
+        .arg(targetPeer);
 }
 
 // H-03 fix: include a per-call UUID suffix so same-millisecond ACKs never collide.

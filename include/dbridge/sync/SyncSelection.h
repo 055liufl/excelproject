@@ -47,10 +47,18 @@ class DBRIDGE_EXPORT SyncSelection::Builder {
    public:
     Builder() = default;
     Builder& addRecord(const QString& table, const QString& pk) {
-        sel_.records_.append({table, pk});
+        // H-11 fix: reject non-simple identifiers to prevent SQL injection via table name.
+        if (!isSimpleIdent(table))
+            invalidTables_.append(table);
+        else
+            sel_.records_.append({table, pk});
         return *this;
     }
     Builder& addRecords(const QString& table, const QStringList& pks) {
+        if (!isSimpleIdent(table)) {
+            invalidTables_.append(table);
+            return *this;
+        }
         for (const auto& pk : pks)
             sel_.records_.append({table, pk});
         return *this;
@@ -73,6 +81,15 @@ class DBRIDGE_EXPORT SyncSelection::Builder {
     }
 
     SyncSelection build(QString* err = nullptr) {
+        // H-11 fix: reject invalid table identifiers.
+        if (!invalidTables_.isEmpty()) {
+            if (err)
+                *err = QStringLiteral(
+                           "E_SYNC_SELECTION_EMPTY: table name '%1' is not a valid "
+                           "SQLite identifier (must match [A-Za-z_][A-Za-z0-9_]*)")
+                           .arg(invalidTables_.first());
+            return SyncSelection{};
+        }
         // H-01 fix: reject raw-SQL addWhere() calls — only PK-set selection is supported in MVP.
         if (!rawWhereAttempts_.isEmpty()) {
             if (err)
@@ -93,6 +110,21 @@ class DBRIDGE_EXPORT SyncSelection::Builder {
    private:
     SyncSelection sel_;
     QStringList rawWhereAttempts_;
+    QStringList invalidTables_;
+
+    // H-11: simple identifier = starts with letter/underscore, contains only [A-Za-z0-9_].
+    static bool isSimpleIdent(const QString& s) {
+        if (s.isEmpty())
+            return false;
+        const QChar first = s[0];
+        if (!first.isLetter() && first != QLatin1Char('_'))
+            return false;
+        for (const QChar& c : s) {
+            if (!c.isLetterOrNumber() && c != QLatin1Char('_'))
+                return false;
+        }
+        return true;
+    }
 };
 
 }  // namespace dbridge::sync

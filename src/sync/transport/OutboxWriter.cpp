@@ -110,17 +110,22 @@ bool OutboxWriter::writeAtomic(const QString& finalName, const QByteArray& data,
     {
         QByteArray dirPath = d.absolutePath().toLocal8Bit();
         int dirFd = ::open(dirPath.constData(), O_RDONLY);
-        if (dirFd >= 0) {
-            const int rc = ::fsync(dirFd);
-            ::close(dirFd);
-            if (rc != 0) {
-                // M-02 fix: directory fsync failure means the rename/ready may not be durable.
-                if (err)
-                    *err = QStringLiteral("dir fsync failed for %1 (errno=%2)")
-                               .arg(d.absolutePath())
-                               .arg(errno);
-                return false;
-            }
+        if (dirFd < 0) {
+            // M-06 fix: directory open failure means we cannot fsync — treat as transport error.
+            if (err)
+                *err = QStringLiteral("cannot open dir for fsync: %1 (errno=%2)")
+                           .arg(d.absolutePath())
+                           .arg(errno);
+            return false;
+        }
+        const int rc = ::fsync(dirFd);
+        ::close(dirFd);
+        if (rc != 0) {
+            if (err)
+                *err = QStringLiteral("dir fsync failed for %1 (errno=%2)")
+                           .arg(d.absolutePath())
+                           .arg(errno);
+            return false;
         }
     }
 

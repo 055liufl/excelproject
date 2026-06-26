@@ -34,9 +34,27 @@ struct TableDiff {
     int modifiedRows = 0;
 };
 
+// Remote-side snapshot passed to IComparisonSession::initialize().
+struct RemoteTableSnapshot {
+    QString table;
+    // Per-table metadata for fast identical check (schema fingerprint + checksum + row count).
+    struct Meta {
+        QString schemaFingerprint;
+        QString contentChecksum;
+        qint64 rowCount = 0;
+    } meta;
+    // Remote rows for row-level diff. May be loaded lazily (empty = use fetchRemoteRows).
+    QList<QVariantMap> rows;
+};
+
 class DBRIDGE_EXPORT IComparisonSession {
    public:
     virtual ~IComparisonSession() = default;
+
+    // C-10 fix: initialize the session with remote snapshot data.
+    // Must be called before tableDiffs() / rowDiffs(). Returns false on error.
+    virtual bool initialize(const QList<RemoteTableSnapshot>& remoteSnapshots,
+                            QString* err = nullptr) = 0;
 
     virtual QList<TableDiff> tableDiffs() const = 0;
     virtual QList<RowDiff> rowDiffs(const QString& table, int offset = 0, int limit = -1) const = 0;

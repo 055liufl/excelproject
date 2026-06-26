@@ -160,14 +160,16 @@ bool hasAnyLookupHCols(const QVector<RouteSpec>& routes) {
 }
 
 // Build the extra SQL column selections for H-cols (all lookups, roundtrip true and false).
-// Returns e.g. ", t.h1, t.h2" to be appended before " FROM " in the base SQL.
+// Returns e.g. ", "t"."h1", "t"."h2"" to be appended before " FROM " in the base SQL.
 QString buildHColSelectSuffix(const QVector<RouteSpec>& routes) {
     QStringList parts;
     QSet<QString> seen;
     for (const auto& route : routes) {
         for (const auto& lk : route.lookups) {
             for (const auto& sp : lk.select) {
-                QString qualified = route.table + QLatin1Char('.') + sp.second;
+                // H-10 fix: quote both table and column identifiers.
+                QString qualified = SqlBuilder::quoteIdent(route.table) + QLatin1Char('.') +
+                                    SqlBuilder::quoteIdent(sp.second);
                 if (!seen.contains(qualified)) {
                     seen.insert(qualified);
                     parts.append(qualified);
@@ -271,21 +273,27 @@ bool buildReverseCache(const QVector<RouteSpec>& routes, const SchemaCatalog& ca
             int end = qMin(start + chunkSize, keyList.size());
             int batchSize = end - start;
 
-            QString sql = QStringLiteral("SELECT ") + selectColNames.join(QStringLiteral(", ")) +
-                          QStringLiteral(" FROM ") + lk.fromTable + QStringLiteral(" WHERE ");
+            // H-10 fix: quote all identifiers in reverse lookup prefetch SQL.
+            QStringList quotedSelectCols;
+            for (const auto& colName : selectColNames)
+                quotedSelectCols.append(SqlBuilder::quoteIdent(colName));
+            QString sql = QStringLiteral("SELECT ") + quotedSelectCols.join(QStringLiteral(", ")) +
+                          QStringLiteral(" FROM ") + SqlBuilder::quoteIdent(lk.fromTable) +
+                          QStringLiteral(" WHERE ");
 
             if (numSelectCols == 1) {
                 QStringList placeholders;
                 for (int i = 0; i < batchSize; ++i)
                     placeholders.append(QStringLiteral("?"));
-                sql += lk.select[0].first + QStringLiteral(" IN (") +
+                sql += SqlBuilder::quoteIdent(lk.select[0].first) + QStringLiteral(" IN (") +
                        placeholders.join(QStringLiteral(", ")) + QStringLiteral(")");
             } else {
                 QStringList orClauses;
                 for (int i = 0; i < batchSize; ++i) {
                     QStringList andClauses;
                     for (const auto& sp : lk.select)
-                        andClauses.append(sp.first + QStringLiteral(" = ?"));
+                        andClauses.append(SqlBuilder::quoteIdent(sp.first) +
+                                          QStringLiteral(" = ?"));
                     orClauses.append(QStringLiteral("(") +
                                      andClauses.join(QStringLiteral(" AND ")) +
                                      QStringLiteral(")"));

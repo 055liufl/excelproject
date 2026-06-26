@@ -448,9 +448,16 @@ bool SyncWorker::processArtifact(const QString& path) {
     QFileInfo fi(path);
     QString name = fi.fileName();
 
-    // Skip .ack files — handled separately
+    // M-07 fix: ACK artifacts also enter the inbox ledger to avoid infinite re-processing.
     if (name.endsWith(QStringLiteral(".ack"))) {
-        return processAckArtifact(path, name);
+        LedgerStatus ackSt = ledger_->status(*wconnPtr_, name);
+        if (ackSt == LedgerStatus::Consumed)
+            return true;  // already processed
+        ledger_->markSeen(*wconnPtr_, name, nullptr);
+        const bool ok = processAckArtifact(path, name);
+        if (ok)
+            ledger_->markConsumed(*wconnPtr_, name, nullptr);
+        return ok;
     }
 
     // Check ledger
@@ -880,9 +887,9 @@ bool SyncWorker::broadcastTopeer(const QString& peer, QString* outErr) {
         hdr.routeTag = peer;
 
         QByteArray payload = codec_->encodeChangeset(hdr, changesetToSend);
-        // H-07 fix: use stable artifact naming contract for interop with third-party mover.
+        // H-07 / H-08 fix: include target peer so different peers get distinct file names.
         QString artifactName =
-            ddl::changesetArtifactName(entry.origin, hdr.streamEpoch, entry.originSeq);
+            ddl::changesetArtifactName(entry.origin, hdr.streamEpoch, entry.originSeq, peer);
         QString writeErr;
         if (!outbox_->write(artifactName, payload, &writeErr)) {
             emit errorOccurred(
@@ -1003,25 +1010,29 @@ bool SyncWorker::runBaselineFallbackFor(const QString& artifactName) {
     if (!baseline.shouldFallbackToBaseline(applied, dec.header.originSeq))
         return false;
 
-    BaselineManager::BaselineArtifact artifact;
-    QString baselineErr;
-    if (!baseline.exportBaseline(*wconnPtr_, canonicalSyncTables_, &artifact, &baselineErr)) {
-        emit errorOccurred({err::E_SYNC_BASELINE_FAILED, Severity::Error,
-                            QStringLiteral("baseline"), dec.header.origin, baselineErr});
-        return false;
-    }
+    // C-09 fix: a self-export+apply cycle ("local self-referential baseline") cannot close
+    // the gap — it just re-encodes what we already have without advancing the origin_seq.
+    // Correct behavior requires requesting a baseline artifact FROM the source node over the
+    // transport layer. Until that is implemented, quarantine the artifact and emit E_SYNC_GAP
+    // so the operator knows manual intervention or source-side baseline generation is needed.
+    emit errorOccurred(
+        {err::E_SYNC_GAP, Severity::Error, QStringLiteral("baseline"), dec.header.origin,
+         QStringLiteral("Gap for origin=%1 seq=%2 exceeds threshold. "
+                        "A source-authoritative baseline is required (FR-8). "
+                        "Quarantining pending artifact until source baseline is received.")
+             .arg(dec.header.origin)
+             .arg(dec.header.originSeq)});
 
-    ConsistencyCache cache;
-    cache.init(*wconnPtr_, config_.consistencyCacheDurable(), nullptr);
-    qint64 newAnchorSeq = 0;
-    if (!baseline.applyBaseline(*wconnPtr_, hPtr_, artifact, *av_, *ts_, *rw_, cache,
-                                dec.header.streamEpoch, dec.header.origin, &newAnchorSeq,
-                                &baselineErr)) {
-        emit errorOccurred({err::E_SYNC_BASELINE_FAILED, Severity::Error,
-                            QStringLiteral("baseline"), dec.header.origin, baselineErr});
-        return false;
+    // Move the gap artifact to quarantine so it doesn't endlessly re-trigger this fallback.
+    if (!config_.quarantineDir().isEmpty()) {
+        QDir qDir(config_.quarantineDir());
+        qDir.mkpath(QStringLiteral("."));
+        if (QFile::copy(path, qDir.filePath(artifactName)))
+            QFile::remove(path);
     }
-    return true;
+    // Mark consumed in ledger so the rescan doesn't re-attempt.
+    ledger_->markConsumed(*wconnPtr_, artifactName, nullptr);
+    return false;
 }
 
 // I-04: Submit import to run on the worker thread using wconn + session capture.
@@ -1263,9 +1274,11 @@ void SyncWorker::enqueueSelectionPush(const SyncSelection& selection,
                 body.rows.append(row);
 
             QByteArray payload = codec_->encodeSelectionPush(hdr, body);
-            // H-07 fix: use stable naming contract for interop with third-party transport mover.
+            // H-07 / H-08 fix: include center node as target peer to disambiguate artifacts.
+            const QString centerPeer = config_.centerNodeId().isEmpty() ? QStringLiteral("center")
+                                                                        : config_.centerNodeId();
             const QString artifactName =
-                ddl::selectionPushArtifactName(chunk.pushId, chunk.chunkSeq);
+                ddl::selectionPushArtifactName(chunk.pushId, chunk.chunkSeq, centerPeer);
             QString writeErr;
             if (!outbox_->write(artifactName, payload, &writeErr)) {
                 emit errorOccurred({err::E_SYNC_TRANSPORT, Severity::Error,

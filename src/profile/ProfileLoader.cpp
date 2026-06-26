@@ -215,9 +215,26 @@ bool readTemporalSlot(const QJsonValue& v, TemporalSlotKind kind, const QString&
             TemporalSideSpec excelSide;
             excelSide.declared = true;
             excelSide.type = TemporalPhysType::String;
+
+            // M-02 fix: explicit null for excelFormat must be rejected (not silently treated as
+            // "").
+            if (hasExcelFormat && o.value(QStringLiteral("excelFormat")).isNull()) {
+                if (err)
+                    *err = ownerLabel + QStringLiteral(": ") + QLatin1String(slotKindName(kind)) +
+                           QStringLiteral(".excelFormat must not be null");
+                return false;
+            }
             excelSide.format = o.value(QStringLiteral("excelFormat")).toString();
 
             QJsonValue fbVal = o.value(QStringLiteral("excelFormatFallback"));
+            // M-02 fix: explicit null for excelFormatFallback must be rejected (not silently
+            // skipped).
+            if (hasFallback && fbVal.isNull()) {
+                if (err)
+                    *err = ownerLabel + QStringLiteral(": ") + QLatin1String(slotKindName(kind)) +
+                           QStringLiteral(".excelFormatFallback must not be null");
+                return false;
+            }
             if (!fbVal.isUndefined() && !fbVal.isNull()) {
                 if (!fbVal.isArray()) {
                     if (err)
@@ -264,6 +281,14 @@ bool readTemporalSlot(const QJsonValue& v, TemporalSlotKind kind, const QString&
             TemporalSideSpec dbSide;
             dbSide.declared = true;
             dbSide.type = TemporalPhysType::String;
+
+            // M-02 fix: explicit null for dbFormat must be rejected (not silently treated as "").
+            if (o.value(QStringLiteral("dbFormat")).isNull()) {
+                if (err)
+                    *err = ownerLabel + QStringLiteral(": ") + QLatin1String(slotKindName(kind)) +
+                           QStringLiteral(".dbFormat must not be null");
+                return false;
+            }
             dbSide.format = o.value(QStringLiteral("dbFormat")).toString();
 
             QString offending;

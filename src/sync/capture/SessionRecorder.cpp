@@ -44,7 +44,7 @@ bool SessionRecorder::begin(sqlite3* h, const QStringList& syncTables, QString* 
 bool SessionRecorder::sealInto(sqlite3* h, ChangelogStore& store, QSqlDatabase& db, WriteTxn& txn,
                                const QString& origin, qint64 epoch, qint64 schemaVer,
                                const QString& schemaFp, qint64 parentSeq, qint64 originSeq,
-                               qint64* outLocalSeq, QString* err) {
+                               qint64* outLocalSeq, QString* err, const QString& pushId) {
     if (!session_) {
         if (err)
             *err = QStringLiteral("SessionRecorder not active");
@@ -77,7 +77,9 @@ bool SessionRecorder::sealInto(sqlite3* h, ChangelogStore& store, QSqlDatabase& 
     bool ok = store.append(db, QStringLiteral("changeset"), origin,
                            /*sourcePeer=*/QString(), originSeq, parentSeq, epoch, schemaVer,
                            schemaFp, changeset,
-                           /*authoritative=*/true, outLocalSeq, err);
+                           /*authoritative=*/true, outLocalSeq, err,
+                           /*pushId=*/pushId);  // H-01 fix: forward pushId so selection-push
+                                                // changesets have push_id recorded in changelog
     Q_UNUSED(h);
     return ok;
 }

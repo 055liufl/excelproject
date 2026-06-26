@@ -339,8 +339,11 @@ WriteResult CapturedWriteTemplate::branchBC(const WriteParams& p) {
         return result;
     }
 
+    // H-01 fix: pass p.pushId so selection-push changesets (InboundSelectionPush) have their
+    // push_id recorded in the changelog, enabling the broadcast barrier to filter by specific push.
     if (!rec_.sealInto(h_, clog_, wconn_, txn, origin, epoch, isInbound ? p.schemaVer : schemaVer_,
-                       isInbound ? p.schemaFp : schemaFp_, parentSeq, originSeq, &localSeq, &err)) {
+                       isInbound ? p.schemaFp : schemaFp_, parentSeq, originSeq, &localSeq, &err,
+                       /*pushId=*/p.pushId)) {
         txn.rollback();
         result.errorCode = QStringLiteral("SEAL");
         result.errorMsg = err;

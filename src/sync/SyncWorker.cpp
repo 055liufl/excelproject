@@ -1145,11 +1145,14 @@ bool SyncWorker::broadcastTopeer(const QString& peer, QString* outErr,
         if (!routing_->shouldRoute(peer, entry.origin, entry.originSeq, peerOriginAcked))
             continue;
 
-        // C-04 / H-01 fix: skip changelog entries produced by a selection push that has not yet
-        // been fully ACKed by all recipients.  Only skip when the entry's own push_id is
-        // still streaming/pending — not all pushes from the same origin (H-01: coarse filter bug).
+        // H-01 fix: skip changelog entries produced by a selection push that has not yet been fully
+        // applied (status != 'done').  Only skip when the entry's own push_id is still pending —
+        // not all pushes from the same origin (coarse filter bug).
         // Entries without a push_id (plain changesets) are never blocked.
-        if (entry.origin != config_.nodeId() && !entry.pushId.isEmpty()) {
+        // Note: the previous guard "entry.origin != config_.nodeId()" is intentionally removed:
+        // center nodes can be the originator of a selection push, and their own captured changesets
+        // must also be held back until the entire push is marked done.
+        if (!entry.pushId.isEmpty()) {
             QSqlQuery pushQ(*wconnPtr_);
             pushQ.prepare(
                 QStringLiteral("SELECT COUNT(*) FROM __sync_push_progress "

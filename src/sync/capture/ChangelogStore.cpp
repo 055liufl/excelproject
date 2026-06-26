@@ -22,9 +22,9 @@ bool ChangelogStore::append(QSqlDatabase& db, const QString& kind, const QString
                             const QString& sourcePeer, qint64 originSeq, qint64 parentSeq,
                             qint64 epoch, qint64 schemaVer, const QString& schemaFp,
                             const QByteArray& changeset, bool authoritative, qint64* localSeqOut,
-                            QString* err) {
+                            QString* err, const QString& pushId) {
     return insertRow(db, kind, origin, sourcePeer, originSeq, parentSeq, epoch, schemaVer, schemaFp,
-                     changeset, authoritative, localSeqOut, err);
+                     changeset, authoritative, localSeqOut, err, pushId);
 }
 
 bool ChangelogStore::appendForward(QSqlDatabase& db, const QString& origin,

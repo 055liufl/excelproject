@@ -13,10 +13,14 @@ class ChangelogStore {
 
     // Branch B/C: write a locally-captured changeset (fresh capture or
     // re-encoded incoming). authoritative=true for own captures.
+    // H-01 fix: accepts optional pushId so selection-push changesets record their push_id,
+    // enabling the broadcast barrier to filter by this specific push rather than all pushes
+    // from the same origin.
     bool append(QSqlDatabase& db, const QString& kind, const QString& origin,
                 const QString& sourcePeer, qint64 originSeq, qint64 parentSeq, qint64 epoch,
                 qint64 schemaVer, const QString& schemaFp, const QByteArray& changeset,
-                bool authoritative, qint64* localSeqOut, QString* err);
+                bool authoritative, qint64* localSeqOut, QString* err,
+                const QString& pushId = QString());
 
     // Branch A: store incoming raw blob verbatim (forwarded changeset).
     // M-04 fix: accepts optional pushId (empty for plain changesets, non-empty for selection push

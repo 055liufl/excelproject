@@ -1,4 +1,6 @@
 #pragma once
+#include "dbridge/sync/SyncTypes.h"
+
 #include <QByteArray>
 #include <QSqlDatabase>
 #include <QString>
@@ -11,6 +13,8 @@ namespace dbridge::sync {
 struct ApplyOptions {
     // Authoritative down-link: always replace without consulting RowWinnerStore.
     bool authoritative = false;
+    // M-01 fix: conflict resolution policy for non-authoritative changesets.
+    ConflictPolicy conflictPolicy = ConflictPolicy::SourceWins;
 };
 
 struct ApplyOutcome {
@@ -49,6 +53,8 @@ class ChangesetApplier {
         ApplyOutcome* outcome;
         // H-04: tables allowed by xFilter; empty = accept all.
         const QStringList* syncTables = nullptr;
+        // M-01 fix: conflict resolution policy for non-authoritative changesets.
+        ConflictPolicy conflictPolicy = ConflictPolicy::SourceWins;
     };
 
     static int conflictCb(void* ctx, int conflict, sqlite3_changeset_iter* iter);

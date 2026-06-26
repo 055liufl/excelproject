@@ -605,6 +605,20 @@ bool SyncWorker::processChangesetArtifact(const DecodeResult& dec, const QString
     p.originRank = config_.originRank(hdr.origin);
     p.changesetBlob = dec.changeset;
 
+    // H-01 fix: Edge nodes receiving a changeset from the center node treat it as
+    // authoritative so the center always wins (center→edge convergence guarantee).
+    const QString& senderPeer = hdr.senderPeer.isEmpty() ? hdr.origin : hdr.senderPeer;
+    p.authoritative = (config_.role() == NodeRole::Edge && !config_.centerNodeId().isEmpty() &&
+                       senderPeer == config_.centerNodeId());
+
+    // H-02 fix: propagate the node's syncTables allow-list so filterCb rejects tables
+    // outside the configured subset (previously syncTables was left empty = accept all).
+    p.syncTables = canonicalSyncTables_;
+
+    // M-01 fix: propagate the configured conflict policy so the apply path can honour
+    // TargetWins/Manual instead of always defaulting to SourceWins.
+    p.conflictPolicy = config_.conflictPolicy();
+
     WriteResult res = tpl_->execute(p);
     if (!res.ok) {
         // H-03 fix: GAP_PENDING is not a hard error — keep artifact in ledger as 'seen' so the

@@ -104,7 +104,11 @@ WriteResult CapturedWriteTemplate::branchA(const WriteParams& p) {
 
     // 3. Apply changeset (no SessionRecorder – we store the raw blob)
     ApplyOptions opts;
-    opts.authoritative = false;
+    // H-01 fix: honour the authoritative flag set by processChangesetArtifact when the
+    // changeset originates from the center node (center→edge down-link).
+    opts.authoritative = p.authoritative;
+    // M-01 fix: propagate conflict policy so conflictCb can apply TargetWins/Manual.
+    opts.conflictPolicy = p.conflictPolicy;
     if (!applier_.apply(h_, wconn_, p.changesetBlob, p.origin, p.originRank, p.seq, rw_, opts,
                         p.syncTables, &result.applyOutcome, &err)) {
         txn.rollback();

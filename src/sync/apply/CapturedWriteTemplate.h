@@ -39,6 +39,10 @@ struct WriteParams {
 
     // Branch A (InboundChangeset):
     QByteArray changesetBlob;
+    // H-01 fix: set true when the changeset comes from an authoritative source (center→edge).
+    bool authoritative = false;
+    // M-01 fix: conflict resolution policy for non-authoritative applies.
+    ConflictPolicy conflictPolicy = ConflictPolicy::SourceWins;
 
     // Branch B/C (SelectionPush / LocalWrite):
     QList<RowMutation> mutations;

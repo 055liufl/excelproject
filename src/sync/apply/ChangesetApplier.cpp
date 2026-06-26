@@ -100,6 +100,9 @@ bool ChangesetApplier::apply(sqlite3* h, QSqlDatabase& wconn, const QByteArray& 
     // xFilter (table allow-list) and xConflict (row-winner arbitration) state.
     ctx.syncTables = syncTables.isEmpty() ? nullptr : &syncTables;
 
+    // M-01 fix: carry conflict policy into the callback for non-authoritative resolution.
+    ctx.conflictPolicy = opts.conflictPolicy;
+
     // C-11 fix: there is no reliable public SQLite API to rebuild a row-filtered changeset, so
     // we do NOT pre-filter. Instead, low-rank DELETE protection is enforced AFTER apply by
     // updateWinnersFromChangeset(): it restores any high-rank row erased by a dominated DELETE,
@@ -180,7 +183,15 @@ int ChangesetApplier::conflictCb(void* ctx, int conflict, sqlite3_changeset_iter
                 return SQLITE_CHANGESET_REPLACE;
             }
 
-            // Non-authoritative: consult RowWinnerStore.
+            // M-01 fix: apply conflict policy before consulting RowWinnerStore.
+            // TargetWins and Manual both OMIT the challenger (i.e. local row wins).
+            if (c->conflictPolicy == ConflictPolicy::TargetWins ||
+                c->conflictPolicy == ConflictPolicy::Manual) {
+                c->outcome->ignored++;
+                return SQLITE_CHANGESET_OMIT;
+            }
+
+            // Non-authoritative (SourceWins default): consult RowWinnerStore.
             const char* tblName = nullptr;
             int nCol = 0;
             int opOut = 0;

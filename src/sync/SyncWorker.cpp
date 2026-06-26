@@ -449,17 +449,14 @@ void SyncWorker::scanInbox() {
     for (const QString& path : found)
         processArtifact(path);
 
-    // M-01 fix: check for artifacts stuck in 'seen' beyond the gap timeout.
-    // These represent persistent gaps in the changeset stream that will never self-heal
-    // without a baseline reset.
-    constexpr qint64 kDefaultGapTimeoutMs = 30 * 1000;  // 30 s; future: from SyncConfig
-    QStringList stale = ledger_->stalePending(*wconnPtr_, kDefaultGapTimeoutMs);
+    // M-1 fix: gap timeout is now configurable via SyncConfig (default 30 s).
+    QStringList stale = ledger_->stalePending(*wconnPtr_, config_.gapTimeoutMs());
     if (!stale.isEmpty()) {
         emit errorOccurred(
             {err::E_SYNC_GAP, Severity::Error, QStringLiteral("scanInbox"), QString(),
              QStringLiteral("Changeset gap unresolved after %1ms; %2 artifact(s) pending. "
                             "Baseline fallback required.")
-                 .arg(kDefaultGapTimeoutMs)
+                 .arg(config_.gapTimeoutMs())
                  .arg(stale.size())});
         for (const QString& artifactName : stale)
             runBaselineFallbackFor(artifactName);

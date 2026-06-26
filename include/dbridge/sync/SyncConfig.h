@@ -103,6 +103,10 @@ class DBRIDGE_EXPORT SyncConfig {
     bool consistencyCacheDurable() const {
         return consistencyCacheDurable_;
     }
+    // M-1 fix: gap timeout is now configurable via SyncConfig (previously hardcoded to 30 s).
+    qint64 gapTimeoutMs() const {
+        return gapTimeoutMs_;
+    }
 
     bool isValid() const {
         return valid_;
@@ -143,6 +147,7 @@ class DBRIDGE_EXPORT SyncConfig {
     qint64 maxSelectionSize_ = 100000;
     qint64 pushChunkBudgetBytes_ = 2 * 1024 * 1024;
     bool consistencyCacheDurable_ = true;
+    qint64 gapTimeoutMs_ = 30 * 1000;  // M-1: default 30 s; configurable via Builder
 };
 
 class DBRIDGE_EXPORT SyncConfig::Builder {
@@ -266,6 +271,10 @@ class DBRIDGE_EXPORT SyncConfig::Builder {
     }
     Builder& consistencyCacheDurable(bool on) {
         cfg_.consistencyCacheDurable_ = on;
+        return *this;
+    }
+    Builder& gapTimeoutMs(qint64 ms) {
+        cfg_.gapTimeoutMs_ = ms;
         return *this;
     }
 

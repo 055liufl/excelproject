@@ -62,16 +62,19 @@ bool ComparisonSession::initialize(const QStringList& tables,
                                    const QHash<QString, DiffEngine::RemoteMeta>& remoteMetas,
                                    const QHash<QString, QList<QVariantMap>>& remoteRows,
                                    QString* err) {
-    // Pin a read snapshot by issuing a no-op query on rconn.
-    // SQLite in WAL mode isolates the read transaction from that point on.
-    {
-        QSqlQuery q(rconn_);
-        if (!q.exec("SELECT * FROM sqlite_master LIMIT 0")) {
-            if (err)
-                *err = q.lastError().text();
-            return false;
-        }
+    // H-7 fix: pin a real read snapshot by opening an explicit read transaction.
+    // A bare SELECT in autocommit mode does NOT hold a snapshot across multiple queries —
+    // SQLite in WAL mode only pins the snapshot for the duration of the query itself.
+    // BEGIN DEFERRED pins the read snapshot for the life of the transaction on rconn_.
+    // Note: rconn_ is a dedicated read-only connection, so BEGIN DEFERRED is safe here
+    // and does not conflict with the write connection held by SyncWorker.
+    if (!rconn_.transaction()) {
+        if (err)
+            *err = QStringLiteral("ComparisonSession: cannot start read transaction: %1")
+                       .arg(rconn_.lastError().text());
+        return false;
     }
+    readTxnActive_ = true;
     pinnedDataVersion_ = readDataVersion(err);
     if (pinnedDataVersion_ <= 0)
         return false;
@@ -167,17 +170,18 @@ bool ComparisonSession::acceptRemote(const QString& table, const QString& pk) {
 
 bool ComparisonSession::stageCell(const QString& table, const QString& pk, const QString& column,
                                   const QVariant& value) {
-    // Start from already-staged row if present, otherwise fall back to local.
-    QVariantMap row;
-
-    // Check staged_ by looking for the pk in the staging buffer via a
-    // round-trip: we save, then retrieve — but StagingBuffer has no getter.
-    // Use findLocalRow as base, then overlay with the remote to get latest.
-    row = findLocalRow(table, pk);
-    if (row.isEmpty())
-        row = findRemoteRow(table, pk);
-    if (row.isEmpty())
-        return false;
+    // C-4 fix: start from the already-staged version of the row so that multiple stageCell()
+    // calls accumulate correctly. Without this, each call re-reads from local/remote and
+    // overwrites any cells that were staged by previous stageCell() calls on the same row.
+    QVariantMap row = staging_.getRow(table, pk);
+    if (row.isEmpty()) {
+        // Not yet staged — seed from local row, fall back to remote.
+        row = findLocalRow(table, pk);
+        if (row.isEmpty())
+            row = findRemoteRow(table, pk);
+        if (row.isEmpty())
+            return false;
+    }
 
     row.insert(column, value);
     staging_.stage(table, pk, row);
@@ -235,6 +239,10 @@ QList<RowDiff> ComparisonSession::fetchRemoteRows(const QString& table,
 
 bool ComparisonSession::save(QString* err) {
     if (staging_.isEmpty()) {
+        if (readTxnActive_) {
+            rconn_.rollback();
+            readTxnActive_ = false;
+        }
         gate_.releaseAll();
         if (context_ && context_->rescanFn)
             context_->rescanFn();
@@ -243,6 +251,10 @@ bool ComparisonSession::save(QString* err) {
 
     if (!checkStale(err)) {
         staging_.discard();
+        if (readTxnActive_) {
+            rconn_.rollback();
+            readTxnActive_ = false;
+        }
         gate_.releaseAll();
         if (context_ && context_->rescanFn)
             context_->rescanFn();
@@ -309,6 +321,11 @@ bool ComparisonSession::save(QString* err) {
     }
 
     staging_.discard();
+    // H-7 fix: commit (ROLLBACK is fine too — no writes on rconn_) the pinned read transaction.
+    if (readTxnActive_) {
+        rconn_.rollback();
+        readTxnActive_ = false;
+    }
     gate_.releaseAll();
     if (context_ && context_->rescanFn)
         context_->rescanFn();
@@ -317,6 +334,11 @@ bool ComparisonSession::save(QString* err) {
 
 void ComparisonSession::discard() {
     staging_.discard();
+    // H-7 fix: release pinned read transaction on discard as well.
+    if (readTxnActive_) {
+        rconn_.rollback();
+        readTxnActive_ = false;
+    }
     gate_.releaseAll();
     // H-09 fix: trigger rescan so pending 'seen' artifacts deferred during session are processed.
     if (context_ && context_->rescanFn)

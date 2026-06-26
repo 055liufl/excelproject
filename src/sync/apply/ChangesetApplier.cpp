@@ -290,7 +290,24 @@ bool ChangesetApplier::updateWinnersFromChangeset(const QByteArray& changeset,
                 for (auto it = obj.begin(); it != obj.end(); ++it) {
                     cols << detail::SqlBuilder::quoteIdent(it.key());
                     placeholders << QStringLiteral("?");
-                    vals << it.value().toVariant();
+                    // C-2/C-3 fix: decode type-tagged values stored by the winner serializer.
+                    // "__i64:<n>" → qlonglong, "__b64:<base64>" → QByteArray, else → as-is.
+                    QVariant val;
+                    if (it.value().isString()) {
+                        const QString s = it.value().toString();
+                        if (s.startsWith(QLatin1String("__i64:"))) {
+                            bool ok = false;
+                            qint64 iv = s.mid(6).toLongLong(&ok);
+                            val = ok ? QVariant(iv) : QVariant(s);
+                        } else if (s.startsWith(QLatin1String("__b64:"))) {
+                            val = QVariant(QByteArray::fromBase64(s.mid(6).toLatin1()));
+                        } else {
+                            val = QVariant(s);
+                        }
+                    } else {
+                        val = it.value().toVariant();
+                    }
+                    vals << val;
                 }
                 if (cols.isEmpty()) {
                     if (err)
@@ -390,12 +407,29 @@ bool ChangesetApplier::updateWinnersFromChangeset(const QByteArray& changeset,
                     rowJson[colKey] = QString::fromUtf8(
                         reinterpret_cast<const char*>(sqlite3_value_text(newVal)));
                     break;
-                case SQLITE_INTEGER:
-                    rowJson[colKey] = static_cast<double>(sqlite3_value_int64(newVal));
+                case SQLITE_INTEGER: {
+                    // C-2 fix: JSON doubles cannot represent all 64-bit integers exactly
+                    // (integers > 2^53 lose precision). Store as a tagged string to preserve
+                    // full int64 precision for row-winner restore.
+                    qint64 iv = sqlite3_value_int64(newVal);
+                    rowJson[colKey] = QStringLiteral("__i64:") + QString::number(iv);
                     break;
+                }
                 case SQLITE_FLOAT:
                     rowJson[colKey] = sqlite3_value_double(newVal);
                     break;
+                case SQLITE_BLOB: {
+                    // C-3 fix: BLOB values must be preserved for row-winner restore.
+                    // Encode as base64 with a type tag so the restore path can rebind as
+                    // QByteArray (which Qt/SQLite driver maps back to a BLOB column).
+                    const void* blobPtr = sqlite3_value_blob(newVal);
+                    int blobLen = sqlite3_value_bytes(newVal);
+                    QByteArray ba = (blobPtr && blobLen > 0)
+                                        ? QByteArray(static_cast<const char*>(blobPtr), blobLen)
+                                        : QByteArray();
+                    rowJson[colKey] = QStringLiteral("__b64:") + QString::fromLatin1(ba.toBase64());
+                    break;
+                }
                 default:
                     rowJson[colKey] = QJsonValue::Null;
             }

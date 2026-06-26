@@ -68,6 +68,7 @@ class ComparisonSession : public IComparisonSession {
     qint64 streamEpoch_;
     std::shared_ptr<SyncContext> context_;
     qint64 pinnedDataVersion_ = 0;
+    bool readTxnActive_ = false;  // H-7: tracks whether BEGIN DEFERRED is open on rconn_
     QList<TableDiff> diffs_;
     QHash<QString, RemoteTableData> remoteData_;
     mutable QHash<QString, QString> pkColCache_;

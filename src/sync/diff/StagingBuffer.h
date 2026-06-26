@@ -17,6 +17,9 @@ class StagingBuffer {
     void stage(const QString& table, const QString& pk, const QVariantMap& row);
     void unstage(const QString& table, const QString& pk);
 
+    // C-4 fix: return the currently staged row for (table, pk), or empty map if not staged.
+    QVariantMap getRow(const QString& table, const QString& pk) const;
+
     // Flush all staged rows to wconn via UpsertExecutor.
     // pkCols: primary key column names (used to build RowMutation).
     bool save(QSqlDatabase& wconn, UpsertExecutor& upsert, const QStringList& pkCols, QString* err);

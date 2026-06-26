@@ -84,6 +84,14 @@ QList<RowMutation> StagingBuffer::toMutations(const QHash<QString, QStringList>&
     return mutations;
 }
 
+QVariantMap StagingBuffer::getRow(const QString& table, const QString& pk) const {
+    for (const StagedRow& sr : staged_) {
+        if (sr.table == table && sr.pk == pk)
+            return sr.row;
+    }
+    return {};
+}
+
 void StagingBuffer::discard() {
     staged_.clear();
 }

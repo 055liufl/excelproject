@@ -8,6 +8,8 @@
 #include <QStringList>
 #include <QVariant>
 
+#include "sql/SqlBuilder.h"
+
 namespace dbridge::sync {
 
 // ---------------------------------------------------------------------------
@@ -113,8 +115,9 @@ bool TableStateStore::resetFromBaseline(QSqlDatabase& db, const QStringList& tab
         }
 
         // Scan all rows of the business table to compute checksum + count.
+        // H-3 fix: use quoteIdent to handle table names with embedded double-quotes.
         QSqlQuery scan(db);
-        if (!scan.exec(QStringLiteral("SELECT * FROM \"%1\"").arg(tbl))) {
+        if (!scan.exec(QStringLiteral("SELECT * FROM ") + detail::SqlBuilder::quoteIdent(tbl))) {
             if (err)
                 *err = scan.lastError().text();
             return false;

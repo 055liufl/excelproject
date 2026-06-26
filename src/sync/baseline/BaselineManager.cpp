@@ -219,20 +219,12 @@ bool BaselineManager::applyBaseline(QSqlDatabase& wconn, sqlite3* /*h*/,
             *ep = QStringLiteral("%1: %2").arg(QLatin1String(err::E_SYNC_BASELINE_FAILED), *ep);
     };
 
-    WriteTxn txn(wconn);
-    if (!txn.begin(err)) {
-        wrapErr(err);
-        return false;
-    }
-
-    // M-4 fix: temporarily disable FK enforcement during baseline apply.
-    // The baseline data does DELETE + full re-INSERT per table. Without FK OFF, deleting a
-    // parent table before a child table (or vice versa) would violate FK constraints.
-    // Since we verify the source DB was consistent, re-enabling FK after all INSERTs is safe.
+    // C-1 fix: PRAGMA foreign_keys cannot be changed from within a SQLite transaction — the
+    // pragma is silently ignored if issued inside BEGIN...COMMIT. Disable FK enforcement
+    // BEFORE opening the transaction so the setting takes effect immediately.
     {
         QSqlQuery pragmaOff(wconn);
         if (!pragmaOff.exec(QStringLiteral("PRAGMA foreign_keys=OFF"))) {
-            txn.rollback();
             if (err)
                 *err = QStringLiteral("%1: cannot disable FK enforcement: %2")
                            .arg(QLatin1String(err::E_SYNC_BASELINE_FAILED),
@@ -241,27 +233,21 @@ bool BaselineManager::applyBaseline(QSqlDatabase& wconn, sqlite3* /*h*/,
         }
     }
 
-    QStringList tables;
-    if (!deserializeAndApply(wconn, art.data, &tables, err)) {
+    WriteTxn txn(wconn);
+    if (!txn.begin(err)) {
         QSqlQuery pragmaOn(wconn);
         pragmaOn.exec(QStringLiteral("PRAGMA foreign_keys=ON"));
-        txn.rollback();
         wrapErr(err);
         return false;
     }
 
-    // Re-enable FK enforcement before commit so any FK inconsistency in the baseline data
-    // is caught by SQLite's deferred constraint check at commit time.
-    {
+    QStringList tables;
+    if (!deserializeAndApply(wconn, art.data, &tables, err)) {
+        txn.rollback();
         QSqlQuery pragmaOn(wconn);
-        if (!pragmaOn.exec(QStringLiteral("PRAGMA foreign_keys=ON"))) {
-            txn.rollback();
-            if (err)
-                *err = QStringLiteral("%1: cannot re-enable FK enforcement: %2")
-                           .arg(QLatin1String(err::E_SYNC_BASELINE_FAILED),
-                                pragmaOn.lastError().text());
-            return false;
-        }
+        pragmaOn.exec(QStringLiteral("PRAGMA foreign_keys=ON"));
+        wrapErr(err);
+        return false;
     }
 
     // Reset applied vector for this origin/epoch.
@@ -288,8 +274,17 @@ bool BaselineManager::applyBaseline(QSqlDatabase& wconn, sqlite3* /*h*/,
     }
 
     if (!txn.commit(err)) {
+        QSqlQuery pragmaOnErr(wconn);
+        pragmaOnErr.exec(QStringLiteral("PRAGMA foreign_keys=ON"));
         wrapErr(err);
         return false;
+    }
+
+    // C-1 fix: re-enable FK enforcement AFTER the transaction commits (outside BEGIN...COMMIT
+    // so the pragma actually takes effect — SQLite ignores it inside a transaction).
+    {
+        QSqlQuery pragmaOn(wconn);
+        pragmaOn.exec(QStringLiteral("PRAGMA foreign_keys=ON"));
     }
 
     // Invalidate in-memory consistency cache for each table (outside txn is fine).

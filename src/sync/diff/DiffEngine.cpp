@@ -5,6 +5,7 @@
 #include <QSqlRecord>
 #include <QVariant>
 
+#include "sql/SqlBuilder.h"
 #include <algorithm>
 
 namespace dbridge::sync {
@@ -178,7 +179,9 @@ QString DiffEngine::getPkColumn(QSqlDatabase& rconn, const QString& table) {
         return pkColCache_.value(table);
 
     QSqlQuery q(rconn);
-    q.prepare(QString("PRAGMA table_info(\"%1\")").arg(table));
+    // H-4 fix: use quoteIdent for table name in PRAGMA.
+    q.prepare(QStringLiteral("PRAGMA table_info(") + detail::SqlBuilder::quoteIdent(table) +
+              QLatin1Char(')'));
     if (!q.exec())
         return {};
 

@@ -39,6 +39,7 @@ class SyncEngine : public ISyncEngine {
     void setProgress(SyncState st, int pct = -1);
     void onWorkerProgress(SyncProgress p);
     void onWorkerError(SyncError e);
+    void releaseGateIfTerminal(SyncState state);
 
     DataBridge& bridge_;
     std::unique_ptr<SyncConfig> configPtr_;  // delayed init via initialize()

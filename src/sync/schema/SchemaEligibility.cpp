@@ -174,28 +174,35 @@ bool SchemaEligibility::hasUpsertTarget(QSqlDatabase& db, const QString& table, 
             *err = ti.lastError().text();
         return false;
     }
-    int pkColCount = 0;
-    int pkNotNullCount = 0;
+    // H-03 fix: SQLite's INTEGER PRIMARY KEY (rowid alias) always has notnull=0 in PRAGMA
+    // table_info, but it is implicitly NOT NULL in practice. Treat single-column INTEGER PK
+    // as always NOT NULL to avoid falsely rejecting the most common table pattern.
+    struct PkCol {
+        int seq;
+        bool notNull;
+        QString type;
+    };
+    QList<PkCol> pkCols;
     while (ti.next()) {
-        const int pkPos = ti.value(5).toInt();  // pk column (1-based, 0 = not PK)
-        if (pkPos > 0) {
-            ++pkColCount;
-            if (ti.value(3).toInt() == 1)  // notnull flag
-                ++pkNotNullCount;
-        }
+        const int pkPos = ti.value(5).toInt();
+        if (pkPos > 0)
+            pkCols.append({pkPos, ti.value(3).toInt() == 1, ti.value(2).toString().toUpper()});
     }
-    if (pkColCount == 0) {
+    if (pkCols.isEmpty()) {
         if (err)
             *err = QStringLiteral("table '%1' has no primary key columns").arg(table);
         return false;
     }
-    if (pkNotNullCount < pkColCount) {
-        if (err)
-            *err = QStringLiteral(
-                       "table '%1': not all PK columns are NOT NULL; "
-                       "ON CONFLICT target would be invalid")
-                       .arg(table);
-        return false;
+    for (const PkCol& c : pkCols) {
+        // Single-column INTEGER PRIMARY KEY is a rowid alias → implicitly NOT NULL.
+        const bool isIntegerRowid = (pkCols.size() == 1 && c.type == QLatin1String("INTEGER"));
+        if (!isIntegerRowid && !c.notNull) {
+            if (err)
+                *err =
+                    QStringLiteral("table '%1': PK column is nullable; ON CONFLICT target invalid")
+                        .arg(table);
+            return false;
+        }
     }
     return true;
 }

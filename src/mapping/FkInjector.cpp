@@ -7,30 +7,15 @@
 
 namespace dbridge::detail {
 
-bool FkInjector::inject(QVector<RoutePayload>& payloads, QString* err) {
-    // Build a map of routeKey -> payload index for fast lookup
-    QHash<QString, int> routeIndex;
-    for (int i = 0; i < payloads.size(); ++i) {
-        routeIndex[payloads[i].table] = i;
-    }
-
-    // The payloads carry fkInject info via their route key naming convention.
-    // The actual FK injection info is carried by the RouteSpec, but here we work
-    // with already-built payloads.
-    //
-    // Convention: each payload that needs FK inject has conflictKey columns that
-    // may not yet have conflictVals. The FK value comes from the parent payload.
-    //
-    // This injector is called with profile context in ImportService which passes
-    // RouteSpecs alongside payloads. Since RoutePayload doesn't store fkInject
-    // directly, we use the profile information via the ImportService.
-    //
-    // For this standalone version, we look for payload columns that appear in
-    // conflictKey but have no corresponding bind value (empty slot).
-    // The actual injection is done with RouteSpec context in ImportService::run.
-    Q_UNUSED(routeIndex)
-    Q_UNUSED(err)
-    return true;  // actual injection done in ImportService with profile context
+bool FkInjector::inject(QVector<RoutePayload>& /*payloads*/, QString* err) {
+    // L-01 fix: this overload is a no-op stub that predates the RouteSpec-aware overload below.
+    // Callers MUST use inject(payloads, routes, excelRow, sheet, errors, initialFailed) instead.
+    // Leaving this callable would silently skip FK injection if called by mistake.
+    if (err)
+        *err = QStringLiteral(
+            "FkInjector::inject() called without RouteSpec context — "
+            "use the RouteSpec overload (fk-injection spec §1)");
+    return false;
 }
 
 QSet<int> FkInjector::inject(QVector<RoutePayload>& payloads, const QVector<RouteSpec>& routes,

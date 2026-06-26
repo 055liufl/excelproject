@@ -70,33 +70,18 @@ bool SelectionResolver::resolveRecord(QSqlDatabase& rconn, const QString& table,
     return true;
 }
 
-bool SelectionResolver::resolveWhere(QSqlDatabase& rconn, const QString& table,
-                                     const QString& whereExpr, QList<ResolveResult>* out,
+bool SelectionResolver::resolveWhere(QSqlDatabase& /*rconn*/, const QString& table,
+                                     const QString& /*whereExpr*/, QList<ResolveResult>* /*out*/,
                                      QString* err) {
-    const QString pkCol = pkColumnForTable(table, rconn);
-    if (pkCol.isEmpty()) {
-        if (err)
-            *err = QStringLiteral("Cannot determine PK column for table '%1'").arg(table);
-        return false;
-    }
-
-    QSqlQuery q(rconn);
-    const QString sql = QStringLiteral("SELECT * FROM \"%1\" WHERE %2").arg(table, whereExpr);
-    if (!q.exec(sql)) {
-        if (err)
-            *err = q.lastError().text();
-        return false;
-    }
-
-    while (q.next()) {
-        QVariantMap row = recordToMap(q);
-        ResolveResult r;
-        r.table = table;
-        r.pk = row.value(pkCol).toString();
-        r.row = std::move(row);
-        out->append(std::move(r));
-    }
-    return true;
+    // M-03 fix: raw-SQL addWhere() is rejected at SyncSelection::Builder::build() time (H-01),
+    // so this path should never be reached in MVP.  If it is, fail safely rather than
+    // executing an arbitrary WHERE clause (SQL injection risk per design §4.4).
+    if (err)
+        *err = QStringLiteral(
+                   "addWhere() raw SQL is not supported in MVP for table '%1'; "
+                   "use addRecord()/addRecords() instead (design §4.4)")
+                   .arg(table);
+    return false;
 }
 
 bool SelectionResolver::resolvePk(QSqlDatabase& rconn, const SyncSelection& sel,

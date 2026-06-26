@@ -2,6 +2,7 @@
 
 #include "dbridge/Errors.h"
 
+#include <QCryptographicHash>
 #include <QDateTime>
 #include <QDebug>
 #include <QDir>
@@ -179,6 +180,15 @@ void SyncWorker::run() {
         QSqlDatabase::removeDatabase(connName);
         return;
     }
+    {
+        QSqlQuery q(wconn);
+        q.prepare(
+            QStringLiteral("SELECT COALESCE(MAX(origin_seq), 0) "
+                           "FROM __sync_changelog WHERE origin = ?"));
+        q.addBindValue(config_.nodeId());
+        if (q.exec() && q.next())
+            localOriginSeq_ = q.value(0).toLongLong();
+    }
     if (!ledger_->init(wconn, &initErr)) {
         initError_ = initErr;
         initSemaphore_.release();
@@ -261,7 +271,11 @@ void SyncWorker::run() {
     }
 
     // I-10: watcher_->stop() removed — no QTimer/QFileSystemWatcher to tear down.
-    ackChan_->flush(*codec_);
+    QString ackErr;
+    if (!ackChan_->flush(*codec_, &ackErr)) {
+        emit errorOccurred({err::E_SYNC_TRANSPORT, Severity::Warning, QStringLiteral("ack"),
+                            config_.nodeId(), ackErr});
+    }
 
     // Teardown: clear pointers before closing connection
     tpl_.reset();
@@ -363,18 +377,27 @@ bool SyncWorker::processArtifact(const QString& path) {
     bool ok = false;
     if (dec.kind == PayloadKind::Changeset)
         ok = processChangesetArtifact(dec, name);
-    else if (dec.kind == PayloadKind::SelectionPush)
-        ok = processSelectionPushArtifact(dec, name);
+    else if (dec.kind == PayloadKind::SelectionPush) {
+        const QString checksum =
+            QString::fromLatin1(QCryptographicHash::hash(data, QCryptographicHash::Sha256).toHex());
+        ok = processSelectionPushArtifact(dec, name, checksum);
+    }
 
     if (ok) {
         ledger_->markConsumed(*wconnPtr_, name, nullptr);
-        // Send ACK back to the changeset's origin node (J-01 fix: populate toPeer).
-        ChangesetAck ack;
-        ack.origin = dec.header.origin;
-        ack.streamEpoch = dec.header.streamEpoch;
-        ack.appliedSeq = dec.header.originSeq;
-        ack.toPeer = dec.header.origin;  // ACK addressed to the changeset producer
-        ackChan_->scheduleChangesetAck(ack, *codec_);
+        if (dec.kind == PayloadKind::Changeset) {
+            // Send ACK back to the changeset's origin node (J-01 fix: populate toPeer).
+            ChangesetAck ack;
+            ack.origin = dec.header.origin;
+            ack.streamEpoch = dec.header.streamEpoch;
+            ack.appliedSeq = dec.header.originSeq;
+            ack.toPeer = dec.header.origin;  // ACK addressed to the changeset producer
+            QString ackErr;
+            if (!ackChan_->scheduleChangesetAck(ack, *codec_, &ackErr)) {
+                emit errorOccurred({err::E_SYNC_TRANSPORT, Severity::Warning, QStringLiteral("ack"),
+                                    dec.header.origin, ackErr});
+            }
+        }
     }
     return ok;
 }
@@ -435,22 +458,26 @@ bool SyncWorker::processChangesetArtifact(const DecodeResult& dec, const QString
     return true;
 }
 
-bool SyncWorker::processSelectionPushArtifact(const DecodeResult& dec, const QString& /*name*/) {
+bool SyncWorker::processSelectionPushArtifact(const DecodeResult& dec, const QString& /*name*/,
+                                              const QString& checksum) {
     const PayloadHeader& hdr = dec.header;
     const SelectionPushBody& body = dec.selection;
+    const QString pushId = !hdr.pushId.isEmpty() ? hdr.pushId : body.pushId;
+    const int chunkSeq = hdr.chunkSeq != 0 ? hdr.chunkSeq : body.chunkSeq;
+    const int totalChunks = hdr.totalChunks > 0 ? hdr.totalChunks : body.totalChunks;
 
     // M-05 fix: ensure __sync_push_progress row exists before any chunk processing.
     // Insert on first chunk arrival (ON CONFLICT DO NOTHING is idempotent for subsequent chunks).
-    if (!hdr.pushId.isEmpty()) {
+    if (!pushId.isEmpty()) {
         QSqlQuery ins(*wconnPtr_);
         ins.prepare(
             QStringLiteral("INSERT OR IGNORE INTO __sync_push_progress "
                            "(push_id, origin, peer, total_chunks, schema_ver, status, updated_ms) "
                            "VALUES (?, ?, ?, ?, ?, 'receiving', ?)"));
-        ins.addBindValue(hdr.pushId);
+        ins.addBindValue(pushId);
         ins.addBindValue(hdr.origin);
         ins.addBindValue(config_.nodeId());
-        ins.addBindValue(body.totalChunks > 0 ? body.totalChunks : 1);
+        ins.addBindValue(totalChunks > 0 ? totalChunks : 1);
         ins.addBindValue(hdr.schemaVer);
         ins.addBindValue(QDateTime::currentMSecsSinceEpoch());
         ins.exec();  // non-fatal if table doesn't exist yet (pre-DDL edge case)
@@ -464,12 +491,12 @@ bool SyncWorker::processSelectionPushArtifact(const DecodeResult& dec, const QSt
                            "failed_code='E_SYNC_PUSH_SCHEMA_MOVED', updated_ms=? "
                            "WHERE push_id=?"));
         q.addBindValue(QDateTime::currentMSecsSinceEpoch());
-        q.addBindValue(hdr.pushId);
+        q.addBindValue(pushId);
         q.exec();
         emit errorOccurred({err::E_SYNC_PUSH_SCHEMA_MOVED, Severity::Error,
                             QStringLiteral("selection_push"), hdr.origin,
                             QString(QStringLiteral("push_id=%1 schema_ver=%2 local=%3"))
-                                .arg(hdr.pushId)
+                                .arg(pushId)
                                 .arg(hdr.schemaVer)
                                 .arg(config_.schemaVersion())});
         return false;
@@ -520,8 +547,9 @@ bool SyncWorker::processSelectionPushArtifact(const DecodeResult& dec, const QSt
     p.schemaVer = hdr.schemaVer;
     p.schemaFp = hdr.schemaFingerprint;
     p.originRank = config_.originRank(hdr.origin);
-    p.pushId = hdr.pushId;
-    p.chunkSeq = hdr.chunkSeq;
+    p.pushId = pushId;
+    p.chunkSeq = chunkSeq;
+    p.checksum = checksum;
     p.mutations = mutations;
     p.syncTables = config_.syncTables();
 
@@ -530,6 +558,17 @@ bool SyncWorker::processSelectionPushArtifact(const DecodeResult& dec, const QSt
         emit errorOccurred(
             {res.errorCode, Severity::Error, "selection_push", hdr.origin, res.errorMsg});
         return false;
+    }
+    PushChunkAck ack;
+    ack.pushId = pushId;
+    ack.chunkSeq = chunkSeq;
+    ack.totalChunks = totalChunks > 0 ? totalChunks : 1;
+    ack.checksum = checksum;
+    ack.ok = true;
+    QString ackErr;
+    if (!ackChan_->schedulePushChunkAck(ack, *codec_, &ackErr)) {
+        emit errorOccurred(
+            {err::E_SYNC_TRANSPORT, Severity::Warning, QStringLiteral("ack"), hdr.origin, ackErr});
     }
     return true;
 }
@@ -624,14 +663,26 @@ bool SyncWorker::processAckArtifact(const QString& path, const QString& name) {
     return false;
 }
 
-void SyncWorker::broadcast() {
+bool SyncWorker::broadcast(QString* outErr) {
+    bool wroteAny = false;
     for (const QString& peer : config_.peerNodes()) {
-        broadcastTopeer(peer);
+        QString peerErr;
+        if (broadcastTopeer(peer, &peerErr))
+            wroteAny = true;
+        if (!peerErr.isEmpty() && outErr && outErr->isEmpty())
+            *outErr = peerErr;
     }
-    ackChan_->flush(*codec_);
+    QString ackErr;
+    if (!ackChan_->flush(*codec_, &ackErr)) {
+        emit errorOccurred({err::E_SYNC_TRANSPORT, Severity::Warning, QStringLiteral("ack"),
+                            config_.nodeId(), ackErr});
+        if (outErr && outErr->isEmpty())
+            *outErr = ackErr;
+    }
+    return wroteAny;
 }
 
-void SyncWorker::broadcastTopeer(const QString& peer) {
+bool SyncWorker::broadcastTopeer(const QString& peer, QString* outErr) {
     // J-01 fix: use readRangeAll(excludeOrigin=peer) so we:
     //   (a) never echo peer's own changes back to it, and
     //   (b) always include our own local changes (which readRange(origin=peer) missed).
@@ -648,6 +699,7 @@ void SyncWorker::broadcastTopeer(const QString& peer) {
 
     qint64 bytesSent = 0;
     qint64 lastSentLocal = afterLocalSeq;
+    bool wroteAny = false;
     for (const auto& entry : entries) {
         // H-02 fix: shouldRoute must compare entry.originSeq against the per-(peer,origin)
         // acked_seq, NOT against afterLocalSeq which is a local_seq watermark in a different
@@ -681,6 +733,7 @@ void SyncWorker::broadcastTopeer(const QString& peer) {
         hdr.originSeq = entry.originSeq;
         hdr.streamEpoch = streamEpoch_;
         hdr.schemaVer = config_.schemaVersion();
+        hdr.schemaFingerprint = guard_ ? guard_->fingerprint() : QString();
         hdr.routeTag = peer;
 
         QByteArray payload = codec_->encodeChangeset(hdr, changesetToSend);
@@ -690,8 +743,11 @@ void SyncWorker::broadcastTopeer(const QString& peer) {
         if (!outbox_->write(artifactName, payload, &writeErr)) {
             emit errorOccurred(
                 {err::E_SYNC_TRANSPORT, Severity::Warning, "broadcast", peer, writeErr});
+            if (outErr)
+                *outErr = writeErr;
             break;
         }
+        wroteAny = true;
         bytesSent += payload.size();
         lastSentLocal = qMax(lastSentLocal, entry.localSeq);
         if (bytesSent >= config_.outboxMaxBytesPerPeer())
@@ -701,6 +757,7 @@ void SyncWorker::broadcastTopeer(const QString& peer) {
     // Advance the send-watermark so the next broadcast starts where we left off.
     if (lastSentLocal > afterLocalSeq)
         ackStore_->updateLastSent(*wconnPtr_, peer, streamEpoch_, lastSentLocal, nullptr);
+    return wroteAny;
 }
 
 qint64 SyncWorker::computePeerAckedSeq(const QString& peer) {
@@ -765,8 +822,9 @@ ImportResult SyncWorker::submitImportSync(const ImportOptions& opts, const QStri
             qint64 localSeq = 0;
             QString sealErr;
             QString fp = guard_ ? guard_->fingerprint() : QString();
+            const qint64 originSeq = nextLocalOriginSeq();
             rec_->sealInto(hPtr_, *clog_, *wconnPtr_, txn, config_.nodeId(), streamEpoch_,
-                           config_.schemaVersion(), fp, 0, 0, &localSeq, &sealErr);
+                           config_.schemaVersion(), fp, 0, originSeq, &localSeq, &sealErr);
             txn.commit(nullptr);
         } else {
             rec_->abort();
@@ -788,6 +846,10 @@ ImportResult SyncWorker::submitImportSync(const ImportOptions& opts, const QStri
     return future.get();
 }
 
+qint64 SyncWorker::nextLocalOriginSeq() {
+    return ++localOriginSeq_;
+}
+
 // I-19: Signal worker that a foreground sync() is waiting for ACK.
 void SyncWorker::startAckWait() {
     ackWaiting_ = true;
@@ -795,11 +857,30 @@ void SyncWorker::startAckWait() {
 }
 
 // C-02: Enqueue an immediate drain cycle on the worker thread.
-void SyncWorker::enqueueDrain() {
-    enqueue([this]() {
-        scanInbox();  // apply any pending inbound payloads
-        broadcast();  // pack & write outbox artifacts for all peers
+bool SyncWorker::enqueueDrain(QString* err) {
+    if (!isRunning()) {
+        if (err)
+            *err = QStringLiteral("SyncWorker is not running");
+        return false;
+    }
+    auto sharedPromise = std::make_shared<std::promise<bool>>();
+    std::future<bool> future = sharedPromise->get_future();
+    enqueue([this, sp = sharedPromise]() {
+        QString taskErr;
+        scanInbox();                             // apply any pending inbound payloads
+        const bool wrote = broadcast(&taskErr);  // pack & write outbox artifacts for all peers
+        if (!taskErr.isEmpty()) {
+            emit errorOccurred({err::E_SYNC_TRANSPORT, Severity::Error, QStringLiteral("sync"),
+                                config_.nodeId(), taskErr});
+        }
+        sp->set_value(wrote);
     });
+    if (future.wait_for(std::chrono::seconds(60)) == std::future_status::timeout) {
+        if (err)
+            *err = QStringLiteral("enqueueDrain timed out after 60s");
+        return false;
+    }
+    return future.get();
 }
 
 // C-01: Enqueue a selection push — SelectionResolver → FkClosureBuilder → ChunkStreamer
@@ -878,12 +959,33 @@ void SyncWorker::enqueueSelectionPush(const SyncSelection& selection,
         }
 
         // Step 5: encode and write each chunk to the outbox.
+        // H-01 fix: capture schemaFingerprint before entering the loop.
+        const QString schemaFp = guard_ ? guard_->fingerprint() : QString();
+        const QString pushId = chunks.isEmpty() ? QString() : chunks.first().pushId;
+
+        // M-05 / C-02: create push_progress(sending) on the worker thread BEFORE writing chunks.
+        if (!pushId.isEmpty() && wconnPtr_) {
+            QSqlQuery ins(*wconnPtr_);
+            ins.prepare(QStringLiteral(
+                "INSERT OR IGNORE INTO __sync_push_progress "
+                "(push_id, origin, peer, total_chunks, schema_ver, status, updated_ms)"
+                " VALUES (?, ?, '', ?, ?, 'sending', ?)"));
+            ins.addBindValue(pushId);
+            ins.addBindValue(config_.nodeId());
+            ins.addBindValue(chunks.size());
+            ins.addBindValue(config_.schemaVersion());
+            ins.addBindValue(QDateTime::currentMSecsSinceEpoch());
+            ins.exec();
+        }
+
         for (const ChunkStreamer::Chunk& chunk : chunks) {
             PayloadHeader hdr;
             hdr.origin = config_.nodeId();
             hdr.originSeq = 0;  // SelectionPush has no changelog seq
             hdr.streamEpoch = streamEpoch_;
             hdr.schemaVer = config_.schemaVersion();
+            hdr.schemaFingerprint =
+                schemaFp;  // H-01 fix: must be filled so receiver SchemaGuard accepts
             hdr.pushId = chunk.pushId;
             hdr.chunkSeq = chunk.chunkSeq;
             hdr.totalChunks = chunk.totalChunks;

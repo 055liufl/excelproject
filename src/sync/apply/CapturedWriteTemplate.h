@@ -35,6 +35,7 @@ struct WriteParams {
     // SelectionPush only:
     QString pushId;
     int chunkSeq = 0;
+    QString checksum;
 
     // Branch A (InboundChangeset):
     QByteArray changesetBlob;

@@ -17,16 +17,16 @@ class AckChannel {
     explicit AckChannel(OutboxWriter& writer, const QString& nodeId, qint64 ackMaxDelayMs = 5000);
 
     // Queue a changeset ACK.  May trigger an automatic flush.
-    void scheduleChangesetAck(const ChangesetAck& ack, PayloadCodec& codec);
+    bool scheduleChangesetAck(const ChangesetAck& ack, PayloadCodec& codec, QString* err = nullptr);
 
     // Queue a push-chunk ACK.  May trigger an automatic flush.
-    void schedulePushChunkAck(const PushChunkAck& ack, PayloadCodec& codec);
+    bool schedulePushChunkAck(const PushChunkAck& ack, PayloadCodec& codec, QString* err = nullptr);
 
     // Immediately write all queued ACKs to the outbox.
-    void flush(PayloadCodec& codec);
+    bool flush(PayloadCodec& codec, QString* err = nullptr);
 
    private:
-    void maybeFlush(PayloadCodec& codec);
+    bool maybeFlush(PayloadCodec& codec, QString* err);
 
     OutboxWriter& writer_;
     QString nodeId_;

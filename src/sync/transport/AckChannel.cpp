@@ -1,6 +1,7 @@
 #include "AckChannel.h"
 
 #include <QDateTime>
+#include <QStringList>
 
 #include "../SyncDDL.h"
 
@@ -11,43 +12,61 @@ AckChannel::AckChannel(OutboxWriter& writer, const QString& nodeId, qint64 ackMa
     lastFlushMs_ = QDateTime::currentMSecsSinceEpoch();
 }
 
-void AckChannel::scheduleChangesetAck(const ChangesetAck& ack, PayloadCodec& codec) {
+bool AckChannel::scheduleChangesetAck(const ChangesetAck& ack, PayloadCodec& codec, QString* err) {
     pendingChangeset_.append(ack);
-    maybeFlush(codec);
+    return maybeFlush(codec, err);
 }
 
-void AckChannel::schedulePushChunkAck(const PushChunkAck& ack, PayloadCodec& codec) {
+bool AckChannel::schedulePushChunkAck(const PushChunkAck& ack, PayloadCodec& codec, QString* err) {
     pendingChunk_.append(ack);
-    maybeFlush(codec);
+    return maybeFlush(codec, err);
 }
 
-void AckChannel::flush(PayloadCodec& codec) {
+bool AckChannel::flush(PayloadCodec& codec, QString* err) {
     const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
 
+    bool ok = true;
+    QStringList failures;
+    QList<ChangesetAck> failedChangeset;
     for (const ChangesetAck& ack : qAsConst(pendingChangeset_)) {
         QByteArray data = codec.encodeChangesetAck(ack);
         // fromPeer = nodeId_ (this node), toPeer = ack.toPeer (J-01 fix: was hardcoded "self")
         const QString name = ddl::ackArtifactName(nodeId_, ack.toPeer, nowMs);
-        writer_.writeAck(name, data, nullptr);
+        QString writeErr;
+        if (!writer_.writeAck(name, data, &writeErr)) {
+            ok = false;
+            failedChangeset.append(ack);
+            failures.append(QStringLiteral("%1: %2").arg(name, writeErr));
+        }
     }
-    pendingChangeset_.clear();
 
+    QList<PushChunkAck> failedChunk;
     for (const PushChunkAck& ack : qAsConst(pendingChunk_)) {
         QByteArray data = codec.encodeChunkAck(ack);
         // PushChunkAck does not carry a toPeer yet; keep existing routing tag.
         // TODO(J-01): extend PushChunkAck with toPeer when push fan-out is implemented.
         const QString name = ddl::ackArtifactName(nodeId_, ack.pushId, nowMs);
-        writer_.writeAck(name, data, nullptr);
+        QString writeErr;
+        if (!writer_.writeAck(name, data, &writeErr)) {
+            ok = false;
+            failedChunk.append(ack);
+            failures.append(QStringLiteral("%1: %2").arg(name, writeErr));
+        }
     }
-    pendingChunk_.clear();
 
+    pendingChangeset_ = std::move(failedChangeset);
+    pendingChunk_ = std::move(failedChunk);
     lastFlushMs_ = nowMs;
+    if (!ok && err)
+        *err = failures.join(QStringLiteral("; "));
+    return ok;
 }
 
-void AckChannel::maybeFlush(PayloadCodec& codec) {
+bool AckChannel::maybeFlush(PayloadCodec& codec, QString* err) {
     const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
     if (nowMs - lastFlushMs_ >= ackMaxDelayMs_)
-        flush(codec);
+        return flush(codec, err);
+    return true;
 }
 
 }  // namespace dbridge::sync

@@ -88,7 +88,7 @@ WriteResult CapturedWriteTemplate::branchA(const WriteParams& p) {
     // 2. Verify schema
     if (!guard_.verifyPayload(p.schemaVer, p.schemaFp, &err)) {
         txn.rollback();
-        result.errorCode = QStringLiteral("SCHEMA_MISMATCH");
+        result.errorCode = QLatin1String(err::E_SYNC_SCHEMA_MISMATCH);
         result.errorMsg = err;
         return result;
     }
@@ -99,7 +99,11 @@ WriteResult CapturedWriteTemplate::branchA(const WriteParams& p) {
     if (!applier_.apply(h_, wconn_, p.changesetBlob, p.origin, p.originRank, p.seq, rw_, opts,
                         p.syncTables, &result.applyOutcome, &err)) {
         txn.rollback();
-        result.errorCode = QStringLiteral("APPLY_FAILED");
+        const QString lowerErr = err.toLower();
+        if (lowerErr.contains(QLatin1String("foreign")) || lowerErr.contains(QLatin1String("fk")))
+            result.errorCode = QLatin1String(err::E_SYNC_APPLY_FK);
+        else
+            result.errorCode = QLatin1String(err::E_SYNC_APPLY_CONSTRAINT);
         result.errorMsg = err;
         return result;
     }
@@ -181,7 +185,7 @@ WriteResult CapturedWriteTemplate::branchBC(const WriteParams& p) {
     if (isInbound) {
         if (!guard_.verifyPayload(p.schemaVer, p.schemaFp, &err)) {
             txn.rollback();
-            result.errorCode = QStringLiteral("SCHEMA_MISMATCH");
+            result.errorCode = QLatin1String(err::E_SYNC_SCHEMA_MISMATCH);
             result.errorMsg = err;
             return result;
         }
@@ -273,9 +277,16 @@ WriteResult CapturedWriteTemplate::branchBC(const WriteParams& p) {
     // Seal changeset into changelog
     qint64 localSeq = 0;
     qint64 parentSeq = 0;
-    qint64 originSeq = isInbound ? p.seq : 0;
+    qint64 originSeq = isInbound ? p.seq : p.seq;
     const QString origin = isInbound ? p.origin : nodeId_;
     const qint64 epoch = isInbound ? p.epoch : streamEpoch_;
+    if (!isInbound && originSeq <= 0) {
+        rec_.abort();
+        txn.rollback();
+        result.errorCode = QLatin1String(err::E_SYNC_INIT);
+        result.errorMsg = QStringLiteral("local origin_seq must be allocated before branch C seal");
+        return result;
+    }
 
     if (!rec_.sealInto(h_, clog_, wconn_, txn, origin, epoch, isInbound ? p.schemaVer : schemaVer_,
                        isInbound ? p.schemaFp : schemaFp_, parentSeq, originSeq, &localSeq, &err)) {
@@ -292,13 +303,20 @@ WriteResult CapturedWriteTemplate::branchBC(const WriteParams& p) {
         upsert.prepare(
             QStringLiteral("INSERT INTO __sync_push_chunk_progress "
                            "(push_id, chunk_seq, status, checksum, applied_ms) "
-                           "VALUES (?, ?, 'applied', '', ?) "
+                           "VALUES (?, ?, 'applied', ?, ?) "
                            "ON CONFLICT(push_id, chunk_seq) DO UPDATE SET "
-                           "  status = 'applied', applied_ms = excluded.applied_ms"));
+                           "  status = 'applied', checksum = excluded.checksum, "
+                           "  applied_ms = excluded.applied_ms"));
         upsert.addBindValue(p.pushId);
         upsert.addBindValue(p.chunkSeq);
+        upsert.addBindValue(p.checksum);
         upsert.addBindValue(nowMs);
-        upsert.exec();
+        if (!upsert.exec()) {
+            txn.rollback();
+            result.errorCode = QLatin1String(err::E_SYNC_TRANSPORT);
+            result.errorMsg = upsert.lastError().text();
+            return result;
+        }
     }
 
     // Update table_state from RowMutations using pre-scanned (correct) old-row info (H-05).
@@ -319,7 +337,7 @@ WriteResult CapturedWriteTemplate::branchBC(const WriteParams& p) {
 
     if (!tmuts.isEmpty()) {
         ts_.applyMutations(wconn_, tmuts, isInbound ? p.epoch : streamEpoch_,
-                           isInbound ? p.schemaFp : schemaFp_, isInbound ? p.seq : 0, &err);
+                           isInbound ? p.schemaFp : schemaFp_, originSeq, &err);
         err.clear();
     }
 

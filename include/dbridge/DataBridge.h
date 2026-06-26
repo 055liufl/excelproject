@@ -48,6 +48,10 @@ class DBRIDGE_EXPORT DataBridge {
     bool snapshotProfileCatalog(const QString& profileName, detail::ProfileSpec* profile,
                                 detail::SchemaCatalog* catalog, QString* err = nullptr);
 
+    // Copy only the current schema catalog. Used by sync paths that do not depend on an ETL
+    // profile.
+    bool snapshotCatalog(detail::SchemaCatalog* catalog, QString* err = nullptr);
+
     // J-09: Called by SyncEngine::initialize() / ~SyncEngine() to guard importExcel()
     // against direct writes while sync is active.
     void setSyncActive(bool active);

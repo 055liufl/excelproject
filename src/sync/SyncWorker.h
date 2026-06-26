@@ -77,7 +77,7 @@ class SyncWorker : public QThread {
     void startAckWait();
 
     // C-02: Enqueue an immediate drain cycle (scan inbox + broadcast) on the worker.
-    void enqueueDrain();
+    bool enqueueDrain(QString* err = nullptr);
 
     // C-01: Enqueue a selection push on the worker thread.
     // catalog is a pre-snapshot from the calling thread (safe cross-thread).
@@ -95,17 +95,19 @@ class SyncWorker : public QThread {
     // --- Main loop phases ---
     void processPendingTasks();
     void scanInbox();
-    void broadcast();
+    bool broadcast(QString* outErr = nullptr);
 
     // --- Inbox processing ---
     bool processArtifact(const QString& path);
     bool processChangesetArtifact(const DecodeResult& dec, const QString& artifactName);
-    bool processSelectionPushArtifact(const DecodeResult& dec, const QString& artifactName);
+    bool processSelectionPushArtifact(const DecodeResult& dec, const QString& artifactName,
+                                      const QString& checksum);
     bool processAckArtifact(const QString& path, const QString& artifactName);
 
     // --- Broadcast helpers ---
-    void broadcastTopeer(const QString& peer);
+    bool broadcastTopeer(const QString& peer, QString* outErr = nullptr);
     qint64 computePeerAckedSeq(const QString& peer);
+    qint64 nextLocalOriginSeq();
 
     // --- Data members ---
     SyncConfig config_;

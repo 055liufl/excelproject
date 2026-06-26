@@ -133,17 +133,24 @@ bool SyncEngine::sync(QString* err) {
 
     setProgress(SyncState::Importing);
 
-    // Enqueue a full scan+broadcast task on the worker.
-    // I-14 fix: gate is released inside the worker task.
-    // I-19: Start ACK deadline timer so worker emits E_SYNC_ACK_TIMEOUT if no ACK arrives.
-    // J-02: Stay in Exporting (percent=-1) until ACK arrives or timeout.
-    // The worker task triggers a broadcast cycle; ACK arrival or timeout drives state to
-    // Completed/Failed via onWorkerError (E_SYNC_ACK_TIMEOUT) in the main loop.
     setProgress(SyncState::Exporting, -1);
-    // C-02 fix: enqueue a real manual drain — scanInbox + broadcast before arming ACK timer.
-    worker_->enqueueDrain();
-    worker_->startAckWait();  // arm timeout AFTER drain is queued
-    // Gate released by ACK arrival (Completed) or timeout (Failed) via onWorkerError.
+    QString drainErr;
+    const bool hasPayload = worker_->enqueueDrain(&drainErr);
+    if (!drainErr.isEmpty()) {
+        appendError({err::E_SYNC_TRANSPORT, Severity::Error, QStringLiteral("sync"),
+                     configPtr_->nodeId(), drainErr});
+        setProgress(SyncState::Failed, 0);
+        ctx_->gate.release();
+        if (err)
+            *err = drainErr;
+        return false;
+    }
+    if (!hasPayload) {
+        setProgress(SyncState::Completed, 100);
+        ctx_->gate.release();
+        return true;
+    }
+    worker_->startAckWait();
     return true;
 }
 
@@ -201,7 +208,7 @@ bool SyncEngine::syncSelected(const SyncSelection& selection, QString* err) {
     // SelectionResolver → FkClosureBuilder → ChunkStreamer → OutboxWriter chain on the worker.
     detail::SchemaCatalog catalogSnapshot;
     QString snapErr;
-    if (!bridge_.snapshotProfileCatalog(QString(), nullptr, &catalogSnapshot, &snapErr)) {
+    if (!bridge_.snapshotCatalog(&catalogSnapshot, &snapErr)) {
         ctx_->gate.release();
         if (err)
             *err = QStringLiteral("Cannot snapshot schema catalog: ") + snapErr;
@@ -246,28 +253,43 @@ void SyncEngine::setProgress(SyncState st, int pct) {
 }
 
 void SyncEngine::onWorkerProgress(SyncProgress p) {
-    QMutexLocker lk(&snapMutex_);
-    progress_ = p;
+    {
+        QMutexLocker lk(&snapMutex_);
+        progress_ = p;
+        if (p.state == SyncState::Completed || p.state == SyncState::Failed ||
+            p.state == SyncState::Stopped) {
+            result_.finalState = p.state;
+            result_.ok = (p.state == SyncState::Completed);
+        }
+    }
+    releaseGateIfTerminal(p.state);
 }
 
 void SyncEngine::onWorkerError(SyncError e) {
     appendError(e);
     appendLog(e.severity, e.phase, e.message);
 
-    // H-09 fix: Fatal/Error from worker that represents a terminal foreground failure must
-    // transition the foreground state to Failed and release the gate.  Without this the
-    // caller would see state() == Exporting forever after e.g. E_SYNC_ACK_TIMEOUT.
     if (e.severity == Severity::Fatal || e.severity == Severity::Error) {
+        bool terminalFailure = false;
         QMutexLocker lk(&snapMutex_);
         if (progress_.state == SyncState::Exporting || progress_.state == SyncState::Capturing) {
             progress_.state = SyncState::Failed;
             progress_.percent = 0;
             result_.ok = false;
+            result_.finalState = SyncState::Failed;
             result_.errors.append(e);
+            terminalFailure = true;
         }
+        if (terminalFailure)
+            releaseGateIfTerminal(SyncState::Failed);
     }
-    // Gate release is handled by the worker emitting its own "operation done" signal;
-    // we intentionally do NOT release here to avoid double-release races.
+}
+
+void SyncEngine::releaseGateIfTerminal(SyncState state) {
+    if (!ctx_)
+        return;
+    if (state == SyncState::Completed || state == SyncState::Failed || state == SyncState::Stopped)
+        ctx_->gate.release();
 }
 
 // --- Factory ---

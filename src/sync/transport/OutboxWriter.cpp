@@ -56,8 +56,14 @@ bool OutboxWriter::writeAtomic(const QString& finalName, const QByteArray& data,
             return false;
         }
         int fd = static_cast<int>(f.handle());
-        if (fd >= 0)
-            ::fsync(fd);
+        if (fd >= 0 && ::fsync(fd) != 0) {
+            // M-04 fix: treat fsync failure as a transport error — data may not be durable.
+            if (err)
+                *err = QStringLiteral("fsync failed for %1 (errno=%2)").arg(tmpPath).arg(errno);
+            f.close();
+            QFile::remove(tmpPath);
+            return false;
+        }
         f.close();
     }
 
@@ -88,8 +94,13 @@ bool OutboxWriter::writeAtomic(const QString& finalName, const QByteArray& data,
             return false;
         }
         int rfd = static_cast<int>(rf.handle());
-        if (rfd >= 0)
-            ::fsync(rfd);
+        if (rfd >= 0 && ::fsync(rfd) != 0) {
+            if (err)
+                *err = QStringLiteral("fsync .ready failed (errno=%1)").arg(errno);
+            rf.close();
+            rf.remove();
+            return false;
+        }
         rf.close();
     }
 

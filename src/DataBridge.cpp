@@ -298,6 +298,23 @@ bool DataBridge::snapshotProfileCatalog(const QString& profileName, detail::Prof
     return true;
 }
 
+bool DataBridge::snapshotCatalog(detail::SchemaCatalog* catalog, QString* err) {
+    if (!d_->dbOpen_) {
+        if (err)
+            *err = QStringLiteral("Database not open");
+        return false;
+    }
+    QString schErr;
+    if (!d_->refreshCatalog(&schErr)) {
+        if (err)
+            *err = QStringLiteral("Schema refresh failed: ") + schErr;
+        return false;
+    }
+    if (catalog)
+        *catalog = d_->catalog_;
+    return true;
+}
+
 ExportResult DataBridge::exportExcel(const QString& xlsxPath, const ExportOptions& options) {
     ExportResult result;
     if (!d_->dbOpen_) {

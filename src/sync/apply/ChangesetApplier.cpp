@@ -70,8 +70,8 @@ QString computePkHashStr(const QByteArray& pkMaterial, const QByteArray& content
 
 bool ChangesetApplier::apply(sqlite3* h, QSqlDatabase& wconn, const QByteArray& changeset,
                              const QString& origin, int originRank, qint64 originSeq,
-                             RowWinnerStore& winners, const ApplyOptions& opts, ApplyOutcome* out,
-                             QString* err) {
+                             RowWinnerStore& winners, const ApplyOptions& opts,
+                             const QStringList& syncTables, ApplyOutcome* out, QString* err) {
     if (!out)
         return false;
     *out = ApplyOutcome{};
@@ -87,16 +87,18 @@ bool ChangesetApplier::apply(sqlite3* h, QSqlDatabase& wconn, const QByteArray& 
     ctx.authoritative = opts.authoritative;
     ctx.outcome = out;
 
+    // H-04 fix: pass syncTables into ConflictCtx so the shared pCtx carries both
+    // xFilter (table allow-list) and xConflict (row-winner arbitration) state.
+    ctx.syncTables = syncTables.isEmpty() ? nullptr : &syncTables;
+
     // For non-authoritative path we use apply_v2 with a rebase buffer.
     void* pRebase = nullptr;
     int nRebase = 0;
 
     int rc = sqlite3changeset_apply_v2(
         h, changeset.size(), const_cast<void*>(static_cast<const void*>(changeset.constData())),
-        nullptr,  // xFilter (accept all tables)
-        &conflictCb, &ctx, &pRebase, &nRebase,
-        0  // flags
-    );
+        &filterCb,  // H-04: table filter — uses same pCtx as conflictCb
+        &conflictCb, &ctx, &pRebase, &nRebase, SQLITE_CHANGESETAPPLY_NOSAVEPOINT);
 
     if (pRebase && nRebase > 0 && !opts.authoritative) {
         out->rebaseBuffer = QByteArray(static_cast<const char*>(pRebase), nRebase);
@@ -115,6 +117,20 @@ bool ChangesetApplier::apply(sqlite3* h, QSqlDatabase& wconn, const QByteArray& 
     updateWinnersFromChangeset(changeset, origin, originRank, originSeq, winners, wconn);
 
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// private: xFilter callback (H-04)
+// ---------------------------------------------------------------------------
+
+int ChangesetApplier::filterCb(void* ctx, const char* tblName) {
+    auto* c = static_cast<ConflictCtx*>(ctx);
+    if (!c->syncTables)
+        return 1;  // accept all when list is empty
+    // Always reject internal __sync_* meta tables.
+    if (qstrncmp(tblName, "__sync_", 7) == 0)
+        return 0;
+    return c->syncTables->contains(QString::fromUtf8(tblName)) ? 1 : 0;
 }
 
 // ---------------------------------------------------------------------------

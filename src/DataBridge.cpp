@@ -10,6 +10,7 @@
 
 #include "DataBridgePrivate.h"
 #include "profile/ProfileLoader.h"
+#include "schema/SchemaCatalog.h"
 
 namespace dbridge {
 
@@ -248,6 +249,53 @@ ImportResult DataBridge::runImportOnDb(const QString& xlsxPath, const ImportOpti
         return result;
     }
     return d_->importSvc_.run(it.value(), d_->catalog_, xlsxPath, options, db);
+}
+
+ExportResult DataBridge::runExportOnDb(const QString& xlsxPath, const ExportOptions& options,
+                                       QSqlDatabase& db) {
+    ExportResult result;
+    if (!d_->dbOpen_) {
+        RowError e;
+        e.code = QString::fromLatin1(err::E_OPEN_DB);
+        e.message = QStringLiteral("Database not open");
+        result.errors.append(e);
+        return result;
+    }
+    auto it = d_->profiles_.find(options.profileName);
+    if (it == d_->profiles_.end()) {
+        RowError e;
+        e.code = QString::fromLatin1(err::E_PROFILE_PARSE);
+        e.message = QStringLiteral("Profile not loaded: ") + options.profileName;
+        result.errors.append(e);
+        return result;
+    }
+    return d_->exportSvc_.run(it.value(), d_->catalog_, xlsxPath, options, db);
+}
+
+bool DataBridge::snapshotProfileCatalog(const QString& profileName, detail::ProfileSpec* profile,
+                                        detail::SchemaCatalog* catalog, QString* err) {
+    if (!d_->dbOpen_) {
+        if (err)
+            *err = QStringLiteral("Database not open");
+        return false;
+    }
+    QString schErr;
+    if (!d_->refreshCatalog(&schErr)) {
+        if (err)
+            *err = QStringLiteral("Schema refresh failed: ") + schErr;
+        return false;
+    }
+    auto it = d_->profiles_.find(profileName);
+    if (it == d_->profiles_.end()) {
+        if (err)
+            *err = QStringLiteral("Profile not loaded: ") + profileName;
+        return false;
+    }
+    if (profile)
+        *profile = it.value();
+    if (catalog)
+        *catalog = d_->catalog_;
+    return true;
 }
 
 ExportResult DataBridge::exportExcel(const QString& xlsxPath, const ExportOptions& options) {

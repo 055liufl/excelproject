@@ -4,8 +4,11 @@
 
 #include <QFuture>
 #include <QMutex>
+#include <QSqlDatabase>
 #include <QtConcurrent/QtConcurrent>
 
+#include "profile/ProfileSpec.h"
+#include "schema/SchemaCatalog.h"
 #include <atomic>
 #include <memory>
 
@@ -31,8 +34,10 @@ class BatchTransfer : public IBatchTransfer {
     TransferState exportState() const override;
 
    private:
-    void runImport(const ImportOptions& opts);
-    void runExport(const ExportOptions& opts);
+    void runImport(const ImportOptions& opts, const QString& dbPath,
+                   const detail::ProfileSpec& profile, const detail::SchemaCatalog& catalog);
+    void runExport(const ExportOptions& opts, const QString& dbPath,
+                   const detail::ProfileSpec& profile, const detail::SchemaCatalog& catalog);
 
     DataBridge& bridge_;
 

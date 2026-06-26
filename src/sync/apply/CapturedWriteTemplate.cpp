@@ -97,7 +97,7 @@ WriteResult CapturedWriteTemplate::branchA(const WriteParams& p) {
     ApplyOptions opts;
     opts.authoritative = false;
     if (!applier_.apply(h_, wconn_, p.changesetBlob, p.origin, p.originRank, p.seq, rw_, opts,
-                        &result.applyOutcome, &err)) {
+                        p.syncTables, &result.applyOutcome, &err)) {
         txn.rollback();
         result.errorCode = QStringLiteral("APPLY_FAILED");
         result.errorMsg = err;

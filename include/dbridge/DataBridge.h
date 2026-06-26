@@ -10,6 +10,8 @@ namespace dbridge {
 
 namespace detail {
 class DataBridgePrivate;
+struct ProfileSpec;
+class SchemaCatalog;
 }  // namespace detail
 
 class DBRIDGE_EXPORT DataBridge {
@@ -39,6 +41,12 @@ class DBRIDGE_EXPORT DataBridge {
     // Called by SyncWorker to run ImportService on wconn with session capture (I-04).
     ImportResult runImportOnDb(const QString& xlsxPath, const ImportOptions& options,
                                QSqlDatabase& db);
+    ExportResult runExportOnDb(const QString& xlsxPath, const ExportOptions& options,
+                               QSqlDatabase& db);
+
+    // Copy profile/catalog state on the owner thread before dispatching work to another thread.
+    bool snapshotProfileCatalog(const QString& profileName, detail::ProfileSpec* profile,
+                                detail::SchemaCatalog* catalog, QString* err = nullptr);
 
     // J-09: Called by SyncEngine::initialize() / ~SyncEngine() to guard importExcel()
     // against direct writes while sync is active.

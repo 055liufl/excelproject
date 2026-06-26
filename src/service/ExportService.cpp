@@ -63,12 +63,11 @@ static QHash<QString, TemporalColumnInfo> buildTemporalExportMap(const ProfileSp
 static QVariant convertTemporalForExport(const QVariant& dbVal, const TemporalColumnInfo& info,
                                          const QString& sheet, const QString& dbColumn,
                                          ErrorCollector* errors) {
-    // Explicit NULL → empty cell, skip conversion
+    // Explicit SQL NULL → empty cell, no error (spec: only isNull() is silent).
     if (dbVal.isNull())
         return QVariant();
-
-    if (tconv::isEmptyForTemporal(dbVal))
-        return QVariant();
+    // H-10 fix: a non-NULL empty/blank string is NOT silently skipped — it must go through
+    // the DB-side parser and produce E_TIME_PARSE_DB on failure, per time-format spec.
 
     QVariant structured;
     if (tconv::isStructuredTemporal(dbVal, info.kind)) {

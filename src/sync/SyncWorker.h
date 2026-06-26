@@ -16,7 +16,9 @@
 #include "capture/ChangelogStore.h"
 #include "capture/SessionRecorder.h"
 #include "payload/PayloadCodec.h"
+#include "profile/ProfileSpec.h"
 #include "schema/QuarantineStore.h"
+#include "schema/SchemaCatalog.h"
 #include "schema/SchemaGuard.h"
 #include "schema/TableStateStore.h"
 #include "transport/AckChannel.h"
@@ -63,9 +65,11 @@ class SyncWorker : public QThread {
 
     // I-04: Submit import to run on the worker thread using wconn + session capture.
     // Blocks until the import completes (safe: caller thread waits, worker executes).
-    // Falls back to bridge.runImportOnDb directly if worker is not ready.
-    ImportResult submitImportSync(DataBridge& bridge, const ImportOptions& opts,
-                                  const QString& xlsxPath);
+    // profile/catalog are value-copied snapshots taken on the calling thread — the worker
+    // never touches DataBridge::db_ or its mutable catalog (C-03 fix).
+    ImportResult submitImportSync(const ImportOptions& opts, const QString& xlsxPath,
+                                  const detail::ProfileSpec& profile,
+                                  const detail::SchemaCatalog& catalog);
 
     // I-19: Notify worker that a foreground sync() is waiting for ACK.
     // The worker will emit E_SYNC_ACK_TIMEOUT if no ACK arrives within ackMaxDelayMs.

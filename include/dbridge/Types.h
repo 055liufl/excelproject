@@ -14,6 +14,8 @@ struct ConnectionSpec {
 };
 
 struct ImportOptions {
+    QString xlsxPath;  // file path for IBatchTransfer; DataBridge::importExcel still takes it
+                       // explicitly
     QString profileName;
     QString sheetName;         // empty = use Profile's sheet
     bool abortOnError = true;  // MVP must be true
@@ -21,6 +23,8 @@ struct ImportOptions {
 };
 
 struct ExportOptions {
+    QString xlsxPath;  // file path for IBatchTransfer; DataBridge::exportExcel still takes it
+                       // explicitly
     QString profileName;
     QString sheetName;  // empty = use Profile's sheet
 };

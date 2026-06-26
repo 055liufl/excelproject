@@ -7,6 +7,8 @@
 #include <QString>
 
 #include "ForegroundGate.h"
+#include "profile/ProfileSpec.h"
+#include "schema/SchemaCatalog.h"
 #include <functional>
 #include <memory>
 #include <optional>
@@ -26,8 +28,13 @@ struct SyncContext {
 
     // I-04: Set by SyncEngine after worker init. BatchTransfer calls this to route
     // imports through SyncWorker (wconn + session capture). Null when sync not active.
-    // Signature: (xlsxPath, options) -> ImportResult (blocking, runs on worker thread)
-    std::function<ImportResult(const QString&, const ImportOptions&)> importFn;
+    // Signature: (xlsxPath, options, profile, catalog) -> ImportResult.
+    // The profile/catalog snapshots are copied before dispatch so the worker never touches the
+    // DataBridge-owned QSqlDatabase or mutable catalog.
+    std::function<ImportResult(const QString&, const ImportOptions&,
+                               const dbridge::detail::ProfileSpec&,
+                               const dbridge::detail::SchemaCatalog&)>
+        importFn;
 };
 
 // Process-wide singleton registry of SyncContext objects.

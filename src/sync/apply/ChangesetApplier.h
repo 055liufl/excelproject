@@ -26,9 +26,10 @@ struct ApplyOutcome {
 // RowWinnerStore (G-01) for non-authoritative paths.
 class ChangesetApplier {
    public:
+    // H-04 fix: syncTables limits which tables xFilter accepts; empty = accept all (test only).
     bool apply(sqlite3* h, QSqlDatabase& wconn, const QByteArray& changeset, const QString& origin,
                int originRank, qint64 originSeq, RowWinnerStore& winners, const ApplyOptions& opts,
-               ApplyOutcome* out, QString* err);
+               const QStringList& syncTables, ApplyOutcome* out, QString* err);
 
    private:
     struct ConflictCtx {
@@ -41,9 +42,12 @@ class ChangesetApplier {
         RowWinnerStore* winners;
         bool authoritative;
         ApplyOutcome* outcome;
+        // H-04: tables allowed by xFilter; empty = accept all.
+        const QStringList* syncTables = nullptr;
     };
 
     static int conflictCb(void* ctx, int conflict, sqlite3_changeset_iter* iter);
+    static int filterCb(void* ctx, const char* tblName);  // H-04: xFilter
 
     // Post-apply: update row_winner for all successfully inserted/updated rows.
     void updateWinnersFromChangeset(const QByteArray& changeset, const QString& origin, int rank,

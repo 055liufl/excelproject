@@ -29,14 +29,21 @@ QString SyncContextRegistry::canonicalKey(const QString& path, QString* err) {
                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
                            OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
     if (h == INVALID_HANDLE_VALUE) {
-        // File doesn't exist yet — fall back to normalised path as temp key.
-        return QFileInfo(path).absoluteFilePath().toLower();
+        // M-04 fix: database file must exist before we can obtain an OS file identity.
+        // A path-string fallback could let two aliases create separate SyncContexts,
+        // breaking the single-writer guarantee (design §4.3/G-07).
+        if (err)
+            *err =
+                QStringLiteral("Cannot open database file for identity resolution: %1").arg(path);
+        return {};
     }
     BY_HANDLE_FILE_INFORMATION info;
     bool ok = GetFileInformationByHandle(h, &info);
     CloseHandle(h);
     if (!ok) {
-        return QFileInfo(path).absoluteFilePath().toLower();
+        if (err)
+            *err = QStringLiteral("GetFileInformationByHandle failed for: %1").arg(path);
+        return {};
     }
     return QStringLiteral("win:%1:%2")
         .arg(info.dwVolumeSerialNumber)
@@ -44,8 +51,12 @@ QString SyncContextRegistry::canonicalKey(const QString& path, QString* err) {
 #else
     struct stat st;
     if (::stat(path.toLocal8Bit().constData(), &st) != 0) {
-        // File doesn't exist yet — use normalised path as temporary key.
-        return QFileInfo(path).absoluteFilePath();
+        // M-04 fix: no path fallback — require the file to exist so OS inode is the key.
+        if (err)
+            *err = QStringLiteral("Database file not found or not accessible: %1 (errno=%2)")
+                       .arg(path)
+                       .arg(errno);
+        return {};
     }
     return QStringLiteral("posix:%1:%2").arg((quint64)st.st_dev).arg((quint64)st.st_ino);
 #endif

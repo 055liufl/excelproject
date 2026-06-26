@@ -1,6 +1,7 @@
 #pragma once
 #include <QString>
 #include <QStringList>
+#include <QUuid>
 
 namespace dbridge::sync::ddl {
 
@@ -170,8 +171,13 @@ inline QString selectionPushArtifactName(const QString& pushId, int chunkSeq) {
         .arg(chunkSeq, 6, 10, QLatin1Char('0'));
 }
 
-inline QString ackArtifactName(const QString& fromPeer, const QString& toPeer, qint64 ms) {
-    return QStringLiteral("ack__%1__%2__%3.ack").arg(fromPeer).arg(toPeer).arg(ms);
+// H-03 fix: include a per-call UUID suffix so same-millisecond ACKs never collide.
+inline QString ackArtifactName(const QString& fromPeer, const QString& toPeer, qint64 ms,
+                               const QString& uniqueSuffix = QString()) {
+    const QString suffix = uniqueSuffix.isEmpty()
+                               ? QUuid::createUuid().toString(QUuid::WithoutBraces).left(8)
+                               : uniqueSuffix;
+    return QStringLiteral("ack__%1__%2__%3__%4.ack").arg(fromPeer).arg(toPeer).arg(ms).arg(suffix);
 }
 
 }  // namespace dbridge::sync::ddl

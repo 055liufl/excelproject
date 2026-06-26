@@ -16,7 +16,8 @@ class ImportService {
     std::function<void(const QString& identityKey)> onPrefetch;
 
     ImportResult run(const ProfileSpec& profile, const SchemaCatalog& catalog,
-                     const QString& xlsxPath, const ImportOptions& options, QSqlDatabase& db);
+                     const QString& xlsxPath, const ImportOptions& options, QSqlDatabase& db,
+                     bool manageTransaction = true);
 };
 
 }  // namespace dbridge::detail

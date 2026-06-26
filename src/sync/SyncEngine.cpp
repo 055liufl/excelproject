@@ -104,8 +104,12 @@ bool SyncEngine::initialize(const SyncConfig& config, QString* err) {
     }
 
     // I-04: Wire importFn so BatchTransfer can route imports through SyncWorker.
-    ctx_->importFn = [this](const QString& xlsxPath, const ImportOptions& opts) -> ImportResult {
-        return worker_->submitImportSync(bridge_, opts, xlsxPath);
+    // Profile/catalog snapshots are taken on the calling thread (safe) and forwarded to
+    // the worker so it never touches DataBridge::db_ or catalog_ from the wrong thread.
+    ctx_->importFn = [this](const QString& xlsxPath, const ImportOptions& opts,
+                            const detail::ProfileSpec& profile,
+                            const detail::SchemaCatalog& catalog) -> ImportResult {
+        return worker_->submitImportSync(opts, xlsxPath, profile, catalog);
     };
 
     // J-09: Block direct DataBridge::importExcel() while sync is active.
@@ -250,6 +254,21 @@ void SyncEngine::onWorkerProgress(SyncProgress p) {
 void SyncEngine::onWorkerError(SyncError e) {
     appendError(e);
     appendLog(e.severity, e.phase, e.message);
+
+    // H-09 fix: Fatal/Error from worker that represents a terminal foreground failure must
+    // transition the foreground state to Failed and release the gate.  Without this the
+    // caller would see state() == Exporting forever after e.g. E_SYNC_ACK_TIMEOUT.
+    if (e.severity == Severity::Fatal || e.severity == Severity::Error) {
+        QMutexLocker lk(&snapMutex_);
+        if (progress_.state == SyncState::Exporting || progress_.state == SyncState::Capturing) {
+            progress_.state = SyncState::Failed;
+            progress_.percent = 0;
+            result_.ok = false;
+            result_.errors.append(e);
+        }
+    }
+    // Gate release is handled by the worker emitting its own "operation done" signal;
+    // we intentionally do NOT release here to avoid double-release races.
 }
 
 // --- Factory ---

@@ -12,6 +12,7 @@
 #include <QSqlQuery>
 #include <QUuid>
 
+#include "service/ImportService.h"
 #include "sync/SyncDDL.h"
 #include "sync/WriteTxn.h"
 #include "sync/capture/SqliteHandle.h"
@@ -619,28 +620,27 @@ qint64 SyncWorker::computePeerAckedSeq(const QString& peer) {
 }
 
 // I-04: Submit import to run on the worker thread using wconn + session capture.
-ImportResult SyncWorker::submitImportSync(DataBridge& bridge, const ImportOptions& opts,
-                                          const QString& xlsxPath) {
+// C-03 fix: accepts pre-snapshotted profile/catalog so the worker never touches
+// DataBridge::db_ or its mutable members from the wrong thread.
+ImportResult SyncWorker::submitImportSync(const ImportOptions& opts, const QString& xlsxPath,
+                                          const detail::ProfileSpec& profile,
+                                          const detail::SchemaCatalog& catalog) {
     if (!isRunning() || !wconnPtr_) {
-        // Worker not ready — fall back to direct bridge call (same as before, no session capture)
-        qWarning() << "[SyncWorker] submitImportSync: worker not ready, using direct db_";
-        return bridge.runImportOnDb(xlsxPath, opts, *wconnPtr_);
+        // Worker not started — return error; cannot fall back to main-thread db_ (C-03).
+        ImportResult r;
+        RowError e;
+        e.code = QLatin1String(err::E_SYNC_INIT);
+        e.message = QStringLiteral(
+            "SyncWorker not ready; import rejected to avoid cross-thread db_ access");
+        r.errors.append(e);
+        return r;
     }
 
-    // J-03: Use shared_ptr<promise> so the promise outlives this stack frame if
-    // the 60-second timeout fires before the worker task executes.
     auto sharedPromise = std::make_shared<std::promise<ImportResult>>();
     std::future<ImportResult> future = sharedPromise->get_future();
 
-    // J-03: Capture bridge by pointer (bridge is owned by caller, lives >= SyncEngine).
-    // Do NOT call bridge.runImportOnDb() from the worker task — that touches
-    // DataBridgePrivate::db_ (main-thread connection) and catalog_ without a lock.
-    // Instead capture the catalog+profile snapshot on the calling thread now (safe:
-    // DataBridge methods are called from their owning thread at this point).
-    // For simplicity: pass bridge& and note that runImportOnDb only reads catalog_/profiles_
-    // (no write, no Qt SQL query on main db_) after this point; refreshCatalog is skipped.
-    DataBridge* bridgePtr = &bridge;
-    enqueue([this, bridgePtr, opts, xlsxPath, sp = sharedPromise]() mutable {
+    // profile/catalog are value-copied into the lambda — worker never touches main-thread objects.
+    enqueue([this, opts, xlsxPath, profile, catalog, sp = sharedPromise]() mutable {
         if (!wconnPtr_ || !hPtr_) {
             ImportResult r;
             RowError e;
@@ -651,7 +651,7 @@ ImportResult SyncWorker::submitImportSync(DataBridge& bridge, const ImportOption
             return;
         }
 
-        // Run ImportService on wconn, wrapped in WriteTxn + SessionRecorder (branch C semantics).
+        // CapturedWriteTemplate branch C: fresh session capture around the UPSERT writes.
         WriteTxn txn(*wconnPtr_);
         QString txnErr;
         if (!txn.begin(&txnErr)) {
@@ -667,9 +667,10 @@ ImportResult SyncWorker::submitImportSync(DataBridge& bridge, const ImportOption
         QString sessionErr;
         rec_->begin(hPtr_, config_.syncTables(), &sessionErr);
 
-        // runImportOnDb uses stored catalog+profiles from DataBridge (read-only, thread-safe
-        // after initial load) and writes rows to wconn (worker-owned).
-        ImportResult result = bridgePtr->runImportOnDb(xlsxPath, opts, *wconnPtr_);
+        // Run ImportService using the worker-owned wconn and the pre-snapshotted
+        // profile/catalog — zero access to DataBridge::db_ or main-thread state.
+        detail::ImportService svc;
+        ImportResult result = svc.run(profile, catalog, xlsxPath, opts, *wconnPtr_);
 
         if (result.ok) {
             qint64 localSeq = 0;

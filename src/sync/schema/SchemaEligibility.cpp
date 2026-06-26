@@ -166,11 +166,38 @@ bool SchemaEligibility::hasUpsertTarget(QSqlDatabase& db, const QString& table, 
     // PK itself is always a valid ON CONFLICT target — if we got here the table has a PK.
     // Additionally verify no partial unique index is the *only* unique constraint
     // (PK alone is sufficient, so just return true if PK exists).
-    Q_UNUSED(err)
-    // We already verified pkCols is non-empty in the caller. PK = valid upsert target.
-    Q_UNUSED(table)
-    Q_UNUSED(db)
-    return true;  // PK is always a valid conflict target for ON CONFLICT DO UPDATE
+    // M-02 fix: verify all PK columns are NOT NULL so ON CONFLICT(pk) is a valid target.
+    QSqlQuery ti(db);
+    ti.prepare(QStringLiteral("PRAGMA table_info(\"%1\")").arg(table));
+    if (!ti.exec()) {
+        if (err)
+            *err = ti.lastError().text();
+        return false;
+    }
+    int pkColCount = 0;
+    int pkNotNullCount = 0;
+    while (ti.next()) {
+        const int pkPos = ti.value(5).toInt();  // pk column (1-based, 0 = not PK)
+        if (pkPos > 0) {
+            ++pkColCount;
+            if (ti.value(3).toInt() == 1)  // notnull flag
+                ++pkNotNullCount;
+        }
+    }
+    if (pkColCount == 0) {
+        if (err)
+            *err = QStringLiteral("table '%1' has no primary key columns").arg(table);
+        return false;
+    }
+    if (pkNotNullCount < pkColCount) {
+        if (err)
+            *err = QStringLiteral(
+                       "table '%1': not all PK columns are NOT NULL; "
+                       "ON CONFLICT target would be invalid")
+                       .arg(table);
+        return false;
+    }
+    return true;
 }
 
 bool SchemaEligibility::isShadowTable(QSqlDatabase& db, const QString& table, QString* err) {

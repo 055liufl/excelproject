@@ -9,6 +9,7 @@
 #include "ErrorCollector.h"
 #include "excel/ExcelReader.h"
 #include "mapping/BatchUniqueness.h"
+#include "mapping/FkInjector.h"
 #include "mapping/Mapper.h"
 #include "mapping/Router.h"
 #include "mapping/TopoSorter.h"
@@ -77,105 +78,6 @@ struct LookupHit {
 using LookupCache = QHash<QString, QHash<QString, LookupHit>>;
 
 }  // anonymous namespace
-
-// ---- FK injection ----------------------------------------------------------
-
-// §6.6 NULL strict: if a parent bind is NULL, report E_VALIDATE_FK and mark child failed.
-// §6.7 Cascade suppression: if an ancestor route failed, drop the child payload silently.
-// Returns the set of route-indices that failed this row (used to suppress further children).
-static QSet<int> doFkInject(QVector<RoutePayload>& payloads, const QVector<RouteSpec>& routes,
-                            int excelRow, const QString& sheet, ErrorCollector* errors,
-                            QSet<int> initialFailed = {}) {
-    QHash<QString, int> tableToPayloadIdx;
-    for (int i = 0; i < payloads.size(); ++i)
-        tableToPayloadIdx[payloads[i].table] = i;
-
-    // Build parent-chain map: routeIdx → parentRouteIdx (-1 if no parent)
-    QHash<int, int> parentIdx;
-    for (int i = 0; i < routes.size(); ++i) {
-        const QString& parentTable = routes[i].parent;
-        if (!parentTable.isEmpty() && tableToPayloadIdx.contains(parentTable))
-            parentIdx[i] = tableToPayloadIdx[parentTable];
-        else
-            parentIdx[i] = -1;
-    }
-
-    QSet<int> failedIdxs = std::move(initialFailed);
-
-    for (int i = 0; i < routes.size(); ++i) {
-        const RouteSpec& route = routes[i];
-        if (route.fkInject.isEmpty())
-            continue;
-
-        // §6.7: check ancestor chain for failures (initialFailed pre-seeds lookup failures)
-        bool ancestorFailed = false;
-        int ancestor = parentIdx.value(i, -1);
-        while (ancestor >= 0) {
-            if (failedIdxs.contains(ancestor)) {
-                ancestorFailed = true;
-                break;
-            }
-            ancestor = parentIdx.value(ancestor, -1);
-        }
-        if (ancestorFailed)
-            continue;  // silently drop, no duplicate error
-
-        RoutePayload& childPayload = payloads[i];
-        bool rowFailed = false;
-
-        for (const FkInjectSpec& fk : route.fkInject) {
-            auto parentIt = tableToPayloadIdx.find(fk.fromTable);
-            if (parentIt == tableToPayloadIdx.end())
-                continue;
-
-            const RoutePayload& parentPayload = payloads[parentIt.value()];
-
-            for (const auto& pair : fk.pairs) {
-                const QString& parentCol = pair.first;
-                const QString& childCol = pair.second;
-
-                int fromIdx = parentPayload.indexOf(parentCol);
-                if (fromIdx < 0)
-                    continue;
-                QVariant fkVal = parentPayload.binds[fromIdx];
-
-                // §6.6 NULL strict: refuse to inject NULL
-                if (fkVal.isNull()) {
-                    errors->add(sheet, excelRow, childCol, QString(),
-                                QString::fromLatin1(err::E_VALIDATE_FK),
-                                QStringLiteral("fkInject from '") + fk.fromTable +
-                                    QStringLiteral("': parent column '") + parentCol +
-                                    QStringLiteral("' is NULL; cannot inject into '") + childCol +
-                                    '\'');
-                    rowFailed = true;
-                    continue;
-                }
-
-                int toIdx = childPayload.indexOf(childCol);
-                if (toIdx >= 0) {
-                    childPayload.binds[toIdx] = fkVal;
-                } else {
-                    childPayload.dbColumns.append(childCol);
-                    childPayload.binds.append(fkVal);
-                    toIdx = childPayload.dbColumns.size() - 1;
-                }
-
-                // Update conflictVals by column name — design D5
-                for (int ci = 0; ci < childPayload.conflictKey.size(); ++ci) {
-                    if (childPayload.conflictKey[ci] == childCol &&
-                        ci < childPayload.conflictVals.size()) {
-                        childPayload.conflictVals[ci] = fkVal;
-                    }
-                }
-            }
-        }
-
-        if (rowFailed)
-            failedIdxs.insert(i);
-    }
-
-    return failedIdxs;
-}
 
 // ---- Lookup application (Phase B) -----------------------------------------
 
@@ -479,7 +381,7 @@ static bool routeHasChildren(const QString& table, const QVector<RouteSpec>& rou
 
 ImportResult ImportService::run(const ProfileSpec& profile, const SchemaCatalog& catalog,
                                 const QString& xlsxPath, const ImportOptions& options,
-                                QSqlDatabase& db) {
+                                QSqlDatabase& db, bool manageTransaction) {
     ImportResult result;
     ErrorCollector errors;
 
@@ -614,7 +516,8 @@ ImportResult ImportService::run(const ProfileSpec& profile, const SchemaCatalog&
                                               reader, r, sheetName, &errors);
 
         // FK injection (§6.6 NULL strict, §6.7 cascade suppression)
-        doFkInject(ctx.payloads, *routesPtr, r, sheetName, &errors, std::move(lookupFailed));
+        FkInjector fkInjector;
+        fkInjector.inject(ctx.payloads, *routesPtr, r, sheetName, &errors, std::move(lookupFailed));
 
         // Batch uniqueness check
         for (int pi = 0; pi < ctx.payloads.size(); ++pi) {
@@ -667,7 +570,7 @@ ImportResult ImportService::run(const ProfileSpec& profile, const SchemaCatalog&
     }
 
     // --- Phase D: Write (single transaction) ---
-    if (!db.transaction()) {
+    if (manageTransaction && !db.transaction()) {
         errors.addTable(sheetName, QString::fromLatin1(err::E_DB_UPSERT),
                         QStringLiteral("Failed to start transaction: ") + db.lastError().text());
         result.errors = errors.list();
@@ -731,8 +634,9 @@ ImportResult ImportService::run(const ProfileSpec& profile, const SchemaCatalog&
     }
 
     if (writeOk) {
-        if (!db.commit()) {
-            db.rollback();
+        if (manageTransaction && !db.commit()) {
+            if (manageTransaction)
+                db.rollback();
             errors.addTable(sheetName, QString::fromLatin1(err::E_DB_UPSERT),
                             QStringLiteral("Commit failed: ") + db.lastError().text());
             result.writtenRows = 0;
@@ -740,7 +644,8 @@ ImportResult ImportService::run(const ProfileSpec& profile, const SchemaCatalog&
             result.ok = true;
         }
     } else {
-        db.rollback();
+        if (manageTransaction)
+            db.rollback();
         result.writtenRows = 0;
     }
 

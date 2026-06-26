@@ -1,8 +1,15 @@
 #include "BatchTransfer.h"
 
+#include "dbridge/Errors.h"
+
 #include <QDebug>
+#include <QSqlError>
+#include <QSqlQuery>
+#include <QUuid>
 #include <QtConcurrent/QtConcurrent>
 
+#include "service/ExportService.h"
+#include "service/ImportService.h"
 #include "sync/SyncContext.h"
 
 namespace dbridge {
@@ -38,6 +45,18 @@ bool BatchTransfer::startImport(const ImportOptions& options, QString* err) {
         return false;
     }
 
+    if (options.xlsxPath.isEmpty()) {
+        if (err)
+            *err = QStringLiteral("xlsxPath is required");
+        return false;
+    }
+
+    detail::ProfileSpec profile;
+    detail::SchemaCatalog catalog;
+    if (!bridge_.snapshotProfileCatalog(options.profileName, &profile, &catalog, err))
+        return false;
+    const QString dbPath = bridge_.dbPath();
+
     // Reset all import state.
     importStopRequested_.store(false);
     importState_ = TransferState::Running;
@@ -46,8 +65,9 @@ bool BatchTransfer::startImport(const ImportOptions& options, QString* err) {
     importProgress_ = TransferProgress{};
     lock.unlock();
 
-    // QtConcurrent::run copies `options` into the lambda capture; safe.
-    importFuture_ = QtConcurrent::run([this, options]() { runImport(options); });
+    importFuture_ = QtConcurrent::run([this, options, dbPath, profile, catalog]() {
+        runImport(options, dbPath, profile, catalog);
+    });
     return true;
 }
 
@@ -63,6 +83,18 @@ bool BatchTransfer::startExport(const ExportOptions& options, QString* err) {
         return false;
     }
 
+    if (options.xlsxPath.isEmpty()) {
+        if (err)
+            *err = QStringLiteral("xlsxPath is required");
+        return false;
+    }
+
+    detail::ProfileSpec profile;
+    detail::SchemaCatalog catalog;
+    if (!bridge_.snapshotProfileCatalog(options.profileName, &profile, &catalog, err))
+        return false;
+    const QString dbPath = bridge_.dbPath();
+
     exportStopRequested_.store(false);
     exportState_ = TransferState::Running;
     exportErrors_.clear();
@@ -70,19 +102,18 @@ bool BatchTransfer::startExport(const ExportOptions& options, QString* err) {
     exportProgress_ = TransferProgress{};
     lock.unlock();
 
-    exportFuture_ = QtConcurrent::run([this, options]() { runExport(options); });
+    exportFuture_ = QtConcurrent::run([this, options, dbPath, profile, catalog]() {
+        runExport(options, dbPath, profile, catalog);
+    });
     return true;
 }
 
 // ---------------------------------------------------------------------------
 // runImport  (runs on worker thread)
 //
-// Convention: opts.xlsxPath holds the xlsx file path.
-//             opts.profileName is the import profile name (distinct from the file path).
-//             opts.sheetName   is passed as-is to DataBridge (empty = profile default).
-// ---------------------------------------------------------------------------
-
-void BatchTransfer::runImport(const ImportOptions& opts) {
+void BatchTransfer::runImport(const ImportOptions& opts, const QString& dbPath,
+                              const detail::ProfileSpec& profile,
+                              const detail::SchemaCatalog& catalog) {
     // I-04 / J-10: Route import through SyncWorker if sync is active for this database.
     // J-10: Use getExisting() (no refCount increment, no context creation) so we never
     // create an empty context and never leak a reference if importFn is not set.
@@ -91,11 +122,7 @@ void BatchTransfer::runImport(const ImportOptions& opts) {
         if (!dbPath.isEmpty()) {
             auto ctx = sync::SyncContextRegistry::instance().getExisting(dbPath);
             if (ctx && ctx->importFn) {
-                // Sync is active: run import on SyncWorker thread with session capture.
-                // xlsxPath is carried in opts.profileName (design limitation; M3 adds dedicated
-                // field).
-                const QString xlsxPath = opts.profileName;
-                ImportResult result = ctx->importFn(xlsxPath, opts);
+                ImportResult result = ctx->importFn(opts.xlsxPath, opts, profile, catalog);
                 // No release() — getExisting() does not increment refCount.
                 // Commit result and finish
                 if (importStopRequested_.load()) {
@@ -132,7 +159,7 @@ void BatchTransfer::runImport(const ImportOptions& opts) {
         return;
     }
 
-    // The synchronous DataBridge call does all the heavy lifting.
+    // Use a connection opened on this QtConcurrent thread; never reuse DataBridge::db_ here.
     // We cannot inject progress ticks into it, so we report 50 % while it
     // runs and 100 % when it finishes (or 0 % on early-stop).
     {
@@ -140,12 +167,27 @@ void BatchTransfer::runImport(const ImportOptions& opts) {
         importProgress_.percent = 50;
     }
 
-    // opts.profileName is reused here as the xlsx file path (design smell: the field
-    // serves dual purpose as both profile identifier and file path).  A dedicated
-    // xlsxPath field should be added to ImportOptions in M3 when full SyncWorker
-    // routing is implemented.
-    const QString xlsxPath = opts.profileName;
-    ImportResult result = bridge_.importExcel(xlsxPath, opts);
+    ImportResult result;
+    const QString connName =
+        QStringLiteral("dbridge_bt_import_") + QUuid::createUuid().toString(QUuid::WithoutBraces);
+    {
+        QSqlDatabase db = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), connName);
+        db.setDatabaseName(dbPath);
+        db.setConnectOptions(QStringLiteral("QSQLITE_BUSY_TIMEOUT=5000"));
+        if (!db.open()) {
+            RowError e;
+            e.code = QString::fromLatin1(err::E_OPEN_DB);
+            e.message = db.lastError().text();
+            result.errors.append(e);
+        } else {
+            QSqlQuery q(db);
+            q.exec(QStringLiteral("PRAGMA foreign_keys=ON"));
+            detail::ImportService svc;
+            result = svc.run(profile, catalog, opts.xlsxPath, opts, db);
+        }
+        db.close();
+    }
+    QSqlDatabase::removeDatabase(connName);
 
     // Check for stop request that arrived while the bridge call was in flight.
     if (importStopRequested_.load()) {
@@ -172,10 +214,9 @@ void BatchTransfer::runImport(const ImportOptions& opts) {
 // ---------------------------------------------------------------------------
 // runExport  (runs on worker thread)
 //
-// Convention: opts.profileName is the xlsx file path.
-// ---------------------------------------------------------------------------
-
-void BatchTransfer::runExport(const ExportOptions& opts) {
+void BatchTransfer::runExport(const ExportOptions& opts, const QString& dbPath,
+                              const detail::ProfileSpec& profile,
+                              const detail::SchemaCatalog& catalog) {
     {
         QMutexLocker lock(&mutex_);
         exportProgress_ = TransferProgress{0, 0, -1};
@@ -192,8 +233,25 @@ void BatchTransfer::runExport(const ExportOptions& opts) {
         exportProgress_.percent = 50;
     }
 
-    const QString xlsxPath = opts.profileName;
-    ExportResult result = bridge_.exportExcel(xlsxPath, opts);
+    ExportResult result;
+    const QString connName =
+        QStringLiteral("dbridge_bt_export_") + QUuid::createUuid().toString(QUuid::WithoutBraces);
+    {
+        QSqlDatabase db = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), connName);
+        db.setDatabaseName(dbPath);
+        db.setConnectOptions(QStringLiteral("QSQLITE_OPEN_READONLY=1;QSQLITE_BUSY_TIMEOUT=5000"));
+        if (!db.open()) {
+            RowError e;
+            e.code = QString::fromLatin1(err::E_OPEN_DB);
+            e.message = db.lastError().text();
+            result.errors.append(e);
+        } else {
+            detail::ExportService svc;
+            result = svc.run(profile, catalog, opts.xlsxPath, opts, db);
+        }
+        db.close();
+    }
+    QSqlDatabase::removeDatabase(connName);
 
     if (exportStopRequested_.load()) {
         QMutexLocker lock(&mutex_);

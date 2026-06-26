@@ -250,10 +250,19 @@ bool BaselineManager::applyBaseline(QSqlDatabase& wconn, sqlite3* /*h*/,
         return false;
     }
 
+    // C-4 fix: helper lambda to restore FK ON — called on every error and success path.
+    // This is the RAII-style guard that prevents FK=OFF from leaking into the connection state
+    // after any failure between FK=OFF and the final successful FK=ON.
+    auto restoreFk = [&]() {
+        QSqlQuery pragmaOn(wconn);
+        pragmaOn.exec(QStringLiteral("PRAGMA foreign_keys=ON"));
+    };
+
     // Reset applied vector for this origin/epoch.
     // baselineGeneration = sourceMaxSeq serves as the generation stamp.
     if (!av.reset(wconn, origin, epoch, art.sourceMaxSeq, err)) {
         txn.rollback();
+        restoreFk();
         wrapErr(err);
         return false;
     }
@@ -262,6 +271,7 @@ bool BaselineManager::applyBaseline(QSqlDatabase& wconn, sqlite3* /*h*/,
     // the remote fingerprint and avoid producing false "Different" results after baseline apply.
     if (!ts.resetFromBaseline(wconn, tables, epoch, schemaFp, err)) {
         txn.rollback();
+        restoreFk();
         wrapErr(err);
         return false;
     }
@@ -269,23 +279,19 @@ bool BaselineManager::applyBaseline(QSqlDatabase& wconn, sqlite3* /*h*/,
     // Clear row winner store — all rows now reflect baseline truth.
     if (!rw.resetAll(wconn, err)) {
         txn.rollback();
+        restoreFk();
         wrapErr(err);
         return false;
     }
 
     if (!txn.commit(err)) {
-        QSqlQuery pragmaOnErr(wconn);
-        pragmaOnErr.exec(QStringLiteral("PRAGMA foreign_keys=ON"));
+        restoreFk();
         wrapErr(err);
         return false;
     }
 
-    // C-1 fix: re-enable FK enforcement AFTER the transaction commits (outside BEGIN...COMMIT
-    // so the pragma actually takes effect — SQLite ignores it inside a transaction).
-    {
-        QSqlQuery pragmaOn(wconn);
-        pragmaOn.exec(QStringLiteral("PRAGMA foreign_keys=ON"));
-    }
+    // Re-enable FK enforcement AFTER the transaction commits.
+    restoreFk();
 
     // Invalidate in-memory consistency cache for each table (outside txn is fine).
     for (const QString& table : tables) {

@@ -124,6 +124,8 @@ struct DecodeResult {
     PayloadHeader header;
     PayloadKind kind = PayloadKind::Changeset;
     QByteArray changeset;
+    // C-5 fix: preserve the complete encoded payload so quarantine can replay via codec->decode().
+    QByteArray rawPayload;
     SelectionPushBody selection;
     BaselineRequestPayload baselineRequest;
     BaselineResponsePayload baselineResponse;

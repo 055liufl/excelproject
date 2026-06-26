@@ -554,9 +554,11 @@ bool SyncWorker::processChangesetArtifact(const DecodeResult& dec, const QString
     // Schema guard
     QString schemaErr;
     if (!guard_->verifyPayload(hdr.schemaVer, hdr.schemaFingerprint, &schemaErr)) {
-        // Quarantine
+        // C-5 fix: quarantine the FULL payload bytes (not just dec.changeset) so that
+        // drainReady() can replay via codec_->decode() on the complete encoded artifact.
+        // Previously this stored only the raw changeset which would fail codec decoding on replay.
         quarantine_->quarantine(*wconnPtr_, hdr.origin, hdr.originSeq, hdr.streamEpoch,
-                                hdr.schemaVer, dec.changeset, nullptr);
+                                hdr.schemaVer, dec.rawPayload, nullptr);
         emit errorOccurred(
             {err::E_SYNC_SCHEMA_MISMATCH, Severity::Warning, "apply", hdr.origin, schemaErr});
         return false;
@@ -1414,6 +1416,13 @@ bool SyncWorker::submitCaptureWriteSync(const QList<RowMutation>& mutations,
 void SyncWorker::startAckWait() {
     ackWaiting_ = true;
     ackDeadlineMs_ = QDateTime::currentMSecsSinceEpoch() + config_.ackMaxDelayMs();
+}
+
+// C-1 fix: cancel a pending ACK wait that was armed before enqueueDrain but no payload was sent.
+void SyncWorker::cancelAckWait() {
+    ackWaiting_ = false;
+    ackDeadlineMs_ = 0;
+    pendingPushId_.clear();
 }
 
 // C-02: Enqueue an immediate drain cycle on the worker thread.

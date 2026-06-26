@@ -81,6 +81,8 @@ class SyncWorker : public QThread {
     // I-19: Notify worker that a foreground sync() is waiting for ACK.
     // The worker will emit E_SYNC_ACK_TIMEOUT if no ACK arrives within ackMaxDelayMs.
     void startAckWait();
+    // C-1 fix: cancel a pending ACK wait when no payload was sent.
+    void cancelAckWait();
 
     // C-05 fix: route RowMutations through CapturedWriteTemplate on the worker thread.
     // Gives comparison-session saves the same session-capture + changelog semantics as local

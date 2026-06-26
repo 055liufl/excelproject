@@ -162,9 +162,15 @@ bool SyncEngine::sync(QString* err) {
     setProgress(SyncState::Importing);
 
     setProgress(SyncState::Exporting, -1);
+    // C-1 fix: arm ACK wait BEFORE enqueueDrain to close the race window where an ACK arrives
+    // between broadcast completion and startAckWait() — which would leave ackWaiting_ true
+    // forever (or until timeout).  If no payload is actually sent, cancelAckWait() clears the
+    // flag before any timeout can fire.
+    worker_->startAckWait();
     QString drainErr;
     const bool hasPayload = worker_->enqueueDrain(&drainErr);
     if (!drainErr.isEmpty()) {
+        worker_->cancelAckWait();
         appendError({err::E_SYNC_TRANSPORT, Severity::Error, QStringLiteral("sync"),
                      configPtr_->nodeId(), drainErr});
         setProgress(SyncState::Failed, 0);
@@ -174,11 +180,12 @@ bool SyncEngine::sync(QString* err) {
         return false;
     }
     if (!hasPayload) {
+        // Nothing was broadcast — no ACK will come.
+        worker_->cancelAckWait();
         setProgress(SyncState::Completed, 100);
         ctx_->gate.release();
         return true;
     }
-    worker_->startAckWait();
     return true;
 }
 

@@ -361,28 +361,51 @@ bool BaselineManager::applyBaseline(QSqlDatabase& wconn, sqlite3* /*h*/,
     // appliedSeq for baseline rows is sourceMaxSeq (the highest changelog seq on the exporter).
     {
         const qint64 baselineSeq = art.sourceMaxSeq;
+        bool seedOk = true;
         for (const QString& tableName : tables) {
+            if (!seedOk)
+                break;
             // Collect PK column names and their indices via PRAGMA table_info.
             QStringList pkCols;
             {
                 QSqlQuery pragmaQ(wconn);
                 pragmaQ.prepare(QStringLiteral("PRAGMA table_info(") +
                                 detail::SqlBuilder::quoteIdent(tableName) + QLatin1Char(')'));
-                if (pragmaQ.exec()) {
-                    while (pragmaQ.next()) {
-                        if (pragmaQ.value(QStringLiteral("pk")).toInt() > 0)
-                            pkCols << pragmaQ.value(QStringLiteral("name")).toString();
-                    }
+                // M-01 fix: treat PRAGMA failure as a hard error — we cannot compute pk_hash
+                // without column info; silently skipping would leave the table unprotected.
+                if (!pragmaQ.exec()) {
+                    if (err)
+                        *err = QStringLiteral("M-01: PRAGMA table_info failed for %1: %2")
+                                   .arg(tableName, pragmaQ.lastError().text());
+                    seedOk = false;
+                    break;
+                }
+                while (pragmaQ.next()) {
+                    if (pragmaQ.value(QStringLiteral("pk")).toInt() > 0)
+                        pkCols << pragmaQ.value(QStringLiteral("name")).toString();
                 }
             }
-            if (pkCols.isEmpty())
-                continue;  // no PK — skip (cannot compute pk_hash)
+            if (pkCols.isEmpty()) {
+                // M-01 fix: no PK columns found — PRAGMA ran but returned no PK rows.
+                // This means we cannot compute pk_hash; fail so the caller rolls back.
+                if (err)
+                    *err =
+                        QStringLiteral("M-01: table %1 has no primary key columns").arg(tableName);
+                seedOk = false;
+                break;
+            }
 
             QSqlQuery rowQ(wconn);
             rowQ.prepare(QStringLiteral("SELECT * FROM ") +
                          detail::SqlBuilder::quoteIdent(tableName));
-            if (!rowQ.exec())
-                continue;
+            // M-01 fix: SELECT failure must roll back baseline, not silently skip the table.
+            if (!rowQ.exec()) {
+                if (err)
+                    *err = QStringLiteral("M-01: SELECT * failed for %1: %2")
+                               .arg(tableName, rowQ.lastError().text());
+                seedOk = false;
+                break;
+            }
 
             const QSqlRecord rec = rowQ.record();
             const int colCount = rec.count();
@@ -471,8 +494,22 @@ bool BaselineManager::applyBaseline(QSqlDatabase& wconn, sqlite3* /*h*/,
                 winner.originSeq = baselineSeq;
                 winner.contentHash = contentH;
                 winner.winningContent = winningContentStr;
-                rw.put(wconn, tableName, pkHashStr, winner, nullptr);
+                // M-01 fix: propagate put() failures so the transaction is rolled back.
+                QString putErr;
+                if (!rw.put(wconn, tableName, pkHashStr, winner, &putErr)) {
+                    if (err)
+                        *err =
+                            QStringLiteral("M-01: rw.put failed for %1: %2").arg(tableName, putErr);
+                    seedOk = false;
+                    break;
+                }
             }
+        }
+        if (!seedOk) {
+            txn.rollback();
+            restoreFk();
+            wrapErr(err);
+            return false;
         }
     }
 

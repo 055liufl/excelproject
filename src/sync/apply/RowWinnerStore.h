@@ -29,6 +29,11 @@ class RowWinnerStore {
     bool put(QSqlDatabase& db, const QString& table, const QString& pkHash, const RowWinner& winner,
              QString* err);
 
+    // H-01 fix: like put(), but also allows overwrite when rank/seq match and the stored
+    // winningContent is empty (completes an earlier partial write from conflictCb).
+    bool putOrRefill(QSqlDatabase& db, const QString& table, const QString& pkHash,
+                     const RowWinner& winner, QString* err);
+
     // Delete all winner rows (called after baseline reset).
     bool resetAll(QSqlDatabase& db, QString* err);
 

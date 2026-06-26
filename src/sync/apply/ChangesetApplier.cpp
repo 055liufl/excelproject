@@ -200,7 +200,9 @@ int ChangesetApplier::conflictCb(void* ctx, int conflict, sqlite3_changeset_iter
                 (incumbent.rank == INT_MIN) || (challenger.rank > incumbent.rank) ||
                 (challenger.rank == incumbent.rank && challenger.originSeq > incumbent.originSeq);
             if (win) {
-                c->winners->put(*c->wconn, table, pkHashStr, challenger, nullptr);
+                // H-01 fix: do NOT write the incomplete challenger here (winningContent is empty
+                // at this point).  updateWinnersFromChangeset() runs after apply_v2 and writes the
+                // full RowWinner including winningContent via putOrRefill().
                 c->outcome->applied++;
                 return SQLITE_CHANGESET_REPLACE;
             }
@@ -445,12 +447,10 @@ bool ChangesetApplier::updateWinnersFromChangeset(const QByteArray& changeset,
         challenger.winningContent =
             QString::fromUtf8(QJsonDocument(rowJson).toJson(QJsonDocument::Compact));
 
-        RowWinner incumbent = winners.get(wconn, tableName, pkHashStr);
-        const bool shouldUpdate = (incumbent.rank == INT_MIN) || (rank > incumbent.rank) ||
-                                  (rank == incumbent.rank && seq >= incumbent.originSeq);
-
-        if (shouldUpdate)
-            winners.put(wconn, tableName, pkHashStr, challenger, nullptr);
+        // H-01 fix: use putOrRefill() so that if conflictCb() was called for this row
+        // (and left an empty winningContent record), the full content written here takes
+        // precedence even when rank/seq are identical.
+        winners.putOrRefill(wconn, tableName, pkHashStr, challenger, nullptr);
     }
     sqlite3changeset_finalize(iter);
     return ok;

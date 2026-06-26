@@ -4,288 +4,289 @@
 
 ## 总体评分
 
-总分：72/100。
+总分：68/100。
 
 各维度子分：
 
-- 合规性：70/100。同步、导入导出和 OpenSpec 主体能力覆盖面较高，但基线 gap 闭环、MVP 导入原子性、部分时间格式继承语义存在明确偏差。
-- 正确性：72/100。向量时钟连续性、ACK、FK 闭包、反向查找等核心路径有实现；但类型严格相等、主键/tuple key 字符串化、导出时间错误定位、低优先级 DELETE 恢复语义有实质风险。
-- 安全性：68/100。大部分业务 SQL 使用绑定参数，`SqlBuilder::quoteIdent()` 已建立；但同步若干路径仍手工拼接/手工双引号，未统一通过 `quoteIdent()`。
-- 架构质量：76/100。模块拆分较完整，SyncWorker 单写线程模型清晰；但 SyncWorker 仍承担传输、ACK、baseline、selection push、apply 调度等过多职责。
-- 边界处理：69/100。已有 stale gap、schema guard、quarantine、ACK timeout、FK cycle/too large 等处理；但 baseline fallback 未闭环，复合主键整体拒绝，若干空字符串/NULL/类型边界与规格不一致。
+- 合规性：67/100。同步主干、Excel 导入导出、OpenSpec 五个特性都有实现，但 baseline 应用、ACK/进度语义、直接导入兼容性、ComparisonSession 语义仍与设计文档存在明显偏差。
+- 正确性：63/100。向量时钟连续性、sqlite session 捕获、FK 闭包、反向查找、时间格式等路径可运行；但 row winner 内容序列化、baseline FK 关闭、snapshot pinning、stageCell 合并、行级/route 级错误粒度存在确认 bug。
+- 安全性：74/100。大部分 SQL 值使用绑定参数，标识符 quoting 已普遍使用；仍有少量动态标识符拼接绕过 `quoteIdent()`，以及 profile raw SQL 的可信边界未明确。
+- 架构质量：70/100。模块边界总体成形，store/apply/transport/profile/mapping 拆分清晰；`SyncWorker` 和 `ExportService` 仍过于集中，部分协议状态复用了不合适的数据表。
+- 边界处理：61/100。已有 quarantine、gap timeout、schema guard、ACK timeout、chunk 顺序、单行超预算等处理；但复合主键、BLOB/大整数、baseline FK、stale ledger、跨平台 outbox durability 等边界仍不足。
 
-本轮已按要求读取全部 15 份规格/设计文档，并读取 `src/` 下 122 个 `.cpp/.h` 源文件。
+本轮已按要求读取全部 15 份设计/OpenSpec 文档，并读取 `src/` 下 122 个 `.cpp/.h` 源文件（共 15,822 行）。评审结论以下列文档为基准：
+
+- `specs/Qt-SQLite-Excel-批量导入导出-设计文档.md`
+- `specs/MVP-Qt-SQLite-Excel-批量导入导出-实现设计.md`
+- `specs/SQLite-同步工具-设计文档.md`
+- `specs/SQLite-同步工具-plan.md`
+- `openspec/specs/fk-injection/spec.md`
+- `openspec/specs/row-lookup/spec.md`
+- `openspec/specs/export-column-order/spec.md`
+- `openspec/specs/export-reverse-lookup/spec.md`
+- `openspec/specs/time-format/spec.md`
+- `openspec/changes/archive/2026-05-18-add-row-lookup-and-multi-fk-inject/design.md`
+- `openspec/changes/archive/2026-05-18-add-row-lookup-and-multi-fk-inject/proposal.md`
+- `openspec/changes/archive/2026-05-21-add-export-column-order/design.md`
+- `openspec/changes/archive/2026-05-21-add-export-reverse-lookup/design.md`
+- `openspec/changes/archive/2026-05-21-add-time-explicit-type/design.md`
+- `openspec/changes/archive/2026-05-21-add-time-format-profile/design.md`
 
 ## 第一部分：功能合规性评审
 
 ### 1.1 同步引擎核心（SyncEngine / SyncWorker）
 
-- 已实现：单写线程模型。`SyncEngine::initialize()` 创建 `SyncWorker` 并把 `importFn`、`workerWriteFn`、`workerCaptureWriteFn` 绑定到共享 `SyncContext`，避免主线程直接跨线程使用数据库连接，见 `src/sync/SyncEngine.cpp:62`、`src/sync/SyncEngine.cpp:123`、`src/sync/SyncEngine.cpp:128`、`src/sync/SyncEngine.cpp:134`。
-- 已实现：同步激活后阻断 `DataBridge::importExcel()` 直接写入，要求通过 `IBatchTransfer` 进入 worker，见 `src/DataBridge.cpp:177`、`src/DataBridge.cpp:181`、`src/DataBridge.cpp:184`。
-- 已实现：物理数据库上下文以 POSIX dev/inode 或 Windows file index 作为 key，符合单库单上下文要求，见 `src/sync/SyncContext.cpp:20`、`src/sync/SyncContext.cpp:52`、`src/sync/SyncContext.cpp:61`。
-- 已实现：ChangeLog 捕获与本地导入同事务封装。`SyncWorker::submitImportSync()` 在 worker 线程 `BEGIN IMMEDIATE`、启动 sqlite session、运行导入、`sealInto()` 写入 changelog 后提交，见 `src/sync/SyncWorker.cpp:1246`、`src/sync/SyncWorker.cpp:1262`、`src/sync/SyncWorker.cpp:1277`、`src/sync/SyncWorker.cpp:1286`、`src/sync/SyncWorker.cpp:1300`。
-- 已实现：前台同步门闩。`ForegroundGate` 确保前台 import/export/syncSelected 不并行，见 `src/sync/ForegroundGate.h:12`、`src/batch/BatchTransfer.cpp:63`、`src/batch/BatchTransfer.cpp:112`、`src/sync/SyncEngine.cpp:159`。
-- 已实现：出站/入站通道。Outbox 采用 tmp 写入、fsync、rename、ready marker、目录 fsync，见 `src/sync/transport/OutboxWriter.cpp:24`、`src/sync/transport/OutboxWriter.cpp:45`、`src/sync/transport/OutboxWriter.cpp:59`、`src/sync/transport/OutboxWriter.cpp:73`、`src/sync/transport/OutboxWriter.cpp:95`、`src/sync/transport/OutboxWriter.cpp:113`。Inbox ledger 有 seen/consumed/corrupt，见 `src/sync/transport/InboxLedger.cpp:20`、`src/sync/transport/InboxLedger.cpp:36`、`src/sync/transport/InboxLedger.cpp:52`。
-- 已实现：ACK timeout 与前台状态回写。见 `src/sync/SyncWorker.cpp:394`、`src/sync/SyncWorker.cpp:904`、`src/sync/SyncWorker.cpp:974`。
-- 偏差：changeset ACK 到达时只校验 `toPeer`，没有绑定当前前台 `sync()` 发出的批次或目标 peer；任意合法 changeset ACK 都会清空 `ackWaiting_` 并置 Completed，见 `src/sync/SyncWorker.cpp:888`、`src/sync/SyncWorker.cpp:900`、`src/sync/SyncWorker.cpp:904`。selection push ACK 已通过 `pendingPushId_` 过滤，见 `src/sync/SyncWorker.cpp:927`，普通 changeset ACK 缺同等级关联。
-- 缺失：gap 后的 baseline fallback 未形成协议闭环。stale pending 会调用 `runBaselineFallbackFor()`，见 `src/sync/SyncWorker.cpp:451`、`src/sync/SyncWorker.cpp:463`；但该函数只报错、隔离文件、mark consumed，并明确说明需要 source-authoritative baseline 但尚未实现请求发送，见 `src/sync/SyncWorker.cpp:1189`、`src/sync/SyncWorker.cpp:1194`、`src/sync/SyncWorker.cpp:1202`、`src/sync/SyncWorker.cpp:1210`。虽然 baseline request/response handler 已存在，见 `src/sync/SyncWorker.cpp:773`、`src/sync/SyncWorker.cpp:828`，但 gap 触发点未发出 `BaselineRequest`。
+- 已实现：单写线程和 worker 写入入口基本符合设计。`SyncEngine` 建立 `SyncWorker` 后将 import/export/capture write 绑定到 `SyncContext`，避免主线程直接跨线程使用 worker 连接，见 `src/sync/SyncEngine.cpp:123`、`src/sync/SyncEngine.cpp:128`、`src/sync/SyncEngine.cpp:134`。
+- 已实现：本地导入经 worker 线程执行，使用 `BEGIN IMMEDIATE`、sqlite session、导入函数、`sealInto()`、commit 的顺序，见 `src/sync/SyncWorker.cpp:1255`、`src/sync/SyncWorker.cpp:1262`、`src/sync/SyncWorker.cpp:1277`、`src/sync/SyncWorker.cpp:1286`、`src/sync/SyncWorker.cpp:1300`。
+- 已实现：`CapturedWriteTemplate` 区分 inbound changeset 与 local/import/selection push 写入路径，inbound changeset 走 `branchA()`，selection/local 走 `branchBC()`，见 `src/sync/apply/CapturedWriteTemplate.cpp:47`、`src/sync/apply/CapturedWriteTemplate.cpp:64`、`src/sync/apply/CapturedWriteTemplate.cpp:166`。
+- 已实现：gap fallback 已能发送 `BaselineRequest`，并在 baseline response 后 apply baseline、移除 in-flight、重新扫描 inbox，见 `src/sync/SyncWorker.cpp:1192`、`src/sync/SyncWorker.cpp:1202`、`src/sync/SyncWorker.cpp:1223`、`src/sync/SyncWorker.cpp:1242`、`src/sync/SyncWorker.cpp:852`、`src/sync/SyncWorker.cpp:860`、`src/sync/SyncWorker.cpp:863`。
+- 已实现：前台 ACK 超时路径存在，`ackWaiting_` 超时后发 `E_SYNC_ACK_TIMEOUT`，见 `src/sync/SyncWorker.cpp:397`、`src/sync/SyncWorker.cpp:399`。
+- 偏差：`DataBridge::importExcel()` 在 `syncActive_` 时阻断所有直接导入，未按“同步表拒绝、非同步表允许”或“旧 API 重定向到队列”做兼容，见 `src/DataBridge.cpp:181`、`src/DataBridge.cpp:184`。影响是非同步表批量导入也被全局锁死。
+- 偏差：普通 changeset ACK 只校验 `toPeer`，任意合法 ACK 到达都会满足当前 `ackWaiting_`，没有绑定本次 foreground sync 的 peer/range/batch，见 `src/sync/SyncWorker.cpp:891`、`src/sync/SyncWorker.cpp:896`、`src/sync/SyncWorker.cpp:907`、`src/sync/SyncWorker.cpp:908`。selection push ACK 已用 `pendingPushId_` 过滤，普通 changeset ACK 缺同等级保护。
+- 偏差：gap timeout 硬编码为 30 秒，未使用 `SyncConfig` 中的 gap/peer 参数，见 `src/sync/SyncWorker.cpp:452`、`src/sync/SyncWorker.cpp:455`、`src/sync/SyncWorker.cpp:456`。
+- 偏差：`InboxLedger::stalePending()` 对所有 `status='seen'` artifact 触发 stale 检测，不区分 changeset、baseline request/response、ACK、被 inbound gate defer 的 selection push，见 `src/sync/transport/InboxLedger.cpp:93`、`src/sync/transport/InboxLedger.cpp:98`。`processArtifact()` 又在 inbound gate 判断前先 `markSeen()`，见 `src/sync/SyncWorker.cpp:517`、`src/sync/SyncWorker.cpp:518`，可能产生误报 gap。
 
 ### 1.2 差量与冲突处理（DiffEngine / ConflictArbiter / RebaseEngine）
 
-- 已实现：表级差量比较包含 schema fingerprint、checksum、row count 三要素，见 `src/sync/diff/DiffEngine.cpp:41`、`src/sync/diff/DiffEngine.cpp:43`。
-- 已实现：行级 diff 可比较 added/deleted/modified/same，见 `src/sync/diff/DiffEngine.cpp:68`、`src/sync/diff/DiffEngine.cpp:97`、`src/sync/diff/DiffEngine.cpp:108`、`src/sync/diff/DiffEngine.cpp:119`。
-- 已实现：冲突仲裁按 rank 优先、rank 相同时 originSeq 后写胜出，见 `src/sync/conflict/ConflictArbiter.cpp:13`、`src/sync/conflict/ConflictArbiter.cpp:18`、`src/sync/conflict/ConflictArbiter.cpp:22`。`ChangesetApplier` 的 sqlite conflict callback 也按同样语义更新 winner，见 `src/sync/apply/ChangesetApplier.cpp:194`、`src/sync/apply/ChangesetApplier.cpp:196`、`src/sync/apply/ChangesetApplier.cpp:199`。
-- 已实现：RebaseEngine 使用 sqlite3 rebaser API，见 `src/sync/conflict/RebaseEngine.cpp:9`、`src/sync/conflict/RebaseEngine.cpp:17`、`src/sync/conflict/RebaseEngine.cpp:27`。
-- 偏差：row diff 和 comparison session 的主键索引用 `toString()`，不同 SQLite 类型可能碰撞或排序/匹配错误，见 `src/sync/diff/DiffEngine.cpp:79`、`src/sync/diff/DiffEngine.cpp:82`、`src/sync/diff/DiffEngine.cpp:89`、`src/sync/diff/ComparisonSession.cpp:363`。
-- 偏差：低优先级 DELETE 恢复路径用 `INSERT OR REPLACE`，SQLite 会执行 DELETE+INSERT 语义，可能触发级联删除或破坏 rowid/触发器语义，见 `src/sync/apply/ChangesetApplier.cpp:302`、`src/sync/apply/ChangesetApplier.cpp:304`。这与设计文档中避免 `INSERT OR REPLACE` 的数据完整性原则不一致。
+- 已实现：表级差量判定同时比较 schema fingerprint、checksum、row count，符合高水位不能作为判等依据的要求，见 `src/sync/diff/DiffEngine.cpp:41`、`src/sync/diff/DiffEngine.cpp:43`、`src/sync/diff/DiffEngine.cpp:44`。
+- 已实现：`AppliedVectorStore` 强制连续应用，`seq != applied + 1` 时返回 gap，见 `src/sync/apply/AppliedVectorStore.cpp:20`、`src/sync/apply/AppliedVectorStore.cpp:31`、`src/sync/apply/AppliedVectorStore.cpp:41`。
+- 已实现：`ConflictArbiter` 和 `ChangesetApplier` 都采用 rank 优先、rank 相同 originSeq 后写胜出的 LWW 规则，见 `src/sync/conflict/ConflictArbiter.cpp:13`、`src/sync/conflict/ConflictArbiter.cpp:18`、`src/sync/apply/ChangesetApplier.cpp:194`、`src/sync/apply/ChangesetApplier.cpp:196`。
+- 已实现：`RebaseEngine` 使用 sqlite3 rebaser API，见 `src/sync/conflict/RebaseEngine.cpp:9`、`src/sync/conflict/RebaseEngine.cpp:17`、`src/sync/conflict/RebaseEngine.cpp:27`。
+- 偏差：`DiffEngine::tableDiffs()` 在 row_count 不同时用 `localRowCount / 4` 或 `rm.rowCount / 4` 估算 modified rows，不是实际 diff 结果，见 `src/sync/diff/DiffEngine.cpp:48`、`src/sync/diff/DiffEngine.cpp:51`、`src/sync/diff/DiffEngine.cpp:54`。这会误导 UI 或自动决策。
+- 偏差：`ComparisonSession::initialize()` 注释声称 pin read snapshot，但实际只执行一次 `SELECT * FROM sqlite_master LIMIT 0`，没有显式 `BEGIN` 持有读事务，查询结束后快照并不会被长期固定，见 `src/sync/diff/ComparisonSession.cpp:65`、`src/sync/diff/ComparisonSession.cpp:69`。
+- 偏差：`ComparisonSession::fetchRemoteRows()` 把 `keysetPageToken` 当 offset hint，而不是按主键 keyset 分页，见 `src/sync/diff/ComparisonSession.cpp:191`、`src/sync/diff/ComparisonSession.cpp:200`、`src/sync/diff/ComparisonSession.cpp:204`。这与设计中的稳定 keyset pagination 不一致。
+- 缺失：`ComparisonSession::stageCell()` 没有从 `StagingBuffer` 读取已有 staged row，连续编辑同一行不同列时后一次会基于 local row 覆盖前一次 staged 修改，见 `src/sync/diff/ComparisonSession.cpp:168`、`src/sync/diff/ComparisonSession.cpp:170`、`src/sync/diff/ComparisonSession.cpp:173`、`src/sync/diff/ComparisonSession.cpp:176`。
 
 ### 1.3 变更捕获（ChangelogStore / SessionRecorder）
 
-- 已实现：sqlite session 创建、attach 同步表、收集 changeset、写 changelog 都有实现，见 `src/sync/capture/SessionRecorder.cpp:19`、`src/sync/capture/SessionRecorder.cpp:28`、`src/sync/capture/SessionRecorder.cpp:59`、`src/sync/capture/SessionRecorder.cpp:77`。
-- 已实现：changelog append 使用普通 INSERT，不吞掉重复 `(origin, epoch, origin_seq)` 错误，见 `src/sync/capture/ChangelogStore.cpp:134`、`src/sync/capture/ChangelogStore.cpp:138`、`src/sync/capture/ChangelogStore.cpp:158`。
-- 已实现：session 捕获硬依赖 sqlite session/preupdate 编译选项，见 `src/sync/capture/SqliteHandle.cpp:15`、`src/sync/capture/SqliteHandle.cpp:19`。
-- 偏差：session hard gate 只检查编译选项和 handle，未记录/比对 SQLite source id，也未验证 Qt 驱动实际链接库与 session API 的一致性；`SqliteHandle::libVersion()` 只暴露版本字符串，见 `src/sync/capture/SqliteHandle.cpp:23`。若运行环境存在 Qt SQLite 插件与头文件/库不一致，错误定位能力不足。
-- 已实现：无变更时 `collectChangeset()` 返回非 null 空 QByteArray，避免把无变更误判为错误，见 `src/sync/capture/SessionRecorder.cpp:108`、`src/sync/capture/SessionRecorder.cpp:112`。
+- 已实现：`SessionRecorder` 创建 sqlite session、attach 同步表、收集 changeset、写入 changelog，见 `src/sync/capture/SessionRecorder.cpp:19`、`src/sync/capture/SessionRecorder.cpp:28`、`src/sync/capture/SessionRecorder.cpp:59`、`src/sync/capture/SessionRecorder.cpp:77`。
+- 已实现：`ChangelogStore::append()` 使用普通 INSERT，不通过 replace 吞掉重复 `(origin, epoch, origin_seq)`，见 `src/sync/capture/ChangelogStore.cpp:134`、`src/sync/capture/ChangelogStore.cpp:138`、`src/sync/capture/ChangelogStore.cpp:158`。
+- 已实现：读取出站范围时排除 peer echo，见 `src/sync/capture/ChangelogStore.cpp:71`、`src/sync/capture/ChangelogStore.cpp:83`。
+- 偏差：session 可用性检查只看编译选项 `ENABLE_SESSION` 和 `ENABLE_PREUPDATE_HOOK`，没有执行最小 `sqlite3session_create` smoke test，也未记录 `sqlite3_sourceid()` 级诊断，见 `src/sync/capture/SqliteHandle.cpp:15`、`src/sync/capture/SqliteHandle.cpp:19`、`src/sync/capture/SqliteHandle.cpp:23`。Qt SQLite 插件链接库不一致时定位能力不足。
 
 ### 1.4 选择与传输（SelectionResolver / ChunkStreamer / OutboxWriter / InboxWatcher）
 
-- 已实现：`SelectionResolver` 拒绝 raw SQL where，避免 selection API 注入风险，见 `src/sync/selection/SelectionResolver.cpp:80`、`src/sync/selection/SelectionResolver.cpp:83`、`src/sync/selection/SelectionResolver.cpp:91`。
-- 已实现：按主键解析记录并使用绑定参数，见 `src/sync/selection/SelectionResolver.cpp:57`、`src/sync/selection/SelectionResolver.cpp:59`、`src/sync/selection/SelectionResolver.cpp:62`。
-- 已实现：FK 闭包 BFS 扩展依赖、缺失依赖报错、拓扑排序、循环拒绝，见 `src/sync/selection/FkClosureBuilder.cpp:85`、`src/sync/selection/FkClosureBuilder.cpp:98`、`src/sync/selection/FkClosureBuilder.cpp:114`、`src/sync/selection/FkClosureBuilder.cpp:138`、`src/sync/selection/FkClosureBuilder.cpp:187`。
-- 已实现：chunk streamer 按预算分块，单行超预算直接失败，见 `src/sync/selection/ChunkStreamer.cpp:36`、`src/sync/selection/ChunkStreamer.cpp:64`、`src/sync/selection/ChunkStreamer.cpp:89`。
-- 已实现：selection push 接收侧强制 chunk 顺序，避免子表先于父表落地，见 `src/sync/SyncWorker.cpp:669`、`src/sync/SyncWorker.cpp:674`、`src/sync/SyncWorker.cpp:683`。
-- 偏差：`FkClosureBuilder` 与 selection key 使用字符串化主键，见 `src/sync/selection/FkClosureBuilder.cpp:14`、`src/sync/selection/FkClosureBuilder.cpp:104`、`src/sync/selection/SelectionResolver.cpp:40`、`src/sync/selection/SelectionResolver.cpp:45`。由于同步 schema 当前拒绝复合主键，影响范围主要是单列非 TEXT 主键的类型保真。
-- 偏差：`ChunkStreamer::stream()` 参数中 `targetPeer` 与 `PayloadCodec` 当前未使用，见 `src/sync/selection/ChunkStreamer.cpp:39`、`src/sync/selection/ChunkStreamer.cpp:40`。功能可运行，但设计上目标 peer/编码预算未真正参与分块策略。
+- 已实现：`SelectionResolver` 拒绝 raw SQL where，仅支持主键选择并使用绑定参数，见 `src/sync/selection/SelectionResolver.cpp:57`、`src/sync/selection/SelectionResolver.cpp:59`、`src/sync/selection/SelectionResolver.cpp:62`、`src/sync/selection/SelectionResolver.cpp:80`。
+- 已实现：`FkClosureBuilder` 能按 child→parent FK 构建依赖闭包、处理缺失依赖和最大规模限制，见 `src/sync/selection/FkClosureBuilder.cpp:85`、`src/sync/selection/FkClosureBuilder.cpp:98`、`src/sync/selection/FkClosureBuilder.cpp:138`、`src/sync/selection/FkClosureBuilder.cpp:228`。
+- 已实现：`ChunkStreamer` 支持按预算分块，单行超预算时失败，见 `src/sync/selection/ChunkStreamer.cpp:36`、`src/sync/selection/ChunkStreamer.cpp:64`、`src/sync/selection/ChunkStreamer.cpp:89`。
+- 偏差：发送端处理 `PushChunkAck` 时把 ACK 状态写入 `__sync_push_chunk_progress`，接收端应用 chunk 时也写同一张表，见 `src/sync/SyncWorker.cpp:939`、`src/sync/SyncWorker.cpp:942`、`src/sync/SyncWorker.cpp:958`、`src/sync/apply/CapturedWriteTemplate.cpp:344`、`src/sync/apply/CapturedWriteTemplate.cpp:348`、`src/sync/SyncDDL.h:111`。这混淆“本地接收已应用”和“远端 ACK 已到达”两个协议状态。
+- 偏差：`OutboxWriter` 无条件包含 POSIX `fcntl.h`/`unistd.h` 并调用 `open/fsync`，和 Qt 跨平台设计冲突，见 `src/sync/transport/OutboxWriter.cpp:8`、`src/sync/transport/OutboxWriter.cpp:9`、`src/sync/transport/OutboxWriter.cpp:113`、`src/sync/transport/OutboxWriter.cpp:114`。
+- 偏差：`OutboxWriter` 注释按 POSIX rename replace 语义设计，但实际调用 `QFile::rename(tmpPath, finalPath)`；Qt 在目标存在时通常失败，见 `src/sync/transport/OutboxWriter.cpp:70`、`src/sync/transport/OutboxWriter.cpp:73`。同名重试/重复 artifact 时可能不能实现原子替换。
 
 ### 1.5 模式守卫（SchemaGuard / SchemaEligibility）
 
-- 已实现：空 syncTables 展开为所有用户表，排除 sqlite 内部表和 `__sync_%` 表，见 `src/sync/schema/SchemaEligibility.cpp:14`、`src/sync/schema/SchemaEligibility.cpp:21`。
-- 已实现：拒绝不存在表、view、virtual table、shadow table、无显式 PK、nullable PK，见 `src/sync/schema/SchemaEligibility.cpp:52`、`src/sync/schema/SchemaEligibility.cpp:56`、`src/sync/schema/SchemaEligibility.cpp:60`、`src/sync/schema/SchemaEligibility.cpp:64`、`src/sync/schema/SchemaEligibility.cpp:68`、`src/sync/schema/SchemaEligibility.cpp:72`。
-- 已实现但偏严格：复合主键表全部拒绝，见 `src/sync/schema/SchemaEligibility.cpp:76`、`src/sync/schema/SchemaEligibility.cpp:79`。这与当前 SelectionResolver/FkClosureBuilder/ChangesetApplier 的单列 PK 假设一致，但比“有可用 conflict target”的规格目标更窄。
-- 已实现：schema fingerprint 包含表名、列名、类型、PK 序，见 `src/sync/schema/SchemaGuard.cpp:36`、`src/sync/schema/SchemaGuard.cpp:41`、`src/sync/schema/SchemaGuard.cpp:51`。
-- 偏差：fingerprint 未纳入 NOT NULL、默认值、唯一索引、外键等约束信息，`SchemaGuard.cpp:52` 注释列出 `notnull` 和 `dflt_value`，但实际 material 只追加 name/type/pk，见 `src/sync/schema/SchemaGuard.cpp:52`、`src/sync/schema/SchemaGuard.cpp:56`、`src/sync/schema/SchemaGuard.cpp:59`。如果约束变化但列名/类型/PK 不变，payload 可能未被 guard 拦截。
+- 已实现：同步表 eligibility 排除 sqlite 内部表、`__sync_%`、view、virtual/shadow table、无显式 PK、nullable PK，见 `src/sync/schema/SchemaEligibility.cpp:21`、`src/sync/schema/SchemaEligibility.cpp:52`、`src/sync/schema/SchemaEligibility.cpp:56`、`src/sync/schema/SchemaEligibility.cpp:60`、`src/sync/schema/SchemaEligibility.cpp:68`、`src/sync/schema/SchemaEligibility.cpp:72`。
+- 已实现：schema fingerprint 包含列名、类型、PK、NOT NULL、默认值、唯一索引名、FK 目标，见 `src/sync/schema/SchemaGuard.cpp:46`、`src/sync/schema/SchemaGuard.cpp:52`、`src/sync/schema/SchemaGuard.cpp:71`、`src/sync/schema/SchemaGuard.cpp:84`。
+- 偏差：唯一索引 fingerprint 只记录 index name，未记录 index column list、排序、partial index predicate；同名索引内容变化可能漏检，见 `src/sync/schema/SchemaGuard.cpp:71`、`src/sync/schema/SchemaGuard.cpp:78`、`src/sync/schema/SchemaGuard.cpp:79`。
+- 偏差：复合主键表被整体拒绝，见 `src/sync/schema/SchemaEligibility.cpp:76`、`src/sync/schema/SchemaEligibility.cpp:79`。这与当前 selection/apply 实现一致，但低于“有明确 conflict target 即可同步”的最终规格目标。
 
 ### 1.6 应用层（ChangesetApplier / UpsertExecutor / SelectionPushApplier）
 
-- 已实现：`UpsertExecutor` 使用 `INSERT ... ON CONFLICT DO UPDATE` 或 `INSERT OR IGNORE`，并统一 `quoteIdent()`，见 `src/sync/apply/UpsertExecutor.cpp:83`、`src/sync/apply/UpsertExecutor.cpp:86`、`src/sync/apply/UpsertExecutor.cpp:126`。
-- 已实现：selection push 通过 `CapturedWriteTemplate` 进入捕获模板，而不是绕过 changelog，见 `src/sync/apply/SelectionPushApplier.cpp:28`、`src/sync/apply/SelectionPushApplier.cpp:41`。
-- 已实现：CapturedWriteTemplate 对 inbound selection push 的行级 upsert 错误会整体回滚 chunk，不会 ACK 部分成功，见 `src/sync/apply/CapturedWriteTemplate.cpp:296`、`src/sync/apply/CapturedWriteTemplate.cpp:303`、`src/sync/apply/CapturedWriteTemplate.cpp:306`。
-- 偏差：`UpsertExecutor::apply()` 单独使用时对每行错误继续执行并返回 true，见 `src/sync/apply/UpsertExecutor.cpp:56`、`src/sync/apply/UpsertExecutor.cpp:67`、`src/sync/apply/UpsertExecutor.cpp:72`。当前 CapturedWriteTemplate 会检查 `rowErrors` 并回滚，但其他调用方若直接使用该类需自行保证事务和错误策略。
-- 偏差：selection push 构造 `RowMutation` 时 `m.columns = rowMap.keys()`、`m.values = rowMap.values()` 依赖同一个 `QVariantMap/QMap` 的键序一致，见 `src/sync/SyncWorker.cpp:708`、`src/sync/SyncWorker.cpp:713`、`src/sync/SyncWorker.cpp:714`。在 Qt 当前容器语义下通常一致，但这是隐式约束，建议显式按 keys 取值。
+- 已实现：inbound changeset 通过 `sqlite3changeset_apply_v2()` 应用，且拿到 rebase buffer，见 `src/sync/apply/ChangesetApplier.cpp:111`、`src/sync/apply/ChangesetApplier.cpp:116`、`src/sync/apply/ChangesetApplier.cpp:117`。
+- 已实现：`ChangesetApplier` 已把低优先级 DELETE 后的 winner 恢复改为 `ON CONFLICT DO UPDATE` 或 `INSERT OR IGNORE`，避免旧版 `INSERT OR REPLACE` 的级联副作用，见 `src/sync/apply/ChangesetApplier.cpp:303`、`src/sync/apply/ChangesetApplier.cpp:326`、`src/sync/apply/ChangesetApplier.cpp:332`。
+- 已实现：`UpsertExecutor` 构造 `INSERT ... ON CONFLICT DO UPDATE` 并统一用 `quoteIdent()`，见 `src/sync/apply/UpsertExecutor.cpp:85`、`src/sync/apply/UpsertExecutor.cpp:86`、`src/sync/apply/UpsertExecutor.cpp:127`。
+- 偏差：`ChangesetApplier::updateWinnersFromChangeset()` 把 SQLite INTEGER 存为 JSON double，超过 2^53 的主键或业务整数会丢精度，见 `src/sync/apply/ChangesetApplier.cpp:393`、`src/sync/apply/ChangesetApplier.cpp:394`、`src/sync/apply/ChangesetApplier.cpp:409`。
+- 偏差：同一路径把 BLOB 和其他未处理类型写成 JSON null，winner 恢复会丢失二进制列，见 `src/sync/apply/ChangesetApplier.cpp:399`、`src/sync/apply/ChangesetApplier.cpp:400`、`src/sync/apply/ChangesetApplier.cpp:409`。
+- 偏差：`RowWinnerStore::pkHash()` 的 canonical material 是 `key=value\n`，而 changeset/selection 路径基于原始 PK 值串接，见 `src/sync/apply/RowWinnerStore.cpp:106`、`src/sync/apply/RowWinnerStore.cpp:111`、`src/sync/apply/ChangesetApplier.cpp:68`、`src/sync/apply/CapturedWriteTemplate.cpp:258`。如果不同入口混用，会查不到同一行 winner。
+- 偏差：selection push 构造 `RowMutation` 时分别取 `rowMap.keys()` 和 `rowMap.values()`，依赖 Qt map 顺序一致，见 `src/sync/SyncWorker.cpp:713`、`src/sync/SyncWorker.cpp:716`、`src/sync/SyncWorker.cpp:717`。当前 `QVariantMap` 通常稳定，但应显式按 keys 取 value。
 
 ### 1.7 基线管理（BaselineManager）
 
-- 已实现：baseline 序列化表、压缩、记录 sourceMaxSeq，见 `src/sync/baseline/BaselineManager.cpp:18`、`src/sync/baseline/BaselineManager.cpp:26`、`src/sync/baseline/BaselineManager.cpp:75`、`src/sync/baseline/BaselineManager.cpp:86`。
-- 已实现：baseline apply 先删除目标表再 plain INSERT，不使用 `OR REPLACE`，见 `src/sync/baseline/BaselineManager.cpp:128`、`src/sync/baseline/BaselineManager.cpp:155`、`src/sync/baseline/BaselineManager.cpp:165`。
-- 已实现：applyBaseline 同事务重置 applied vector、table state、row winner，见 `src/sync/baseline/BaselineManager.cpp:222`、`src/sync/baseline/BaselineManager.cpp:237`、`src/sync/baseline/BaselineManager.cpp:245`、`src/sync/baseline/BaselineManager.cpp:252`。
-- 缺失：baseline fallback 的发起侧未把 gap 转成 baseline request artifact，详见 1.1 的 `SyncWorker.cpp:1168` 至 `SyncWorker.cpp:1211`。
-- 风险：baseline deserialize 按传输顺序逐表 DELETE/INSERT，未显式按 FK 拓扑排序；若 SQLite foreign_keys 打开且 baseline 表顺序为子表先父表，删除/插入可能受约束影响，见 `src/sync/baseline/BaselineManager.cpp:115`、`src/sync/baseline/BaselineManager.cpp:128`、`src/sync/baseline/BaselineManager.cpp:141`。
+- 已实现：baseline export 逐表序列化并记录 `sourceMaxSeq`，见 `src/sync/baseline/BaselineManager.cpp:18`、`src/sync/baseline/BaselineManager.cpp:44`、`src/sync/baseline/BaselineManager.cpp:78`、`src/sync/baseline/BaselineManager.cpp:203`。
+- 已实现：baseline apply 后重置 applied vector、table state、row winner，并清理 consistency cache，见 `src/sync/baseline/BaselineManager.cpp:267`、`src/sync/baseline/BaselineManager.cpp:269`、`src/sync/baseline/BaselineManager.cpp:275`、`src/sync/baseline/BaselineManager.cpp:283`。
+- 偏差：`applyBaseline()` 先 `BEGIN IMMEDIATE`，再执行 `PRAGMA foreign_keys=OFF`；SQLite 中在事务内切换 `foreign_keys` 无效，见 `src/sync/baseline/BaselineManager.cpp:222`、`src/sync/baseline/BaselineManager.cpp:233`、`src/sync/baseline/BaselineManager.cpp:234`。后续 `DELETE`/`INSERT` 仍可能受 FK 约束影响。
+- 偏差：baseline 反序列化按 artifact 中表顺序执行 `DELETE` 和 `INSERT`，没有按 FK 拓扑排序，见 `src/sync/baseline/BaselineManager.cpp:115`、`src/sync/baseline/BaselineManager.cpp:128`、`src/sync/baseline/BaselineManager.cpp:141`。与事务内 FK 关闭无效叠加后，会在父子表顺序不利时失败。
+- 偏差：`PRAGMA foreign_keys=ON` 也在同一事务内执行，不能作为“提交前验证 FK”的可靠手段，见 `src/sync/baseline/BaselineManager.cpp:253`、`src/sync/baseline/BaselineManager.cpp:256`、`src/sync/baseline/BaselineManager.cpp:257`。
 
 ## 第二部分：OpenSpec 特性合规性
 
 ### 2.1 FK 注入（FkInjector）
 
-- 已实现：多组 `fkInject`、多 pair、按父 route 输出向子 payload 注入，见 `src/mapping/FkInjector.cpp:21`、`src/mapping/FkInjector.cpp:52`、`src/mapping/FkInjector.cpp:80`、`src/mapping/FkInjector.cpp:116`。
-- 已实现：FK preflight 在写库前检查依赖，见 `src/validation/ForeignKeyPreflight.cpp:14`、`src/validation/ForeignKeyPreflight.cpp:81`、`src/service/ImportService.cpp:541`、`src/service/ImportService.cpp:550`。
-- 偏差：导入服务对 row-level FK/validator/time 错误只跳过失败行而继续写其他行，见 `src/service/ImportService.cpp:562`、`src/service/ImportService.cpp:587`。这符合 time-format OpenSpec 的“行级错误不终止整 sheet”方向，但违反 MVP 文档的全量预校验失败则整体终止要求。
+- 已实现：支持多对 `fkInject.pairs`，父 route 缺失时跳过，父值为 NULL 时按严格错误处理，见 `src/mapping/FkInjector.cpp:60`、`src/mapping/FkInjector.cpp:65`、`src/mapping/FkInjector.cpp:74`、`src/mapping/FkInjector.cpp:76`。
+- 已实现：子列已有非 NULL 且与父值冲突时报 `E_VALIDATE_FK`，见 `src/mapping/FkInjector.cpp:87`、`src/mapping/FkInjector.cpp:90`、`src/mapping/FkInjector.cpp:92`。
+- 偏差：FK/lookup 错误最终被 `ImportService` 汇总成 Excel 行级失败，写入阶段跳过整行，见 `src/service/ImportService.cpp:619`、`src/service/ImportService.cpp:630`。OpenSpec 要求 route 级失败不影响兄弟 route；当前粒度过粗。
 
 ### 2.2 行查找（Router / Mapper）
 
-- 已实现：ImportService 在映射前预取 lookup，构建缓存并按 0/1/N 命中处理，主逻辑位于 `src/service/ImportService.cpp:84`、`src/service/ImportService.cpp:218`。
-- 已实现：Mapper 在有效 temporal 声明存在时剥离 legacy `date:*` validator，并走 temporal convert，见 `src/mapping/Mapper.cpp:23`、`src/mapping/Mapper.cpp:75`、`src/mapping/Mapper.cpp:80`。
-- 偏差：lookup tuple key 用 `QVariant::toString()`，无法满足规格中“按 QVariant/SQLite 亲和后的严格相等、不 trim、不大小写折叠”的类型保真要求；`1`、`"1"`、`1.0` 等可能被合并，见 `src/service/ImportService.cpp:63`、`src/service/ImportService.cpp:65`、`src/service/ExportService.cpp:109`、`src/service/ExportService.cpp:110`。
-- 偏差：`castToAffinity()` 把 TEXT/BLOB/NONE/NUMERIC 以外情况统一转字符串；OpenSpec 要求 BLOB、NUMERIC、无声明 affinity 不应无条件字符串化，见 `src/service/ImportService.cpp:43`、`src/service/ImportService.cpp:60`、`src/service/ExportService.cpp:117`、`src/service/ExportService.cpp:131`。
+- 已实现：mixed profile discriminator 路由、重复 `matchEquals` 拒绝，见 `src/mapping/Router.cpp:7`、`src/mapping/Router.cpp:14`、`src/mapping/Router.cpp:25`。
+- 已实现：lookup 预取按 identity 聚合，跳过 K=0，按 999 变量限制分块，见 `src/service/ImportService.cpp:272`、`src/service/ImportService.cpp:307`、`src/service/ImportService.cpp:323`、`src/service/ImportService.cpp:330`。
+- 已实现：lookup key 已改为类型标记 tuple key，避免 `1`、`"1"`、`1.0` 碰撞，见 `src/service/ImportService.cpp:70`、`src/service/ImportService.cpp:73`、`src/service/ExportService.cpp:107`、`src/service/ExportService.cpp:110`。
+- 偏差：`castToAffinity()` 对 NUMERIC/DECIMAL/BOOLEAN 等 SQLite NUMERIC affinity 未按 SQLite affinity 规则保留数值语义，最终落到 `raw.toString()`，见 `src/service/ImportService.cpp:43`、`src/service/ImportService.cpp:52`、`src/service/ImportService.cpp:60`、`src/service/ImportService.cpp:67`。reverse lookup 侧也有同样逻辑，见 `src/service/ExportService.cpp:141`、`src/service/ExportService.cpp:150`、`src/service/ExportService.cpp:165`。
+- 偏差：`ProfileValidator` 校验 lookup `select.first` 属于 G 表，但没有校验 `select.second` 是否是当前 route 目标表的真实 dbColumn；后续 import upsert 或 export H-col select 才会失败，见 `src/profile/ProfileValidator.cpp:153`、`src/profile/ProfileValidator.cpp:156`、`src/profile/ProfileValidator.cpp:175`、`src/profile/ProfileValidator.cpp:185`。
 
 ### 2.3 导出列顺序（ExportService / ExportHelpers）
 
-- 已实现：columnOrder 通过 `reorderHeaders()` 应用于普通导出、混合导出和反向查找导出，见 `src/service/ExportService.cpp:716`、`src/service/ExportService.cpp:823`、`src/service/ExportService.cpp:893`。
-- 已实现：无 columnOrder 且无 reverse lookup 时保持 streaming path，见 `src/service/ExportService.cpp:785`、`src/service/ExportService.cpp:788`。
-- 偏差：columnOrder-only path 会全量加载 rows 再写，见 `src/service/ExportService.cpp:809`、`src/service/ExportService.cpp:820`。这是实现简化，不违反功能规格，但大表内存边界弱于 streaming 设计目标。
+- 已实现：`columnOrder` 与 raw SQL 互斥，见 `src/profile/ProfileValidator.cpp:418`、`src/profile/ProfileValidator.cpp:420`、`src/profile/ProfileValidator.cpp:422`。
+- 已实现：导出前按 columnOrder 重排 header，未列出的 header 保持相对顺序，见 `src/service/ExportService.cpp:747`、`src/service/ExportService.cpp:748`、`src/service/ExportService.cpp:930`、`src/service/ExportService.cpp:931`。
+- 偏差：columnOrder 或 reverse lookup 路径需要先 `fetchAllRows()` 再写出，而不是流式写，见 `src/service/ExportService.cpp:819`、`src/service/ExportService.cpp:820`、`src/service/ExportService.cpp:898`、`src/service/ExportService.cpp:909`。大表导出内存峰值不符合批量导出“可控内存”的设计目标。
 
 ### 2.4 导出反向查找（ExportService）
 
-- 已实现：reverse lookup 预取 H 值、构建 cache、按 A header 投影，见 `src/service/ExportService.cpp:367`、`src/service/ExportService.cpp:410`、`src/service/ExportService.cpp:669`、`src/service/ExportService.cpp:872`、`src/service/ExportService.cpp:898`。
-- 已实现：混合模式按 class 分别解析 route 并合并 header，见 `src/service/ExportService.cpp:590`、`src/service/ExportService.cpp:693`、`src/service/ExportService.cpp:728`。
-- 偏差：H 值收集把非 NULL 空字符串当 miss，见 `src/service/ExportService.cpp:381`、`src/service/ExportService.cpp:383`、`src/service/ExportService.cpp:430`、`src/service/ExportService.cpp:432`。规格只允许 SQL NULL 作为 miss；空字符串应参与严格匹配。
-- 偏差：反向查找同样受 tuple key 字符串化和 affinity 字符串化影响，见 `src/service/ExportService.cpp:109`、`src/service/ExportService.cpp:117`。
+- 已实现：反向查找会收集 H 值、批量查询 G 表、构建 cache、输出 A header，见 `src/service/ExportService.cpp:258`、`src/service/ExportService.cpp:310`、`src/service/ExportService.cpp:342`、`src/service/ExportService.cpp:382`、`src/service/ExportService.cpp:938`。
+- 已实现：D5 规则“源列非 NULL 优先”已实现，见 `src/service/ExportService.cpp:951`、`src/service/ExportService.cpp:953`、`src/service/ExportService.cpp:956`。
+- 偏差：rowSkip 时不递增 `rowCount`，后续错误定位使用 `rowCount + 1`，因此报错行号是输出行位置而非原始结果行位置，见 `src/service/ExportService.cpp:936`、`src/service/ExportService.cpp:939`、`src/service/ExportService.cpp:941`、`src/service/ExportService.cpp:960`。
+- 偏差：`needReverseLookup` 在 `explicitSql` 时直接为 false，见 `src/service/ExportService.cpp:797`、`src/service/ExportService.cpp:816`、`src/service/ExportService.cpp:817`。如果 profile 同时配置 lookup 与 raw SQL，反向 lookup 不生效；当前 validator 需要明确禁止或文档化。
 
 ### 2.5 时间格式（TemporalConvert / ProfileSpec）
 
-- 已实现：导入 Mapper 支持 U→structured→V，空值静默为 NULL，解析失败按行记录错误，见 `src/mapping/Mapper.cpp:75`、`src/mapping/Mapper.cpp:82`、`src/mapping/Mapper.cpp:91`、`src/mapping/Mapper.cpp:95`。
-- 已实现：导出支持 DB 值 V→structured→U，DB NULL 静默为空，非 NULL 空白继续解析并报错，见 `src/service/ExportService.cpp:61`、`src/service/ExportService.cpp:66`、`src/service/ExportService.cpp:72`、`src/service/ExportService.cpp:80`。
-- 偏差：导出时间解析错误固定报 row 0，丢失实际 Excel 输出行号，见 `src/service/ExportService.cpp:63`、`src/service/ExportService.cpp:82`。调用方虽知道 rowCount，但未传入 `convertTemporalForExport()`，见 `src/service/ExportService.cpp:746`、`src/service/ExportService.cpp:816`、`src/service/ExportService.cpp:923`。
-- 偏差：profile 级 `dateFormat` 对仅声明 legacy `date:fmt` validator 的列被强制忽略，见 `src/profile/ProfileSpec.h:160`、`src/profile/ProfileSpec.h:162`、`src/profile/ProfileSpec.h:164`。若规格期望 profile root temporal default 与列 validator 共存时由新 `dateFormat` 优先，该实现会偏离；`Mapper` 也只在 effective temporal declared 时剥离 date validator，见 `src/mapping/Mapper.cpp:23`、`src/mapping/Mapper.cpp:27`。
+- 已实现：导入时 `Mapper` 只在 effective temporal slot declared 时剥离 legacy `date:*` validator，避免重复解析，见 `src/mapping/Mapper.cpp:23`、`src/mapping/Mapper.cpp:26`、`src/mapping/Mapper.cpp:28`。
+- 已实现：导出 DB 值解析失败使用实际输出行号，不再固定为 0，见 `src/service/ExportService.cpp:76`、`src/service/ExportService.cpp:79`、`src/service/ExportService.cpp:80`、`src/service/ExportService.cpp:580`。
+- 已实现：profile/column temporal side 采用 side-level overwrite，见 `src/profile/ProfileSpec.h:135`、`src/profile/ProfileSpec.h:168`、`src/profile/ProfileSpec.h:170`、`src/profile/ProfileSpec.h:171`。
+- 偏差：`readTemporalSlot()` 对显式 JSON null 直接当未声明处理，见 `src/profile/ProfileLoader.cpp:179`、`src/profile/ProfileLoader.cpp:181`。OpenSpec 要求 format/fallback 等显式 null 被拒绝；如果 slot 本身出现 null，也应明确为非法或在规格中说明。
+- 偏差：profile 级 `dateFormat` 不会覆盖仅声明 legacy `date:fmt` validator 的列，见 `src/profile/ProfileSpec.h:160`、`src/profile/ProfileSpec.h:162`、`src/profile/ProfileSpec.h:164`。如果按 time-format profile 设计应允许 profile 默认统一接管 legacy 日期列，则当前实现偏保守。
 
 ## 第三部分：Excel 批量导入导出合规性
 
 ### 3.1 ImportService
 
-- 已实现：读取 Excel、编译 validator、拓扑排序、lookup 预取、FK preflight、upsert 写入形成完整导入链路，关键入口见 `src/service/ImportService.cpp:540`、`src/service/ImportService.cpp:541`、`src/service/ImportService.cpp:593`、`src/service/ImportService.cpp:605`。
-- 已实现：写入阶段使用单事务，见 `src/service/ImportService.cpp:579`、`src/service/ImportService.cpp:648`、`src/service/ImportService.cpp:659`。
-- 严重偏差：MVP 文档要求导入前全量校验，任一错误终止本次导入且不写入任何数据；当前实现只让 row 0 表级错误整体终止，row-level 错误跳过失败行继续写入成功行，见 `src/service/ImportService.cpp:562`、`src/service/ImportService.cpp:587`、`src/service/ImportService.cpp:598`、`src/service/ImportService.cpp:648`、`src/service/ImportService.cpp:656`。
-- 规格冲突说明：OpenSpec time-format 要求时间解析行级错误不终止整 sheet，因此当前实现更接近 time-format 的行级容错；但主 MVP 设计仍要求全量原子导入。建议在产品层明确 profile/option 级策略，否则合规口径不可判定。
+- 已实现：MVP 默认 `abortOnError=true` 时，任何 row-level 错误都会在写库前返回，见 `src/service/ImportService.cpp:592`、`src/service/ImportService.cpp:594`、`src/service/ImportService.cpp:605`。
+- 已实现：`abortOnError=false` 支持行级错误跳过并继续写其他行，服务 time-format OpenSpec 的“错误不终止全表”模式，见 `src/service/ImportService.cpp:594`、`src/service/ImportService.cpp:595`、`src/service/ImportService.cpp:619`、`src/service/ImportService.cpp:630`。
+- 已实现：写入阶段在单事务内准备 upsert SQL 并绑定参数，见 `src/service/ImportService.cpp:611`、`src/service/ImportService.cpp:612`、`src/service/ImportService.cpp:645`、`src/service/ImportService.cpp:662`。
+- 偏差：`Mapper::map()` 即使 route 内校验失败仍 append payload，最终由 `ImportService` 按 Excel row 跳过整行，见 `src/mapping/Mapper.cpp:58`、`src/mapping/Mapper.cpp:123`、`src/service/ImportService.cpp:619`、`src/service/ImportService.cpp:630`。这不满足 OpenSpec 的 route-level 失败隔离。
 
 ### 3.2 ExportService
 
-- 已实现：普通流式导出、columnOrder、mixed、reverse lookup、temporal formatting 都有覆盖，见 `src/service/ExportService.cpp:580`、`src/service/ExportService.cpp:785`、`src/service/ExportService.cpp:793`、`src/service/ExportService.cpp:839`。
-- 已实现：SQL 构造通过 `SqlBuilder::buildAutoJoinSelect()` 统一 quote 表/列/orderBy，见 `src/sql/SqlBuilder.cpp:57`、`src/sql/SqlBuilder.cpp:72`、`src/sql/SqlBuilder.cpp:87`、`src/sql/SqlBuilder.cpp:121`。
-- 偏差：`explicitSql` 直接执行 profile 提供的 SQL，见 `src/service/ExportService.cpp:763`、`src/service/ExportService.cpp:796`。如果 profile 来自不可信来源，这是功能性逃逸点；若设计假定 profile 可信，则需要在文档/API 中明确。
-- 偏差：reverse lookup 与 columnOrder 路径需要全量加载，见 `src/service/ExportService.cpp:809`、`src/service/ExportService.cpp:862`。对大表导出可能违背批量导出设计中的内存可控目标。
+- 已实现：普通流式路径在没有 columnOrder/reverse lookup 时零额外行缓存，见 `src/service/ExportService.cpp:819`、`src/service/ExportService.cpp:820`、`src/service/ExportService.cpp:822`。
+- 已实现：mixed/classColumn、columnOrder、reverse lookup、temporal formatting 已集成在导出路径，见 `src/service/ExportService.cpp:740`、`src/service/ExportService.cpp:747`、`src/service/ExportService.cpp:760`、`src/service/ExportService.cpp:779`。
+- 偏差：`explicitSql` 直接执行 profile 配置，见 `src/service/ExportService.cpp:797`、`src/service/ExportService.cpp:798`。如果 profile 文件不可信，这是 SQL 执行入口；若 profile 是可信配置，应在 API/文档明确可信边界，并限制为只读单 SELECT。
+- 偏差：ExportService 已接近千行，raw SQL、streaming、mixed、reverse lookup、columnOrder、temporal 多路径交织，见 `src/service/ExportService.cpp:622`、`src/service/ExportService.cpp:692`、`src/service/ExportService.cpp:793`、`src/service/ExportService.cpp:898`。回归风险较高。
 
 ### 3.3 DataBridge 公共 API
 
-- 已实现：open 时检查 SQLite >= 3.24.0、设置 busy timeout/WAL/foreign_keys，见 `src/DataBridge.cpp:31`、`src/DataBridge.cpp:44`、`src/DataBridge.cpp:53`、`src/DataBridge.cpp:57`。
-- 已实现：导入/导出前刷新 catalog、检查 profile 存在，见 `src/DataBridge.cpp:199`、`src/DataBridge.cpp:208`、`src/DataBridge.cpp:328`、`src/DataBridge.cpp:337`。
-- 已实现：同步 active 时 direct import 被拒绝，见 `src/DataBridge.cpp:181`、`src/DataBridge.cpp:184`。
-- 已实现：BatchTransfer 在同步上下文存在时把 import 路由到 SyncWorker，见 `src/batch/BatchTransfer.cpp:140`、`src/batch/BatchTransfer.cpp:146`、`src/batch/BatchTransfer.cpp:148`；无同步时使用独立线程连接，见 `src/batch/BatchTransfer.cpp:197`、`src/batch/BatchTransfer.cpp:209`。
-- 偏差：`DataBridge::runImportOnDb()` 是 public/internal bridge 绕过 `syncActive_` 阻断的后门，见 `src/DataBridge.cpp:225`、`src/DataBridge.cpp:251`。目前 SyncWorker 需要它的等价能力，但 API 边界应限制为 internal 或明确只给 worker/test 使用。
+- 已实现：`DataBridge::runImportOnDb()`、`runExportOnDb()` 可供 worker 使用指定连接执行导入导出，见 `src/DataBridge.cpp:225`、`src/DataBridge.cpp:245`。
+- 偏差：`DataBridge::setSyncActive()` 只是一个 bool，`importExcel()` 不知道哪些表为 sync table，见 `src/DataBridge.cpp:177`、`src/DataBridge.cpp:181`、`src/DataBridge.cpp:184`。这导致公共 API 兼容性被同步开关全局影响。
+- 偏差：同步激活后的旧 `importExcel()` 没有自动转发到 `IBatchTransfer` 或 worker 队列，调用者必须切换 API，见 `src/DataBridge.cpp:183`、`src/DataBridge.cpp:187`。与设计文档中的分阶段兼容目标不完全一致。
 
 ## 第四部分：安全与数据完整性
 
 ### 4.1 SQL 注入风险
 
-已确认的标识符拼接/未统一使用 `quoteIdent()` 位置：
-
-- `src/sync/apply/CapturedWriteTemplate.cpp:237`、`src/sync/apply/CapturedWriteTemplate.cpp:240`：PK where 子句手工 `"%1"=?`，未转义内嵌双引号。
-- `src/sync/apply/CapturedWriteTemplate.cpp:275`：`SELECT * FROM "%1"` 手工拼表名，未转义。
-- `src/sync/SyncWorker.cpp:695`、`src/sync/SyncWorker.cpp:696`：selection push 接收侧 `PRAGMA table_info("%1")` 手工拼表名，未转义。
-- `src/sync/diff/DiffEngine.cpp:181`：`PRAGMA table_info("%1")` 手工拼表名，未转义。
-- `src/sync/diff/ComparisonSession.cpp:375`：`SELECT * FROM "%1" WHERE "%2"` 手工拼表名/列名，未转义。
-- `src/sync/diff/ComparisonSession.cpp:392`：`PRAGMA table_info("%1")` 手工拼表名，未转义。
-- `src/sync/apply/ChangesetApplier.cpp:333`、`src/sync/apply/ChangesetApplier.cpp:334`：已手工 replace 双引号，功能上较安全，但仍应统一走 `SqlBuilder::quoteIdent()`。
-
-正向例子：
-
-- `SqlBuilder::quoteIdent()` 正确转义内嵌双引号，见 `src/sql/SqlBuilder.cpp:8`。
-- `UpsertExecutor`、`SelectionResolver`、`FkClosureBuilder`、`BaselineManager` 多数路径已使用 `quoteIdent()`，见 `src/sync/apply/UpsertExecutor.cpp:86`、`src/sync/selection/SelectionResolver.cpp:59`、`src/sync/selection/FkClosureBuilder.cpp:64`、`src/sync/baseline/BaselineManager.cpp:28`。
+- 风险：`TableStateStore::resetFromBaseline()` 用 `QStringLiteral("SELECT * FROM \"%1\"").arg(tbl)` 拼表名，未统一 `quoteIdent()`，嵌入双引号的表名会破坏 SQL，见 `src/sync/schema/TableStateStore.cpp:115`、`src/sync/schema/TableStateStore.cpp:117`。建议改为 `SELECT * FROM %1`.arg(SqlBuilder::quoteIdent(tbl))。
+- 风险：`DiffEngine::getPkColumn()` 用 `PRAGMA table_info(\"%1\")` 拼表名，未转义内嵌双引号，见 `src/sync/diff/DiffEngine.cpp:176`、`src/sync/diff/DiffEngine.cpp:181`。建议使用 `PRAGMA table_info(` + `quoteIdent(table)` + `)`。
+- 风险：`ProfileLoader` 以 `isSimpleIdentifier()` 拒绝复杂标识符，见 `src/profile/ProfileLoader.cpp:338`、`src/profile/ProfileLoader.cpp:378`。这降低注入风险，但与已经实现的 `quoteIdent()` 能力不一致；如果设计支持任意 SQLite 合法标识符，应改为加载保留、执行时 quote。
+- 风险：`ExportService` 的 `explicitSql` 是 profile 直通 SQL，见 `src/service/ExportService.cpp:797`、`src/service/ExportService.cpp:798`。该入口不是标识符拼接注入，而是配置级 SQL 执行风险；需把 profile 明确定义为可信边界。
 
 ### 4.2 事务安全性
 
-- 已实现：同步写路径使用 `BEGIN IMMEDIATE`，见 `src/sync/WriteTxn.cpp:8`、`src/sync/WriteTxn.cpp:10`。
-- 已实现：CapturedWriteTemplate 出错时 abort session 并 rollback，见 `src/sync/apply/CapturedWriteTemplate.cpp:296`、`src/sync/apply/CapturedWriteTemplate.cpp:306`、`src/sync/apply/CapturedWriteTemplate.cpp:387`。
-- 已实现：baseline apply 事务包裹，失败回滚，见 `src/sync/baseline/BaselineManager.cpp:222`、`src/sync/baseline/BaselineManager.cpp:229`、`src/sync/baseline/BaselineManager.cpp:258`。
-- 风险：普通 ImportService 对 row-level 错误跳过并提交，见 `src/service/ImportService.cpp:587`、`src/service/ImportService.cpp:648`。这不是事务破坏，但与 MVP 原子导入要求冲突。
+- 严重问题：baseline apply 事务内切换 `PRAGMA foreign_keys=OFF/ON` 无效，见 `src/sync/baseline/BaselineManager.cpp:222`、`src/sync/baseline/BaselineManager.cpp:234`、`src/sync/baseline/BaselineManager.cpp:257`。建议在事务外调整，或使用 FK 拓扑排序、deferred constraints、临时禁用策略并用 `PRAGMA foreign_key_check` 验证。
+- 风险：baseline 删除/插入不按 FK 拓扑排序，见 `src/sync/baseline/BaselineManager.cpp:115`、`src/sync/baseline/BaselineManager.cpp:128`、`src/sync/baseline/BaselineManager.cpp:141`。即使源 baseline 一致，目标 apply 也可能因父子顺序失败。
+- 良好：local import capture 和 changelog 写入在同一 worker transaction 内完成，见 `src/sync/SyncWorker.cpp:1262`、`src/sync/SyncWorker.cpp:1277`、`src/sync/SyncWorker.cpp:1286`、`src/sync/SyncWorker.cpp:1300`。
 
 ### 4.3 竞态与线程安全
 
-- 已实现：DataBridge sync active 标志为 atomic，见 `src/DataBridgePrivate.h:36`。
-- 已实现：BatchTransfer 状态读写加 mutex，停止标志为 atomic，见 `src/batch/BatchTransfer.h:44`、`src/batch/BatchTransfer.h:58`。
-- 已实现：SyncEngine 快照状态加 mutex，见 `src/sync/SyncEngine.h:51`、`src/sync/SyncEngine.cpp:210`、`src/sync/SyncEngine.cpp:220`。
-- 风险：`BatchTransfer::startImport()` 先 snapshot profile/catalog，再检查/使用 SyncContext gate；若 snapshot 与 worker schema 状态之间发生 DDL 变化，后续 worker 导入依赖 SyncWorker 的 schema guard 才能兜底。相关路径见 `src/batch/BatchTransfer.cpp:54`、`src/batch/BatchTransfer.cpp:63`。
-- 风险：普通 changeset ACK 未绑定当前 foreground batch，可能被旧 ACK 或其他 peer ACK 提前完成前台 sync，见 `src/sync/SyncWorker.cpp:904`。
+- 良好：`SyncContext` 以物理数据库 identity 做共享上下文，见 `src/sync/SyncContext.cpp:52`、`src/sync/SyncContext.cpp:61`。
+- 风险：普通 changeset ACK 不绑定当前等待批次，可能由旧 ACK/无关 ACK 提前完成前台同步，见 `src/sync/SyncWorker.cpp:903`、`src/sync/SyncWorker.cpp:907`、`src/sync/SyncWorker.cpp:908`。
+- 风险：`InboxLedger` 对 deferred artifact 先标 seen，再由 stale scan 当 gap 处理，见 `src/sync/SyncWorker.cpp:517`、`src/sync/SyncWorker.cpp:518`、`src/sync/transport/InboxLedger.cpp:98`。这会把应用层暂停误判为传输缺口。
 
 ### 4.4 资源泄漏
 
-- 已实现：DataBridge close 先清空 `QSqlDatabase` 引用再 removeDatabase，见 `src/DataBridge.cpp:63`、`src/DataBridge.cpp:71`。
-- 已实现：SyncEngine 析构停止 worker、清理 callbacks、release context，见 `src/sync/SyncEngine.cpp:14`、`src/sync/SyncEngine.cpp:23`、`src/sync/SyncEngine.cpp:28`。
-- 已实现：SessionRecorder abort/delete session，见 `src/sync/capture/SessionRecorder.cpp:85`。
-- 风险：`ComparisonSession` 析构中 `QSqlDatabase::removeDatabase()` 时 `deps_->rconn` 仍作为成员存在，虽然先 close 了，但 Qt 通常要求所有 `QSqlDatabase` 句柄销毁/置空后再 remove；当前见 `src/sync/diff/ComparisonSession.cpp:439`、`src/sync/diff/ComparisonSession.cpp:441`、`src/sync/diff/ComparisonSession.cpp:442`。建议将 `deps_->rconn = QSqlDatabase()` 后再 remove。
+- 风险：`OutboxWriter` 在 POSIX 路径上自行 `open/fsync/close`，异常路径目前简单 return；代码短小但跨平台分支缺失，见 `src/sync/transport/OutboxWriter.cpp:113`、`src/sync/transport/OutboxWriter.cpp:114`、`src/sync/transport/OutboxWriter.cpp:117`。
+- 良好：`ChangesetApplier` 对 `pRebase` 使用后释放，见 `src/sync/apply/ChangesetApplier.cpp:116`、`src/sync/apply/ChangesetApplier.cpp:119`、`src/sync/apply/ChangesetApplier.cpp:120`。
+- 良好：`SessionRecorder::collectChangeset()` 释放 sqlite changeset buffer，见 `src/sync/capture/SessionRecorder.cpp:108`、`src/sync/capture/SessionRecorder.cpp:116`。
 
 ## 第五部分：正确性与边界处理
 
 ### 5.1 已发现的 Bug
 
-- `src/sync/SyncWorker.cpp:1168` — gap baseline fallback 不发送 `BaselineRequest`，只隔离 pending artifact 并返回 false；持久 gap 无法自动恢复 — 建议在 stale gap 处生成并写出 baseline request artifact，记录 in-flight，等待 response 后恢复 pending changeset。
-- `src/service/ImportService.cpp:562` — row-level 校验错误不终止整批导入，违反 MVP 全量预校验/全有全无要求 — 建议引入明确导入策略；MVP 默认 any error rollback，time-format 可通过 profile/option 选择 row-resilient。
-- `src/service/ImportService.cpp:587` — 失败行被跳过且成功行继续写入 — 同上，若按 MVP 应在写入前发现任何 errors 后直接返回。
-- `src/sync/apply/ChangesetApplier.cpp:304` — 低优先级 DELETE 恢复使用 `INSERT OR REPLACE`，可能触发 DELETE+INSERT 级联副作用 — 建议改为 `INSERT ... ON CONFLICT(pk) DO UPDATE`，或用 sqlite changeset 反向补偿策略。
-- `src/sync/apply/CapturedWriteTemplate.cpp:240` — PK 标识符未转义 — 建议统一改为 `SqlBuilder::quoteIdent(pk) + " = ?"`。
-- `src/sync/apply/CapturedWriteTemplate.cpp:275` — 表名未通过 `quoteIdent()` — 建议统一 quote。
-- `src/sync/SyncWorker.cpp:696` — PRAGMA table_info 表名未转义 — 建议统一 quote。
-- `src/sync/diff/DiffEngine.cpp:181` — PRAGMA table_info 表名未转义 — 建议统一 quote。
-- `src/sync/diff/ComparisonSession.cpp:375` — SELECT 表名/列名未转义 — 建议统一 quote。
-- `src/service/ImportService.cpp:60` — BLOB/NUMERIC/NONE affinity 被转字符串 — 建议按 SQLite affinity 规则保留原 QVariant 或只对 TEXT 转字符串。
-- `src/service/ImportService.cpp:65` — lookup tuple key 字符串化导致类型碰撞 — 建议构造带类型 tag/二进制规范编码的 key。
-- `src/service/ExportService.cpp:110` — reverse lookup tuple key 字符串化导致类型碰撞 — 建议与导入侧共用 typed key helper。
-- `src/service/ExportService.cpp:383` — reverse lookup 把空字符串当 missing — 建议只把 `isNull()` 当 missing。
-- `src/service/ExportService.cpp:82` — 导出时间解析错误 row 固定为 0 — 建议传入实际输出行号。
-- `src/profile/ProfileSpec.h:162` — profile 级 `dateFormat` 被 legacy `date:fmt` validator 屏蔽 — 建议按 OpenSpec 最终决议调整优先级，并补回归测试。
-- `src/sync/schema/SchemaGuard.cpp:52` — fingerprint 注释包含 notnull/default，但实际未纳入 material — 建议把 NOT NULL、默认值、唯一索引、FK 参与 fingerprint，或修正文档化边界。
+- `src/sync/baseline/BaselineManager.cpp:234` — 在事务内执行 `PRAGMA foreign_keys=OFF` 无效，baseline apply 可能仍受 FK 约束失败 — 将 FK 策略移到事务外，或按 FK 拓扑排序并在提交后执行 `PRAGMA foreign_key_check`。
+- `src/sync/apply/ChangesetApplier.cpp:394` — row winner JSON 把 INTEGER 存为 double，大整数恢复会丢精度 — 使用类型标记二进制/CBOR/QDataStream 序列化 row content。
+- `src/sync/apply/ChangesetApplier.cpp:400` — row winner JSON 把 BLOB 写成 null，DELETE 恢复会丢列值 — 为 BLOB 使用 base64/hex 类型标记。
+- `src/sync/diff/ComparisonSession.cpp:176` — `stageCell()` 不读取已有 staged row，多列编辑会互相覆盖 — 给 `StagingBuffer` 增加 getter 或在 session 维护 staged map。
+- `src/sync/diff/ComparisonSession.cpp:69` — read snapshot 未真正 pin 住 — 初始化时显式 `BEGIN` 只读事务，session 结束时 commit/rollback。
+- `src/sync/SyncWorker.cpp:908` — changeset ACK 未绑定当前等待批次 — ACK wait tracker 应记录 peer/origin/epoch/fromSeq/toSeq，并按 ACK payload 匹配。
+- `src/sync/SyncWorker.cpp:942` — sender-side chunk ACK 写入 receiver-side `__sync_push_chunk_progress` — 拆分 `__sync_push_chunk_ack` 或在表中增加 direction/peer 字段。
+- `src/sync/schema/TableStateStore.cpp:117` — 表名拼接未 `quoteIdent()` — 使用统一 SQL builder。
+- `src/sync/diff/DiffEngine.cpp:181` — PRAGMA table name 拼接未 `quoteIdent()` — 使用统一 schema helper。
+- `src/profile/ProfileValidator.cpp:175` — lookup `select.second` 未校验为 route 表列 — 在 profile validate 阶段查询 route table schema。
+- `src/service/ImportService.cpp:630` — route-level 错误变成整行跳过 — 改为按 payload/route 标记失败，仅跳过受影响 route 及其子 route。
+- `src/sync/transport/OutboxWriter.cpp:73` — `QFile::rename()` 不保证替换已有目标 — 使用平台原子 replace API，或先生成绝不冲突的 artifact 文件名并禁止覆盖。
 
 ### 5.2 边界用例覆盖
 
-- 已覆盖：SQLite session 不可用时初始化失败路径，见 `src/sync/capture/SqliteHandle.cpp:15` 和 `src/sync/SyncEngine.cpp:79`。
-- 已覆盖：selection 空结果、FK 缺失、FK cycle、selection too large，见 `src/sync/SyncWorker.cpp:1449`、`src/sync/selection/FkClosureBuilder.cpp:114`、`src/sync/selection/FkClosureBuilder.cpp:187`、`src/sync/selection/FkClosureBuilder.cpp:226`。
-- 已覆盖：chunk ACK 乱序/过期 pushId 过滤，见 `src/sync/SyncWorker.cpp:927`、`src/sync/SyncWorker.cpp:930`。
-- 未充分覆盖：lookup/reverse lookup 的 QVariant 类型严格等价、空字符串 H 值、BLOB/NUMERIC affinity。
-- 未充分覆盖：包含双引号的表名/列名在 sync diff、captured write、selection push 接收路径。
-- 未充分覆盖：baseline apply 的 FK 拓扑顺序、父子表删除/插入顺序。
-- 未充分覆盖：普通 changeset ACK 与当前前台 sync batch 的关联。
+- 未充分覆盖：父子表 baseline apply，artifact 表顺序为 parent-first 和 child-first 两种情况，涉及 `src/sync/baseline/BaselineManager.cpp:128`、`src/sync/baseline/BaselineManager.cpp:141`。
+- 未充分覆盖：row winner 中含 `qint64` 最大值、BLOB、NULL、REAL、TEXT 混合列，涉及 `src/sync/apply/ChangesetApplier.cpp:393`、`src/sync/apply/ChangesetApplier.cpp:399`。
+- 未充分覆盖：同一 `ComparisonSession` 连续 stage 同一行不同列，涉及 `src/sync/diff/ComparisonSession.cpp:168`、`src/sync/diff/ComparisonSession.cpp:176`。
+- 未充分覆盖：ACK 重放、旧 ACK、错误 peer ACK 与当前 foreground sync 等待并发，涉及 `src/sync/SyncWorker.cpp:891`、`src/sync/SyncWorker.cpp:907`。
+- 未充分覆盖：route 级 lookup/FK 错误只影响该 route，不影响兄弟 route，涉及 `src/mapping/Mapper.cpp:123`、`src/service/ImportService.cpp:630`。
+- 未充分覆盖：NUMERIC affinity lookup/reverse lookup，例如 SQLite `NUMERIC` 列中 `1` 与 `"1"` 的等价/不等价策略，涉及 `src/service/ImportService.cpp:67`、`src/service/ExportService.cpp:165`。
+- 未充分覆盖：表名/列名包含双引号、关键字、空格时的 sync diff/table state 路径，涉及 `src/sync/schema/TableStateStore.cpp:117`、`src/sync/diff/DiffEngine.cpp:181`。
+- 未充分覆盖：Windows 构建下 outbox durability 路径，涉及 `src/sync/transport/OutboxWriter.cpp:8`、`src/sync/transport/OutboxWriter.cpp:113`。
 
 ### 5.3 错误传播路径
 
-- 良好：SyncWorker init error 会映射到更精确错误码，见 `src/sync/SyncEngine.cpp:77`、`src/sync/SyncEngine.cpp:100`。
-- 良好：baseline 内部错误会 prefix 为 `E_SYNC_BASELINE_FAILED`，见 `src/sync/baseline/BaselineManager.cpp:216`、`src/sync/baseline/BaselineManager.cpp:218`。
-- 良好：Outbox 写入失败会向 SyncWorker/ACK channel 返回错误，见 `src/sync/transport/OutboxWriter.cpp:41`、`src/sync/transport/AckChannel.cpp:36`、`src/sync/transport/AckChannel.cpp:60`。
-- 偏差：`InboxWatcher::scan()` 忽略 `ledger_.markSeen()` 失败，见 `src/sync/transport/InboxWatcher.cpp:42`、`src/sync/transport/InboxWatcher.cpp:43`。如果 ledger 写失败，artifact 仍会被处理，幂等账本可能不完整。
-- 偏差：`OutboundAckStore::setPendingBaseline()` 对不存在 peer 行只是 UPDATE 0 行且返回 true，见 `src/sync/anchor/OutboundAckStore.cpp:112`、`src/sync/anchor/OutboundAckStore.cpp:115`。如果后续实现 baseline in-flight 依赖该字段，需要确认 row 预创建。
+- 良好：baseline 内部错误统一 prefix 到 `E_SYNC_BASELINE_FAILED`，见 `src/sync/baseline/BaselineManager.cpp:216`、`src/sync/baseline/BaselineManager.cpp:218`。
+- 良好：selection push chunk 应用失败会 rollback 并返回错误，不会 ACK 部分成功，见 `src/sync/apply/CapturedWriteTemplate.cpp:296`、`src/sync/apply/CapturedWriteTemplate.cpp:303`、`src/sync/apply/CapturedWriteTemplate.cpp:306`。
+- 偏差：sender-side `processAckArtifact()` 写 `__sync_push_chunk_progress` 时忽略 `markQ.exec()` 返回值，见 `src/sync/SyncWorker.cpp:940`、`src/sync/SyncWorker.cpp:952`。ACK 进度写失败时仍可能继续判断完成。
+- 偏差：`InboxWatcher::scan()` 的 ledger 操作失败风险未向上冒泡；扫描结果可能和账本状态不一致，相关处理入口见 `src/sync/SyncWorker.cpp:437`、`src/sync/SyncWorker.cpp:439`、`src/sync/SyncWorker.cpp:449`。
+- 偏差：`UpsertExecutor::apply()` 对单行 exec 失败只是记录 `rowErrors` 并继续，返回值仍可为 true，见 `src/sync/apply/UpsertExecutor.cpp:56`、`src/sync/apply/UpsertExecutor.cpp:67`、`src/sync/apply/UpsertExecutor.cpp:72`。当前 `CapturedWriteTemplate` 会二次检查，但直接复用该类的调用方容易误判成功。
 
 ## 第六部分：架构质量
 
 ### 6.1 模块职责与耦合
 
-- 优点：ImportService/ExportService、Mapper/FkInjector/Profile、SyncWorker/transport/apply/baseline/diff 分层基本清晰。
-- 优点：`SqlBuilder` 承担 upsert 与 auto join SQL 构造，减少业务层直接拼接，见 `src/sql/SqlBuilder.cpp:13`、`src/sql/SqlBuilder.cpp:57`。
-- 问题：`SyncWorker` 同时负责 worker 生命周期、任务队列、inbox scan、payload decode、changeset apply、selection push、ACK、baseline request/response、peer 评估，职责过重。相关集中区间见 `src/sync/SyncWorker.cpp:432`、`src/sync/SyncWorker.cpp:468`、`src/sync/SyncWorker.cpp:621`、`src/sync/SyncWorker.cpp:773`、`src/sync/SyncWorker.cpp:828`、`src/sync/SyncWorker.cpp:888`、`src/sync/SyncWorker.cpp:1413`。
-- 问题：导入和导出分别定义 `castToAffinity()`、`makeTupleKey()`，实现重复且同样有类型语义缺陷，见 `src/service/ImportService.cpp:43`、`src/service/ImportService.cpp:65`、`src/service/ExportService.cpp:117`、`src/service/ExportService.cpp:110`。
+- 优点：同步代码已经分为 capture/apply/baseline/diff/schema/selection/transport/anchor 等子模块，store 类职责较清晰，例如 `AppliedVectorStore`、`RowWinnerStore`、`InboxLedger`，见 `src/sync/apply/AppliedVectorStore.cpp:12`、`src/sync/apply/RowWinnerStore.cpp:14`、`src/sync/transport/InboxLedger.cpp:20`。
+- 问题：`SyncWorker` 同时承担生命周期、任务队列、inbox scan、payload decode、changeset apply、selection push、ACK、baseline、peer eviction，职责过重，相关集中区间见 `src/sync/SyncWorker.cpp:433`、`src/sync/SyncWorker.cpp:469`、`src/sync/SyncWorker.cpp:621`、`src/sync/SyncWorker.cpp:773`、`src/sync/SyncWorker.cpp:831`、`src/sync/SyncWorker.cpp:874`、`src/sync/SyncWorker.cpp:1171`。
+- 问题：`ExportService` 聚合了 explicit SQL、auto join、mixed、columnOrder、reverse lookup、temporal，接近单文件“导出总控”，见 `src/service/ExportService.cpp:622`、`src/service/ExportService.cpp:692`、`src/service/ExportService.cpp:793`、`src/service/ExportService.cpp:898`。
+- 问题：ACK 状态复用 push chunk progress 表，说明 transport/progress/apply 领域边界没有完全分离，见 `src/sync/SyncWorker.cpp:939`、`src/sync/apply/CapturedWriteTemplate.cpp:344`、`src/sync/SyncDDL.h:111`。
 
 ### 6.2 SOLID 原则
 
-- 单一职责：大多数小类如 `OutboxWriter`、`InboxLedger`、`AckChannel`、`AppliedVectorStore` 职责明确。
-- 开闭原则：Temporal/Profile/OpenSpec 特性被加入到 ProfileSpec/Mapper/ExportService 中，扩展点存在，但 `ExportService.cpp` 已承担过多路径分支，继续增加导出特性会显著提高回归风险。
-- 依赖倒置：SyncEngine 直接持有具体 `SyncWorker`，对测试不利；BatchTransfer 通过 `SyncContext` 间接调 worker，方向较好。
-- 接口隔离：`DataBridge` 暴露的 `runImportOnDb()`、`runExportOnDb()` 边界偏宽，应收敛到 internal friend 或 detail API。
+- 单一职责：`OutboxWriter`、`AckChannel`、`AppliedVectorStore`、`QuarantineStore` 等小类基本符合，见 `src/sync/transport/OutboxWriter.cpp:13`、`src/sync/transport/AckChannel.cpp:12`、`src/sync/apply/AppliedVectorStore.cpp:12`、`src/sync/schema/QuarantineStore.cpp:12`。
+- 开闭原则：OpenSpec 特性通过 `ProfileSpec`、`ProfileLoader`、`ProfileValidator`、`Mapper`、`ExportService` 加入，但 `ExportService` 的分支式扩展已接近上限，见 `src/profile/ProfileSpec.h:88`、`src/profile/ProfileLoader.cpp:570`、`src/service/ExportService.cpp:760`。
+- 依赖倒置：`SyncEngine` 直接 new/持有具体 `SyncWorker`，测试时难替换 transport/apply/baseline 协作者，见 `src/sync/SyncEngine.cpp:62`、`src/sync/SyncEngine.cpp:69`。
+- 接口隔离：`DataBridge` 暴露 `runImportOnDb()`/`runExportOnDb()` 给内部 worker 使用，公共 API 面偏宽，见 `src/DataBridge.cpp:225`、`src/DataBridge.cpp:245`。
 
 ### 6.3 可测试性
 
-- 优点：多数 store/helper 是无 UI 纯 C++/Qt SQL 类，适合以临时 SQLite DB 做单元测试。
-- 缺口：SyncWorker 逻辑庞大且依赖文件系统 outbox/inbox、QThread、SQLite session，端到端测试成本高。建议抽出 `BaselineRequestCoordinator`、`AckWaitTracker`、`SelectionPushReceiver` 以便独立测试。
-- 缺口：OpenSpec 类型严格相等、时间 profile 继承、空字符串 reverse lookup、双引号标识符等应补针对性回归测试。
+- 优点：profile、mapping、SQL builder、store 类大多可用临时 SQLite DB 做单元测试，见 `src/sql/SqlBuilder.cpp:13`、`src/profile/ProfileValidator.cpp:39`、`src/mapping/FkInjector.cpp:18`。
+- 缺口：`SyncWorker` 强依赖 QThread/文件系统/SQLite session/transport 目录，端到端测试成本高，见 `src/sync/SyncWorker.cpp:350`、`src/sync/SyncWorker.cpp:433`、`src/sync/SyncWorker.cpp:469`。
+- 缺口：baseline FK、ACK replay、row winner typed serialization、ComparisonSession snapshot/staging、route-level import errors 需要专门回归测试，相关问题见 `src/sync/baseline/BaselineManager.cpp:234`、`src/sync/SyncWorker.cpp:908`、`src/sync/apply/ChangesetApplier.cpp:394`、`src/sync/diff/ComparisonSession.cpp:176`、`src/service/ImportService.cpp:630`。
 
 ### 6.4 代码重复
 
-- 重复：导入/导出各自实现 tuple key 和 affinity cast，见 `src/service/ImportService.cpp:43`、`src/service/ImportService.cpp:65`、`src/service/ExportService.cpp:110`、`src/service/ExportService.cpp:117`。
-- 重复：多处手工 PRAGMA table_info/pk 发现逻辑，分别在 `src/sync/diff/DiffEngine.cpp:176`、`src/sync/diff/ComparisonSession.cpp:387`、`src/sync/selection/SelectionResolver.cpp:14`、`src/sync/selection/FkClosureBuilder.cpp:31`、`src/sync/SyncWorker.cpp:691`。建议抽成 `SchemaIntrospector` 或 sync schema utility，并统一 quote。
-- 重复：temporal export 调用散落在 mixed/columnOrder/reverse path，且都未传 row 号，见 `src/service/ExportService.cpp:746`、`src/service/ExportService.cpp:816`、`src/service/ExportService.cpp:923`。
+- 重复：导入/导出各自实现 lookup identity、tuple key、affinity cast，见 `src/service/ImportService.cpp:31`、`src/service/ImportService.cpp:43`、`src/service/ImportService.cpp:73`、`src/service/ExportService.cpp:96`、`src/service/ExportService.cpp:110`、`src/service/ExportService.cpp:141`。建议抽到 `LookupKeyCodec`/`AffinityCaster`。
+- 重复：多处自行 PRAGMA table_info 发现 PK，包括 `src/sync/diff/DiffEngine.cpp:176`、`src/sync/selection/SelectionResolver.cpp:14`、`src/sync/selection/FkClosureBuilder.cpp:31`、`src/sync/SyncWorker.cpp:693`。建议统一到 sync schema helper。
+- 重复：temporal export 调用分散在 streaming、mixed、columnOrder/reverse 路径，见 `src/service/ExportService.cpp:580`、`src/service/ExportService.cpp:779`、`src/service/ExportService.cpp:852`、`src/service/ExportService.cpp:961`。建议抽出 row projection pipeline。
 
 ## 第七部分：总结与优先级修复建议
 
 ### Critical（必须修复）
 
-- [C-1] `src/sync/SyncWorker.cpp:1168` — baseline fallback 不发起 `BaselineRequest`，gap 无法自动闭环 — 实现 gap→request artifact→in-flight→response apply→pending rescan 的完整协议。
-- [C-2] `src/service/ImportService.cpp:562` — MVP 全有全无导入语义缺失，row-level 错误仍写入其他行 — 明确并实现导入原子性策略；MVP 默认任何错误不写库。
-- [C-3] `src/sync/apply/ChangesetApplier.cpp:304` — `INSERT OR REPLACE` 恢复 winner 可能触发 DELETE+INSERT 副作用 — 改为 `ON CONFLICT DO UPDATE` 或 changeset 级补偿。
+- [C-1] `src/sync/baseline/BaselineManager.cpp:234` — baseline apply 在事务内关闭 FK，无效且会导致父子表快照应用失败 — 将 FK 策略移出事务，或实现 FK 拓扑删除/插入并用 `PRAGMA foreign_key_check` 验证。
+- [C-2] `src/sync/apply/ChangesetApplier.cpp:394` — row winner 把 INTEGER 序列化为 JSON double，大整数恢复会损坏数据 — 改为类型保真序列化格式。
+- [C-3] `src/sync/apply/ChangesetApplier.cpp:400` — row winner 把 BLOB/未处理类型序列化为 null，DELETE 恢复会丢数据 — 对所有 SQLite value 类型做带类型标签编码。
+- [C-4] `src/sync/diff/ComparisonSession.cpp:176` — 多次 `stageCell()` 会覆盖同一行已有 staged 修改 — 增加 staged row 读取/合并能力。
 
 ### High（强烈建议）
 
-- [H-1] `src/sync/apply/CapturedWriteTemplate.cpp:240` — PK 标识符未转义 — 使用 `SqlBuilder::quoteIdent()`。
-- [H-2] `src/sync/apply/CapturedWriteTemplate.cpp:275` — 表名未转义 — 使用 `SqlBuilder::quoteIdent()`。
-- [H-3] `src/sync/SyncWorker.cpp:696` — PRAGMA 表名未转义 — 使用统一 schema helper。
-- [H-4] `src/sync/diff/ComparisonSession.cpp:375` — SELECT 表名/列名未转义 — 使用 `SqlBuilder::quoteIdent()`。
-- [H-5] `src/service/ImportService.cpp:65` — lookup tuple key 字符串化破坏严格相等 — 引入 typed tuple key。
-- [H-6] `src/service/ExportService.cpp:110` — reverse lookup tuple key 字符串化破坏严格相等 — 与导入共用 typed tuple key。
-- [H-7] `src/service/ImportService.cpp:60` — BLOB/NUMERIC/NONE 被转字符串 — 按 OpenSpec affinity 规则修正。
-- [H-8] `src/service/ExportService.cpp:383` — 空字符串被当作 reverse lookup miss — 仅 SQL NULL 视为 missing。
-- [H-9] `src/profile/ProfileSpec.h:162` — profile `dateFormat` 被 legacy validator 屏蔽 — 按规格决议调整优先级并补测试。
-- [H-10] `src/sync/SyncWorker.cpp:904` — 普通 changeset ACK 可完成任意前台 sync wait — ACK wait 需绑定 peer/origin/batch 或 last sent range。
+- [H-1] `src/sync/SyncWorker.cpp:908` — 普通 changeset ACK 未绑定当前 foreground sync 批次 — 按 peer/origin/epoch/range 关联 ACK wait。
+- [H-2] `src/sync/SyncWorker.cpp:942` — 发送端 ACK 进度与接收端 chunk apply 复用 `__sync_push_chunk_progress` — 拆分 ACK 表或增加 direction/peer 维度。
+- [H-3] `src/sync/schema/TableStateStore.cpp:117` — 动态表名未 `quoteIdent()` — 改用统一 quoting。
+- [H-4] `src/sync/diff/DiffEngine.cpp:181` — PRAGMA 表名未 `quoteIdent()` — 改用统一 schema helper。
+- [H-5] `src/profile/ProfileValidator.cpp:175` — lookup 输出目标未校验为 route 表列 — validate 阶段提前失败。
+- [H-6] `src/service/ImportService.cpp:630` — route 级错误被提升为整行跳过 — 改为 payload/route 级失败传播。
+- [H-7] `src/sync/diff/ComparisonSession.cpp:69` — 没有真正 pin read snapshot — 显式开启并保持只读事务。
+- [H-8] `src/sync/transport/OutboxWriter.cpp:8` — POSIX API 无条件使用，Windows 构建不合规 — 增加平台分支或使用 Qt/native abstraction。
+- [H-9] `src/DataBridge.cpp:184` — sync active 时阻断所有 direct import — 改为按 sync table 判定或自动转发 worker 队列。
 
 ### Medium（建议修复）
 
-- [M-1] `src/service/ExportService.cpp:82` — 导出时间错误 row 固定 0 — 给 `convertTemporalForExport()` 传实际输出行号。
-- [M-2] `src/sync/schema/SchemaGuard.cpp:52` — fingerprint 未覆盖 notnull/default/unique/FK — 扩展 fingerprint material。
-- [M-3] `src/sync/capture/SqliteHandle.cpp:15` — session hard gate 缺 SQLite source id/动态库一致性诊断 — 初始化时记录并校验。
-- [M-4] `src/sync/baseline/BaselineManager.cpp:128` — baseline apply 未按 FK 拓扑删除/插入 — 使用 schema catalog 排序或临时 defer foreign_keys 的受控策略。
-- [M-5] `src/sync/transport/InboxWatcher.cpp:43` — `markSeen()` 失败被忽略 — 失败时不要继续处理 artifact，并上报 transport error。
-- [M-6] `src/sync/diff/ComparisonSession.cpp:442` — removeDatabase 前仍持有 QSqlDatabase 成员 — close 后置空再 remove。
-- [M-7] `src/sync/schema/SchemaEligibility.cpp:79` — 复合 PK 全拒绝限制较强 — 文档化为 MVP 限制，或实现复合 PK selection/diff/apply。
-- [M-8] `src/service/ExportService.cpp:809` — columnOrder-only 全量加载 — 可用 header index 映射后流式写出，降低内存峰值。
+- [M-1] `src/sync/SyncWorker.cpp:455` — gap timeout 硬编码 30 秒 — 移入 `SyncConfig`。
+- [M-2] `src/sync/transport/InboxLedger.cpp:98` — stale seen 不区分 artifact 类型 — ledger 记录 kind/origin/seq，只对 changeset gap 触发 baseline。
+- [M-3] `src/sync/schema/SchemaGuard.cpp:78` — unique index fingerprint 只记录名字 — 纳入 index columns、collation、where predicate。
+- [M-4] `src/sync/schema/SchemaEligibility.cpp:79` — 复合 PK 全拒绝 — 文档化为 MVP 限制，或实现复合 PK selection/diff/apply。
+- [M-5] `src/service/ImportService.cpp:67` — NUMERIC affinity 被转字符串 — 抽出 SQLite affinity caster 并补 NUMERIC 测试。
+- [M-6] `src/service/ExportService.cpp:819` — columnOrder/reverse lookup 路径全量缓存 — 设计可流式投影或分页导出方案。
+- [M-7] `src/profile/ProfileLoader.cpp:181` — temporal slot 显式 null 被吞掉 — 按 OpenSpec 明确拒绝或补充规格说明。
+- [M-8] `src/sync/apply/RowWinnerStore.cpp:106` — pkHash canonical 与 changeset 路径不一致 — 统一 PK hash codec。
+- [M-9] `src/sync/apply/UpsertExecutor.cpp:72` — row exec 失败后 `apply()` 仍可能返回 true — 将错误策略显式化，或失败即返回 false。
 
 ### Low（可选优化）
 
-- [L-1] `src/sync/selection/ChunkStreamer.cpp:39` — `PayloadCodec` 参数未使用 — 删除参数或把实际编码大小纳入预算。
-- [L-2] `src/sync/selection/ChunkStreamer.cpp:40` — `targetPeer` 参数未使用 — 写入 chunk 元数据或从接口移除。
-- [L-3] `src/sync/SyncWorker.cpp:713` — columns/values 依赖 QVariantMap 顺序一致 — 显式遍历 keys 并 `rowMap.value(k)`。
-- [L-4] `src/sync/anchor/OutboundAckStore.cpp:112` — `setPendingBaseline()` 对不存在 peer 行无效果 — 改 UPSERT 或检查 affected rows。
-- [L-5] `src/service/ExportService.cpp:763` — `explicitSql` 信任 profile — 在 API 文档声明 profile 可信边界，或增加只读 SQL/单 SELECT 校验。
+- [L-1] `src/sync/selection/ChunkStreamer.cpp:39` — `PayloadCodec` 参数未使用 — 删除参数或用真实编码大小预算。
+- [L-2] `src/sync/selection/ChunkStreamer.cpp:40` — `targetPeer` 参数未使用 — 写入元数据或从接口移除。
+- [L-3] `src/sync/SyncWorker.cpp:716` — `keys()`/`values()` 依赖 map 顺序 — 显式按 keys 读取 value。
+- [L-4] `src/profile/ProfileLoader.cpp:338` — profile 标识符限制和 `quoteIdent()` 能力不一致 — 明确只支持 simple identifier，或放宽并统一 quote。
+- [L-5] `src/service/ExportService.cpp:797` — raw `explicitSql` 可信边界未在实现层限制 — 增加只读 SELECT 校验或文档化 profile 必须可信。
 
-总体结论：实现已经覆盖了大部分设计面，尤其是 SyncWorker 单写线程、session 捕获、changelog、ACK、selection push、FK 闭包、导出列顺序/反向查找/时间格式等能力。但当前仍不应视为完全合规：baseline gap 自动恢复、MVP 导入原子性、`INSERT OR REPLACE` 数据完整性、typed lookup equality、以及未统一 quote 的同步 SQL 路径是优先级最高的修复项。
+总体结论：当前实现已经具备同步系统的主要骨架，特别是 sqlite session 捕获、changelog、严格 applied vector、baseline request/response、selection push、FK 闭包、OpenSpec 导入导出特性都不是空实现。但仍不能判定为完全合规：baseline FK 事务语义、row winner 类型保真、ComparisonSession 快照/暂存、ACK 与进度状态建模、route 级错误隔离是当前最需要优先修复的核心问题。

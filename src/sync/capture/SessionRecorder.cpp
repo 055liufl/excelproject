@@ -106,7 +106,10 @@ QByteArray SessionRecorder::collectChangeset(QString* err) {
     }
 
     if (nChangeset == 0 || pChangeset == nullptr) {
-        return QByteArray();  // empty (no changes)
+        // H-06 fix: distinguish "no changes captured" from "error" (both returned QByteArray()
+        // before). Return a non-null empty QByteArray so the caller can use isNull() for
+        // error-detection and isEmpty() for the no-changes fast-path.
+        return QByteArray("");  // non-null empty = no changes, not an error
     }
 
     QByteArray result(static_cast<const char*>(pChangeset), nChangeset);

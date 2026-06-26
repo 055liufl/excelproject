@@ -31,6 +31,9 @@ class RowWinnerStore {
     // Delete all winner rows (called after baseline reset).
     bool resetAll(QSqlDatabase& db, QString* err);
 
+    // C-06 fix: delete a single winner row (called when a low-rank DELETE erased the winner).
+    bool clear(QSqlDatabase& db, const QString& table, const QString& pkHash, QString* err);
+
     // Generate pk_hash: canonical key string SHA-256 first 16 bytes as hex.
     static QString pkHash(const QVariantMap& pkValues);
 

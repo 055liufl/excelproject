@@ -147,14 +147,16 @@ bool BaselineManager::deserializeAndApply(QSqlDatabase& wconn, const QByteArray&
             if (rowMap.isEmpty())
                 continue;
 
-            // Build INSERT OR REPLACE.
+            // M-05 fix: plain INSERT (not OR REPLACE). The DELETE above already cleared the
+            // table, so no PK conflicts exist. INSERT OR REPLACE triggers DELETE+INSERT
+            // semantics which can fire FK cascade deletes on child tables unexpectedly.
             QStringList cols, placeholders;
             for (auto it = rowMap.cbegin(); it != rowMap.cend(); ++it) {
                 cols << QStringLiteral("\"%1\"").arg(it.key());
                 placeholders << QStringLiteral("?");
             }
 
-            const QString sql = QStringLiteral("INSERT OR REPLACE INTO \"%1\" (%2) VALUES (%3)")
+            const QString sql = QStringLiteral("INSERT INTO \"%1\" (%2) VALUES (%3)")
                                     .arg(tableName, cols.join(QLatin1Char(',')),
                                          placeholders.join(QLatin1Char(',')));
 

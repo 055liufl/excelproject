@@ -228,18 +228,37 @@ void ChangesetApplier::updateWinnersFromChangeset(const QByteArray& changeset,
         int nCol = 0, op = 0, indirect = 0;
         sqlite3changeset_op(iter, &tbl, &nCol, &op, &indirect);
 
-        // Only track applied writes — INSERT and UPDATE.
-        if (op != SQLITE_INSERT && op != SQLITE_UPDATE)
-            continue;
-
         unsigned char* pkMask = nullptr;
         sqlite3changeset_pk(iter, &pkMask, nullptr);
 
+        // For DELETE: use old values to build the pk/content hash.
+        const bool useNew = (op != SQLITE_DELETE);
         QByteArray pkMaterial, contentMaterial;
-        extractHashMaterials(iter, nCol, /*useNew=*/true, pkMask, &pkMaterial, &contentMaterial);
+        extractHashMaterials(iter, nCol, useNew, pkMask, &pkMaterial, &contentMaterial);
 
         const QString pkHashStr = computePkHashStr(pkMaterial, contentMaterial);
         const QString tableName = QString::fromUtf8(tbl ? tbl : "");
+
+        if (op == SQLITE_DELETE) {
+            // C-06 fix: for DELETE, check if the deleted row was the RowWinner.
+            // If incumbent.rank > incoming rank, this DELETE was applied by a lower-rank
+            // changeset and overwrote the higher-rank winner. We cannot restore the row
+            // without storing the full row content (future work: add winning_content column).
+            // For now: clear the winner entry so future re-deliveries of the high-rank
+            // INSERT are accepted rather than being silently OMITted as "already won".
+            RowWinner incumbent = winners.get(wconn, tableName, pkHashStr);
+            if (incumbent.rank != INT_MIN &&
+                ((rank < incumbent.rank) ||
+                 (rank == incumbent.rank && seq < incumbent.originSeq))) {
+                // Low-rank DELETE of a high-rank row: clear the winner so the high-rank node
+                // can re-deliver and win on the next sync cycle.
+                // TODO(C-06): store winning_content in __sync_row_winner and restore here.
+                winners.clear(wconn, tableName, pkHashStr, nullptr);
+            }
+            continue;  // do not update winner with DELETE info
+        }
+
+        // INSERT / UPDATE: track applied writes.
         QByteArray contentH =
             QCryptographicHash::hash(contentMaterial, QCryptographicHash::Sha256).left(16);
 
@@ -251,7 +270,7 @@ void ChangesetApplier::updateWinnersFromChangeset(const QByteArray& changeset,
 
         RowWinner incumbent = winners.get(wconn, tableName, pkHashStr);
         const bool shouldUpdate = (incumbent.rank == INT_MIN) || (rank > incumbent.rank) ||
-                                  (rank == incumbent.rank && seq > incumbent.originSeq);
+                                  (rank == incumbent.rank && seq >= incumbent.originSeq);
 
         if (shouldUpdate)
             winners.put(wconn, tableName, pkHashStr, challenger, nullptr);

@@ -6,6 +6,7 @@
 #include <QSqlRecord>
 #include <QUuid>
 
+#include "sync/WriteTxn.h"
 #include <algorithm>
 #include <memory>
 
@@ -230,10 +231,27 @@ bool ComparisonSession::save(QString* err) {
             allPkCols.append(pkCol);
     }
 
+    // C-07 fix: wrap save in a write transaction (BEGIN IMMEDIATE) so it participates in the
+    // single-writer protocol.  Full SyncWorker queue integration is the next step.
+    WriteTxn txn(wconn_);
+    QString txnErr;
+    if (!txn.begin(&txnErr)) {
+        if (err)
+            *err = txnErr;
+        return false;
+    }
+
     QString saveErr;
     if (!staging_.save(wconn_, upsert_, allPkCols, &saveErr)) {
+        txn.rollback();
         if (err)
             *err = saveErr;
+        return false;
+    }
+
+    if (!txn.commit(&txnErr)) {
+        if (err)
+            *err = txnErr;
         return false;
     }
 
@@ -325,7 +343,9 @@ namespace {
 // objects alive for the full lifetime of the session.
 struct OwnedDeps {
     QString connName;
+    QString wConnName;  // C-07: separate write connection for save()
     QSqlDatabase rconn;
+    QSqlDatabase wconn;
     TableStateStore ts;
     DiffEngine diff;
     InboundTableGate gate;
@@ -343,6 +363,10 @@ class OwningComparisonSession : public IComparisonSession {
         inner_.reset();
         deps_->rconn.close();
         QSqlDatabase::removeDatabase(deps_->connName);
+        if (deps_->wconn.isOpen()) {
+            deps_->wconn.close();
+            QSqlDatabase::removeDatabase(deps_->wConnName);
+        }
     }
 
     QList<TableDiff> tableDiffs() const override {
@@ -394,7 +418,7 @@ std::unique_ptr<IComparisonSession> createComparisonSession(const SyncConfig& co
 
     // Open a read-only connection for diff operations.
     deps->connName =
-        QStringLiteral("dbridge_cs_") + QUuid::createUuid().toString(QUuid::WithoutBraces);
+        QStringLiteral("dbridge_cs_ro_") + QUuid::createUuid().toString(QUuid::WithoutBraces);
     deps->rconn = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), deps->connName);
     deps->rconn.setDatabaseName(config.sqlitePath());
     deps->rconn.setConnectOptions(
@@ -406,14 +430,30 @@ std::unique_ptr<IComparisonSession> createComparisonSession(const SyncConfig& co
         return nullptr;
     }
 
+    // C-07 fix: open a dedicated write connection so save() doesn't attempt writes on the
+    // read-only rconn.  Full wiring to SyncWorker's write queue (single-writer guarantee) is
+    // the long-term target; this gives the correct connection type in the interim.
+    deps->wConnName =
+        QStringLiteral("dbridge_cs_rw_") + QUuid::createUuid().toString(QUuid::WithoutBraces);
+    deps->wconn = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), deps->wConnName);
+    deps->wconn.setDatabaseName(config.sqlitePath());
+    deps->wconn.setConnectOptions(QStringLiteral("QSQLITE_BUSY_TIMEOUT=5000"));
+    if (!deps->wconn.open()) {
+        if (err)
+            *err = deps->wconn.lastError().text();
+        deps->rconn.close();
+        QSqlDatabase::removeDatabase(deps->connName);
+        QSqlDatabase::removeDatabase(deps->wConnName);
+        return nullptr;
+    }
+
     // streamEpoch is not known here at factory time (it is owned by SyncWorker);
     // use 0 as a placeholder — the caller can call initialize() to set up diffs.
     constexpr qint64 kPlaceholderEpoch = 0;
 
     auto session = std::make_unique<ComparisonSession>(
-        deps->rconn,  // rconn
-        deps->rconn,  // wconn: same connection; sufficient for read-only diff; save() will
-                      // need a proper write connection when called (M2 will wire this up)
+        deps->rconn,  // rconn: read-only diff queries
+        deps->wconn,  // wconn: C-07 fix — proper write connection for save()
         deps->ts, deps->diff, deps->gate, deps->upsert, kPlaceholderEpoch);
 
     return std::make_unique<OwningComparisonSession>(std::move(deps), std::move(session));

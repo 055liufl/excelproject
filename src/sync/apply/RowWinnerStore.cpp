@@ -85,6 +85,20 @@ bool RowWinnerStore::resetAll(QSqlDatabase& db, QString* err) {
     return true;
 }
 
+bool RowWinnerStore::clear(QSqlDatabase& db, const QString& table, const QString& pkHash_,
+                           QString* err) {
+    QSqlQuery q(db);
+    q.prepare(QStringLiteral("DELETE FROM __sync_row_winner WHERE table_name = ? AND pk_hash = ?"));
+    q.addBindValue(table);
+    q.addBindValue(pkHash_);
+    if (!q.exec()) {
+        if (err)
+            *err = q.lastError().text();
+        return false;
+    }
+    return true;
+}
+
 QString RowWinnerStore::pkHash(const QVariantMap& pkValues) {
     // Canonical: sorted keys, "key=value\n" joined, SHA-256 first 16 bytes as hex.
     QByteArray data;

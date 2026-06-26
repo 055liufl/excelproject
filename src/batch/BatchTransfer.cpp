@@ -57,6 +57,16 @@ bool BatchTransfer::startImport(const ImportOptions& options, QString* err) {
         return false;
     const QString dbPath = bridge_.dbPath();
 
+    // M-01 fix: acquire the shared ForegroundGate so import is mutually exclusive with
+    // sync() / syncSelected() on the same database.
+    bool hasGate = false;
+    auto ctx = sync::SyncContextRegistry::instance().getExisting(dbPath);
+    if (ctx) {
+        if (!ctx->gate.tryAcquire(err))
+            return false;
+        hasGate = true;
+    }
+
     // Reset all import state.
     importStopRequested_.store(false);
     importState_ = TransferState::Running;
@@ -65,8 +75,15 @@ bool BatchTransfer::startImport(const ImportOptions& options, QString* err) {
     importProgress_ = TransferProgress{};
     lock.unlock();
 
-    importFuture_ = QtConcurrent::run([this, options, dbPath, profile, catalog]() {
+    importFuture_ = QtConcurrent::run([this, options, dbPath, profile, catalog, hasGate]() {
         runImport(options, dbPath, profile, catalog);
+        // Release gate after completion (hasGate captured by value).
+        if (hasGate) {
+            const QString dp = bridge_.dbPath();
+            auto c = sync::SyncContextRegistry::instance().getExisting(dp);
+            if (c)
+                c->gate.release();
+        }
     });
     return true;
 }
@@ -95,6 +112,15 @@ bool BatchTransfer::startExport(const ExportOptions& options, QString* err) {
         return false;
     const QString dbPath = bridge_.dbPath();
 
+    // M-06 fix: export also acquires the shared ForegroundGate.
+    bool hasGate = false;
+    auto ctx = sync::SyncContextRegistry::instance().getExisting(dbPath);
+    if (ctx) {
+        if (!ctx->gate.tryAcquire(err))
+            return false;
+        hasGate = true;
+    }
+
     exportStopRequested_.store(false);
     exportState_ = TransferState::Running;
     exportErrors_.clear();
@@ -102,8 +128,14 @@ bool BatchTransfer::startExport(const ExportOptions& options, QString* err) {
     exportProgress_ = TransferProgress{};
     lock.unlock();
 
-    exportFuture_ = QtConcurrent::run([this, options, dbPath, profile, catalog]() {
+    exportFuture_ = QtConcurrent::run([this, options, dbPath, profile, catalog, hasGate]() {
         runExport(options, dbPath, profile, catalog);
+        if (hasGate) {
+            const QString dp = bridge_.dbPath();
+            auto c = sync::SyncContextRegistry::instance().getExisting(dp);
+            if (c)
+                c->gate.release();
+        }
     });
     return true;
 }

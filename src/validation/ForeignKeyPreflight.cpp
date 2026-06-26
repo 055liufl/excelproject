@@ -7,6 +7,7 @@
 #include <QSqlQuery>
 
 #include "service/ErrorCollector.h"
+#include "sql/SqlBuilder.h"
 
 namespace dbridge::detail {
 
@@ -118,10 +119,12 @@ bool ForeignKeyPreflight::checkPayload(
         if (onProbe)
             onProbe(fk.fromTable);
 
+        // H-05 fix: quote all identifiers (table name and column names).
         QStringList conditions;
         for (const auto& pc : parentCols)
-            conditions.append(pc + QStringLiteral(" = ?"));
-        QString sql = QStringLiteral("SELECT 1 FROM ") + fk.fromTable + QStringLiteral(" WHERE ") +
+            conditions.append(detail::SqlBuilder::quoteIdent(pc) + QStringLiteral(" = ?"));
+        QString sql = QStringLiteral("SELECT 1 FROM ") +
+                      detail::SqlBuilder::quoteIdent(fk.fromTable) + QStringLiteral(" WHERE ") +
                       conditions.join(QStringLiteral(" AND ")) + QStringLiteral(" LIMIT 1");
 
         QSqlQuery q(db);

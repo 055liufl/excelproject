@@ -53,7 +53,8 @@ struct WriteResult {
     QList<TableMutation> tableMutations;
     QString errorCode;
     QString errorMsg;
-    ApplyOutcome applyOutcome;  // Branch A only
+    ApplyOutcome applyOutcome;     // Branch A only
+    QString tableStateStaleSince;  // M-04: non-empty when table_state update failed (non-fatal)
 };
 
 // Three-branch write template implementing G-03.

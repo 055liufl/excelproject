@@ -127,9 +127,13 @@ WriteResult CapturedWriteTemplate::branchA(const WriteParams& p) {
     // 5a. Update table_state from changeset mutations (I-07)
     QList<TableMutation> muts = extractMutations(p.changesetBlob);
     if (!muts.isEmpty()) {
-        // Non-fatal: log failure but continue — table_state is a soft-accounting layer.
-        if (!ts_.applyMutations(wconn_, muts, p.epoch, p.schemaFp, p.seq, &err))
-            err.clear();  // swallow; will be recomputed on next baseline reset if needed
+        // M-04 fix: table_state failure is non-fatal (can be rebuilt on baseline), but must
+        // be surfaced so DiffEngine knows its data may be stale. Store the warning text;
+        // rollback is NOT performed here because the changeset is already applied correctly.
+        if (!ts_.applyMutations(wconn_, muts, p.epoch, p.schemaFp, p.seq, &err)) {
+            result.tableStateStaleSince = err;  // caller may emit W_SYNC_TABLE_STATE_STALE
+            err.clear();
+        }
     }
 
     // 5b. Store raw blob in changelog (appendForward)
@@ -358,9 +362,11 @@ WriteResult CapturedWriteTemplate::branchBC(const WriteParams& p) {
     }
 
     if (!tmuts.isEmpty()) {
-        ts_.applyMutations(wconn_, tmuts, isInbound ? p.epoch : streamEpoch_,
-                           isInbound ? p.schemaFp : schemaFp_, originSeq, &err);
-        err.clear();
+        if (!ts_.applyMutations(wconn_, tmuts, isInbound ? p.epoch : streamEpoch_,
+                                isInbound ? p.schemaFp : schemaFp_, originSeq, &err)) {
+            result.tableStateStaleSince = err;  // M-04: surface stale warning
+            err.clear();
+        }
     }
 
     if (!txn.commit(&err)) {

@@ -43,15 +43,17 @@ QString SchemaGuard::computeFingerprint(QSqlDatabase& db, const QStringList& tab
         material.append(tbl.toUtf8());
         material.append('\n');
 
-        // column info
+        // Column info — M-2 fix: include notnull and default_value so schema changes that
+        // add NOT NULL constraints or change defaults are detected as fingerprint differences.
         QSqlQuery colQ(db);
-        // M-11 fix: quote identifier (previously raw %1 — would break on reserved/special names).
         colQ.exec(QStringLiteral("PRAGMA table_info(") + detail::SqlBuilder::quoteIdent(tbl) +
                   QLatin1Char(')'));
         while (colQ.next()) {
             // cid, name, type, notnull, dflt_value, pk
             QString colName = colQ.value(1).toString();
             QString colType = colQ.value(2).toString();
+            int notnull = colQ.value(3).toInt();
+            QString dflt = colQ.value(4).toString();
             int pk = colQ.value(5).toInt();
             material.append("COL:");
             material.append(colName.toUtf8());
@@ -59,6 +61,37 @@ QString SchemaGuard::computeFingerprint(QSqlDatabase& db, const QStringList& tab
             material.append(colType.toUtf8());
             material.append(":PK=");
             material.append(QByteArray::number(pk));
+            material.append(":NN=");
+            material.append(QByteArray::number(notnull));
+            material.append(":DFT=");
+            material.append(dflt.toUtf8());
+            material.append('\n');
+        }
+
+        // Unique indexes — changes to uniqueness constraints affect fingerprint.
+        QSqlQuery idxQ(db);
+        idxQ.exec(QStringLiteral("PRAGMA index_list(") + detail::SqlBuilder::quoteIdent(tbl) +
+                  QLatin1Char(')'));
+        while (idxQ.next()) {
+            if (idxQ.value(2).toInt() != 1)  // unique flag
+                continue;
+            QString idxName = idxQ.value(1).toString();
+            material.append("UIDX:");
+            material.append(idxName.toUtf8());
+            material.append('\n');
+        }
+
+        // FK relationships — changes in FK targets affect fingerprint.
+        QSqlQuery fkQ(db);
+        fkQ.exec(QStringLiteral("PRAGMA foreign_key_list(") + detail::SqlBuilder::quoteIdent(tbl) +
+                 QLatin1Char(')'));
+        while (fkQ.next()) {
+            material.append("FK:");
+            material.append(fkQ.value(2).toString().toUtf8());  // refTable
+            material.append(':');
+            material.append(fkQ.value(3).toString().toUtf8());  // from col
+            material.append("->:");
+            material.append(fkQ.value(4).toString().toUtf8());  // to col
             material.append('\n');
         }
     }

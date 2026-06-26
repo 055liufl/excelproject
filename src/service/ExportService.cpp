@@ -60,26 +60,24 @@ static QHash<QString, TemporalColumnInfo> buildTemporalExportMap(const ProfileSp
 
 // Convert a DB cell value to its Excel display value using temporal V→U formatting.
 // On parse failure, records E_TIME_PARSE_DB (non-blocking) and returns null QVariant.
+// M-1 fix: add outputRow parameter so temporal parse errors carry the actual Excel row number
+// instead of a fixed 0. Callers that know the row pass it; those that don't pass 0.
 static QVariant convertTemporalForExport(const QVariant& dbVal, const TemporalColumnInfo& info,
                                          const QString& sheet, const QString& dbColumn,
-                                         ErrorCollector* errors) {
+                                         ErrorCollector* errors, int outputRow = 0) {
     // Explicit SQL NULL → empty cell, no error (spec: only isNull() is silent).
     if (dbVal.isNull())
         return QVariant();
-    // H-10 fix: a non-NULL empty/blank string is NOT silently skipped — it must go through
-    // the DB-side parser and produce E_TIME_PARSE_DB on failure, per time-format spec.
 
     QVariant structured;
     if (tconv::isStructuredTemporal(dbVal, info.kind)) {
         structured = dbVal;
     } else {
         QString errCode, errMsg;
-        // For epochSec: use toStructured which handles qlonglong → QDateTime
-        // For string: toStructured calls parseString with db.format
         structured = tconv::toStructured(dbVal, info.kind, info.db, &errCode, &errMsg);
         if (!structured.isValid()) {
-            // Map import-side error code to DB-side
-            errors->add(sheet, 0, dbColumn, dbVal.toString(),
+            // M-1 fix: use outputRow (actual row) instead of hardcoded 0.
+            errors->add(sheet, outputRow, dbColumn, dbVal.toString(),
                         QString::fromLatin1(err::E_TIME_PARSE_DB),
                         QStringLiteral("Cannot parse DB value '") + dbVal.toString() +
                             QStringLiteral("' (") + errMsg + QStringLiteral(")"));
@@ -106,15 +104,40 @@ QString buildIdentityKey(const LookupSpec& lk) {
            QStringLiteral("::") + selectParts.join(QLatin1Char(','));
 }
 
-// Serialize a value tuple to a stable QHash key (unit-separator as field delimiter).
+// Serialize a value tuple to a stable, type-aware QHash key (unit-separator as field delimiter).
+// H-6 fix: use type-tagged keys so that 1 (int), "1" (string), 1.0 (double) are distinct,
+// matching SQLite strict equality semantics for lookup/reverse-lookup matching.
 QString makeTupleKey(const QVector<QVariant>& values) {
     QStringList parts;
-    for (const auto& v : values)
-        parts.append(v.isNull() ? QString() : v.toString());
+    for (const auto& v : values) {
+        if (v.isNull()) {
+            parts.append(QStringLiteral("\x00null"));
+        } else {
+            switch (v.type()) {
+                case QVariant::LongLong:
+                case QVariant::Int:
+                case QVariant::ULongLong:
+                case QVariant::UInt:
+                    parts.append(QStringLiteral("i:") + QString::number(v.toLongLong()));
+                    break;
+                case QVariant::Double:
+                    parts.append(QStringLiteral("d:") + QString::number(v.toDouble(), 'g', 17));
+                    break;
+                case QVariant::ByteArray:
+                    parts.append(QStringLiteral("b:") +
+                                 QString::fromLatin1(v.toByteArray().toHex()));
+                    break;
+                default:
+                    parts.append(QStringLiteral("s:") + v.toString());
+                    break;
+            }
+        }
+    }
     return parts.join(QLatin1Char('\x1F'));
 }
 
 // Cast a QVariant to the declared type affinity of a G-table column.
+// H-7 fix: BLOB columns keep binary payload; don't coerce to empty string.
 QVariant castToAffinity(const QVariant& raw, const ColumnInfo& gCol) {
     QString type = gCol.declaredType.trimmed().toUpper();
     if (type.contains(QStringLiteral("INT"))) {
@@ -128,7 +151,13 @@ QVariant castToAffinity(const QVariant& raw, const ColumnInfo& gCol) {
         double dv = raw.toDouble(&ok);
         return ok ? QVariant(dv) : QVariant();
     }
-    return QVariant(raw.toString());
+    if (type.contains(QStringLiteral("BLOB"))) {
+        if (raw.type() == QVariant::ByteArray)
+            return raw;
+        const QByteArray ba = raw.toByteArray();
+        return ba.isEmpty() ? QVariant() : QVariant(ba);
+    }
+    return QVariant(raw.toString());  // TEXT / NONE
 }
 
 // Per-hit storage: A-column values from G (match[].G_column order) + cardinality count.
@@ -380,7 +409,8 @@ void collectHValues(const QVector<RouteSpec>& routes, const SchemaCatalog& catal
             bool hasNull = false;
             for (const auto& sp : lk.select) {
                 QVariant dbVal = rowData.value(sp.second);
-                if (dbVal.isNull() || dbVal.toString().isEmpty()) {
+                // H-8 fix: only SQL NULL is a missing H-value; empty string is a valid lookup key.
+                if (dbVal.isNull()) {
                     hasNull = true;
                     break;
                 }
@@ -429,7 +459,8 @@ QHash<QString, QVariant> resolveAHeaders(const QVector<RouteSpec>& routes,
             bool hasNull = false;
             for (const auto& sp : lk.select) {
                 QVariant dbVal = rowData.value(sp.second);
-                if (dbVal.isNull() || dbVal.toString().isEmpty()) {
+                // H-8 fix: only SQL NULL is a missing H-value; empty string is a valid lookup key.
+                if (dbVal.isNull()) {
                     hasNull = true;
                     break;
                 }
@@ -546,7 +577,8 @@ static bool execAndWrite(const QString& sql, const QString& sheet, QSqlDatabase&
             QVariant val = q.value(i);
             const QString& fieldName = headers[i];
             if (temporal.contains(fieldName))
-                val = convertTemporalForExport(val, temporal[fieldName], sheet, fieldName, errors);
+                val = convertTemporalForExport(val, temporal[fieldName], sheet, fieldName, errors,
+                                               *rowCount + 1);  // M-1: pass output row number
             row.append(val);
         }
         writer.writeRow(row);
@@ -744,12 +776,14 @@ ExportResult ExportService::run(const ProfileSpec& profile, const SchemaCatalog&
                     QVariant srcVal = mr.data.value(h);
                     QVariant val = (!srcVal.isNull()) ? srcVal : aVals.value(h, QVariant());
                     if (!val.isNull() && temporal.contains(h))
-                        val = convertTemporalForExport(val, temporal[h], sheetName, h, &errors);
+                        val = convertTemporalForExport(val, temporal[h], sheetName, h, &errors,
+                                                       rowCount + 1);
                     rowVals.append(val);
                 } else {
                     QVariant val = mr.data.value(h, QVariant());
                     if (!val.isNull() && temporal.contains(h))
-                        val = convertTemporalForExport(val, temporal[h], sheetName, h, &errors);
+                        val = convertTemporalForExport(val, temporal[h], sheetName, h, &errors,
+                                                       rowCount + 1);
                     rowVals.append(val);
                 }
             }
@@ -807,14 +841,17 @@ ExportResult ExportService::run(const ProfileSpec& profile, const SchemaCatalog&
                 naturalHeaders.append(rec.fieldName(i));
 
             QVector<QVector<QVariant>> rows;
+            int colOrderLoadRow = 0;
             while (q.next()) {
                 QVector<QVariant> row;
+                ++colOrderLoadRow;
                 for (int i = 0; i < rec.count(); ++i) {
                     QVariant val = q.value(i);
                     const QString& fieldName = naturalHeaders[i];
                     if (temporal.contains(fieldName))
                         val = convertTemporalForExport(val, temporal[fieldName], sheetName,
-                                                       fieldName, &errors);
+                                                       fieldName, &errors,
+                                                       colOrderLoadRow);  // M-1: pass row
                     row.append(val);
                 }
                 rows.append(row);
@@ -921,7 +958,8 @@ ExportResult ExportService::run(const ProfileSpec& profile, const SchemaCatalog&
                         val = rowData.value(h, QVariant());
                     }
                     if (!val.isNull() && temporal.contains(h))
-                        val = convertTemporalForExport(val, temporal[h], sheetName, h, &errors);
+                        val = convertTemporalForExport(val, temporal[h], sheetName, h, &errors,
+                                                       rowCount + 1);  // M-1
                     outRow.append(val);
                 }
                 writer.writeRow(outRow);

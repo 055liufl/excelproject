@@ -39,8 +39,13 @@ QStringList InboxWatcher::scan(QSqlDatabase& db) {
             continue;
 
         // Mark as seen (idempotent: no-op if already known).
-        if (st != LedgerStatus::Seen)
-            ledger_.markSeen(db, artifactName, nullptr);
+        // M-5 fix: if markSeen fails, skip this artifact — processing it without a ledger entry
+        // could cause it to be re-processed indefinitely on the next scan.
+        if (st != LedgerStatus::Seen) {
+            QString markErr;
+            if (!ledger_.markSeen(db, artifactName, &markErr))
+                continue;  // ledger write failed; skip this scan cycle
+        }
 
         const QString artifactPath = d.filePath(artifactName);
         if (QFileInfo::exists(artifactPath))

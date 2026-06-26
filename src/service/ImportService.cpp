@@ -57,15 +57,45 @@ QVariant castToAffinity(const QVariant& raw, const ColumnInfo& gCol) {
             return QVariant();
         return QVariant(dv);
     }
-    return QVariant(raw.toString());  // TEXT / BLOB / NONE: string affinity
+    // H-7 fix: BLOB columns keep binary payload; NONE/TEXT use string.
+    if (type.contains(QStringLiteral("BLOB"))) {
+        if (raw.type() == QVariant::ByteArray)
+            return raw;
+        const QByteArray ba = raw.toByteArray();
+        return ba.isEmpty() ? QVariant() : QVariant(ba);
+    }
+    return QVariant(raw.toString());  // TEXT / NONE: string affinity
 }
 
-// Serialize a match-key tuple to a stable string for use as QHash key.
-// Uses ASCII unit separator (0x1F) as field delimiter.
+// Serialize a match-key tuple to a stable, type-aware string for use as QHash key.
+// H-5/H-6 fix: prefix each value with its type tag so that 1 (int), "1" (string) and
+// 1.0 (double) produce different keys, preserving SQLite strict equality semantics.
 QString makeTupleKey(const QVector<QVariant>& values) {
     QStringList parts;
-    for (const auto& v : values)
-        parts.append(v.isNull() ? QString() : v.toString());
+    for (const auto& v : values) {
+        if (v.isNull()) {
+            parts.append(QStringLiteral("\x00null"));
+        } else {
+            switch (v.type()) {
+                case QVariant::LongLong:
+                case QVariant::Int:
+                case QVariant::ULongLong:
+                case QVariant::UInt:
+                    parts.append(QStringLiteral("i:") + QString::number(v.toLongLong()));
+                    break;
+                case QVariant::Double:
+                    parts.append(QStringLiteral("d:") + QString::number(v.toDouble(), 'g', 17));
+                    break;
+                case QVariant::ByteArray:
+                    parts.append(QStringLiteral("b:") +
+                                 QString::fromLatin1(v.toByteArray().toHex()));
+                    break;
+                default:
+                    parts.append(QStringLiteral("s:") + v.toString());
+                    break;
+            }
+        }
+    }
     return parts.join(QLatin1Char('\x1F'));
 }
 
@@ -559,18 +589,20 @@ ImportResult ImportService::run(const ProfileSpec& profile, const SchemaCatalog&
         return result;
     }
 
-    // Table-level errors (row == 0) abort the entire import.
-    // Row-level errors (row > 0, e.g. E_TIME_PARSE, validator failures) skip only
-    // the failing row — per spec requirement "SHALL NEVER abort an entire sheet's import".
+    // C-2 fix: implement ImportOptions::abortOnError.
+    // - Table-level errors (row == 0) always abort (no partial write makes sense).
+    // - Row-level errors (row > 0): abort when abortOnError=true (MVP all-or-nothing default);
+    //   skip failing row and continue when abortOnError=false (time-format OpenSpec mode).
     {
         bool hasTableErrors = false;
+        bool hasRowErrors = false;
         for (const auto& e : errors.list()) {
-            if (e.row == 0) {
+            if (e.row == 0)
                 hasTableErrors = true;
-                break;
-            }
+            else
+                hasRowErrors = true;
         }
-        if (hasTableErrors) {
+        if (hasTableErrors || (options.abortOnError && hasRowErrors)) {
             result.errors = errors.list();
             return result;
         }

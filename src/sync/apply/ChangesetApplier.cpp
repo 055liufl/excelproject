@@ -5,12 +5,14 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QMap>
+#include <QSet>
 #include <QSqlError>
 #include <QSqlQuery>
 #include <QString>
 #include <QVariant>
 #include <QVariantList>
 
+#include "sql/SqlBuilder.h"
 #include <sqlite3.h>
 
 namespace dbridge::sync {
@@ -286,8 +288,7 @@ bool ChangesetApplier::updateWinnersFromChangeset(const QByteArray& changeset,
                 QStringList cols, placeholders;
                 QVariantList vals;
                 for (auto it = obj.begin(); it != obj.end(); ++it) {
-                    cols << QStringLiteral("\"%1\"").arg(
-                        QString(it.key()).replace(QLatin1Char('"'), QLatin1String("\"\"")));
+                    cols << detail::SqlBuilder::quoteIdent(it.key());
                     placeholders << QStringLiteral("?");
                     vals << it.value().toVariant();
                 }
@@ -299,11 +300,45 @@ bool ChangesetApplier::updateWinnersFromChangeset(const QByteArray& changeset,
                     ok = false;
                     break;
                 }
+                // C-3 fix: use ON CONFLICT DO UPDATE instead of INSERT OR REPLACE to avoid
+                // triggering DELETE+INSERT cascade effects that can break FK child rows.
+                // Query PK columns so we can build the proper conflict target.
+                QStringList pkCols;
+                {
+                    QSqlQuery ti2(wconn);
+                    ti2.prepare(QStringLiteral("PRAGMA table_info(") +
+                                detail::SqlBuilder::quoteIdent(tableName) + QLatin1Char(')'));
+                    if (ti2.exec()) {
+                        while (ti2.next()) {
+                            if (ti2.value(5).toInt() > 0)
+                                pkCols << detail::SqlBuilder::quoteIdent(ti2.value(1).toString());
+                        }
+                    }
+                }
+                QStringList setClauses;
+                QSet<QString> pkSet = QSet<QString>::fromList(pkCols);
+                for (const QString& c : cols) {
+                    if (!pkSet.contains(c))
+                        setClauses << c + QStringLiteral("=excluded.") + c;
+                }
+                QString restoreSql;
+                const QString quotedTable = detail::SqlBuilder::quoteIdent(tableName);
+                if (pkCols.isEmpty() || setClauses.isEmpty()) {
+                    // No PK info or all-PK table: use INSERT OR IGNORE (safe, no cascade).
+                    restoreSql = QStringLiteral("INSERT OR IGNORE INTO %1 (%2) VALUES (%3)")
+                                     .arg(quotedTable, cols.join(QLatin1Char(',')),
+                                          placeholders.join(QLatin1Char(',')));
+                } else {
+                    restoreSql =
+                        QStringLiteral(
+                            "INSERT INTO %1 (%2) VALUES (%3) "
+                            "ON CONFLICT (%4) DO UPDATE SET %5")
+                            .arg(quotedTable, cols.join(QLatin1Char(',')),
+                                 placeholders.join(QLatin1Char(',')), pkCols.join(QLatin1Char(',')),
+                                 setClauses.join(QLatin1Char(',')));
+                }
                 QSqlQuery restoreQ(wconn);
-                restoreQ.prepare(
-                    QStringLiteral("INSERT OR REPLACE INTO \"%1\" (%2) VALUES (%3)")
-                        .arg(QString(tableName).replace(QLatin1Char('"'), QLatin1String("\"\"")),
-                             cols.join(QLatin1Char(',')), placeholders.join(QLatin1Char(','))));
+                restoreQ.prepare(restoreSql);
                 for (const QVariant& v : vals)
                     restoreQ.addBindValue(v);
                 if (!restoreQ.exec()) {

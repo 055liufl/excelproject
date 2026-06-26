@@ -8,6 +8,7 @@
 #include <QSqlRecord>
 #include <QUuid>
 
+#include "sql/SqlBuilder.h"
 #include "sync/WriteTxn.h"
 #include <algorithm>
 #include <memory>
@@ -372,7 +373,10 @@ QVariantMap ComparisonSession::findLocalRow(const QString& table, const QString&
         return {};
 
     QSqlQuery q(rconn_);
-    q.prepare(QString("SELECT * FROM \"%1\" WHERE \"%2\" = :pk").arg(table, pkCol));
+    // H-4 fix: use quoteIdent to handle table/column names with embedded double-quotes.
+    q.prepare(
+        QStringLiteral("SELECT * FROM %1 WHERE %2 = :pk")
+            .arg(detail::SqlBuilder::quoteIdent(table), detail::SqlBuilder::quoteIdent(pkCol)));
     q.bindValue(":pk", pk);
     if (!q.exec() || !q.next())
         return {};
@@ -389,7 +393,9 @@ QString ComparisonSession::getPkColumn(const QString& table) const {
         return pkColCache_.value(table);
 
     QSqlQuery q(rconn_);
-    q.prepare(QString("PRAGMA table_info(\"%1\")").arg(table));
+    // H-4 fix: use quoteIdent.
+    q.prepare(QStringLiteral("PRAGMA table_info(") + detail::SqlBuilder::quoteIdent(table) +
+              QLatin1Char(')'));
     if (!q.exec())
         return {};
 
@@ -439,6 +445,10 @@ class OwningComparisonSession : public IComparisonSession {
     ~OwningComparisonSession() override {
         inner_.reset();
         deps_->rconn.close();
+        // M-6 fix: invalidate the QSqlDatabase handle before removeDatabase.
+        // Qt requires all copies of a QSqlDatabase to be destroyed or set to default
+        // before removeDatabase() is called to avoid "connection still in use" warnings.
+        deps_->rconn = QSqlDatabase();
         QSqlDatabase::removeDatabase(deps_->connName);
     }
 

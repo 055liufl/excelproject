@@ -14,6 +14,7 @@
 #include <QUuid>
 
 #include "service/ImportService.h"
+#include "sql/SqlBuilder.h"
 #include "sync/SyncContext.h"
 #include "sync/SyncDDL.h"
 #include "sync/WriteTxn.h"
@@ -693,7 +694,9 @@ bool SyncWorker::processSelectionPushArtifact(const DecodeResult& dec, const QSt
         if (pkColsCache.contains(table))
             return pkColsCache[table];
         QSqlQuery pq(*wconnPtr_);
-        pq.prepare(QStringLiteral("PRAGMA table_info(\"%1\")").arg(table));
+        // H-3 fix: use quoteIdent for table name in PRAGMA.
+        pq.prepare(QStringLiteral("PRAGMA table_info(") + detail::SqlBuilder::quoteIdent(table) +
+                   QLatin1Char(')'));
         QStringList pks;
         if (pq.exec()) {
             while (pq.next()) {
@@ -1186,28 +1189,63 @@ bool SyncWorker::runBaselineFallbackFor(const QString& artifactName) {
     if (!baseline.shouldFallbackToBaseline(applied, dec.header.originSeq))
         return false;
 
-    // C-09 fix: a self-export+apply cycle ("local self-referential baseline") cannot close
-    // the gap — it just re-encodes what we already have without advancing the origin_seq.
-    // Correct behavior requires requesting a baseline artifact FROM the source node over the
-    // transport layer. Until that is implemented, quarantine the artifact and emit E_SYNC_GAP
-    // so the operator knows manual intervention or source-side baseline generation is needed.
+    // C-1 fix: request a source-authoritative baseline over the transport channel.
+    // If a request is already in-flight for this artifact, don't re-send (debounce).
+    if (baselineRequestsInFlight_.contains(artifactName)) {
+        // Already requested — artifact stays pending; wait for baseline response.
+        return false;
+    }
+
+    // Generate a BaselineRequest artifact and write it to the outbox addressed to the origin node.
+    // The response handler (processBaselineResponseArtifact) will apply the baseline and then
+    // rescan the inbox so this pending artifact gets retried.
+    BaselineRequestPayload req;
+    req.origin = dec.header.origin;
+    req.streamEpoch = dec.header.streamEpoch;
+    req.fromSeq = applied;
+    req.pendingArtifactName = artifactName;
+    req.requestedTables = canonicalSyncTables_;
+
+    PayloadHeader reqHdr;
+    reqHdr.origin = config_.nodeId();
+    reqHdr.originSeq = nextLocalOriginSeq();
+    reqHdr.streamEpoch = streamEpoch_;
+    reqHdr.schemaVer = config_.schemaVersion();
+    reqHdr.schemaFingerprint = guard_ ? guard_->fingerprint() : QString();
+    reqHdr.routeTag = dec.header.origin;
+
+    QByteArray reqPayload = codec_->encodeBaselineRequest(reqHdr, req);
+    const QString reqName = QStringLiteral("blreq__") + config_.nodeId() + QStringLiteral("__") +
+                            dec.header.origin + QStringLiteral("__") +
+                            QString::number(QDateTime::currentMSecsSinceEpoch()) +
+                            QStringLiteral(".payload");
+
+    QString writeErr;
+    if (!outbox_->write(reqName, reqPayload, &writeErr)) {
+        // Cannot send request — quarantine the artifact as before to avoid infinite rescan.
+        emit errorOccurred(
+            {err::E_SYNC_GAP, Severity::Error, QStringLiteral("baseline"), dec.header.origin,
+             QStringLiteral("Gap for origin=%1 seq=%2: cannot send BaselineRequest: %3")
+                 .arg(dec.header.origin)
+                 .arg(dec.header.originSeq)
+                 .arg(writeErr)});
+        if (!config_.quarantineDir().isEmpty()) {
+            QDir qDir(config_.quarantineDir());
+            qDir.mkpath(QStringLiteral("."));
+            if (QFile::copy(path, qDir.filePath(artifactName)))
+                QFile::remove(path);
+        }
+        ledger_->markConsumed(*wconnPtr_, artifactName, nullptr);
+        return false;
+    }
+
+    // Request sent — mark artifact as in-flight and keep it in the pending ledger.
+    baselineRequestsInFlight_.insert(artifactName);
     emit errorOccurred(
-        {err::E_SYNC_GAP, Severity::Error, QStringLiteral("baseline"), dec.header.origin,
-         QStringLiteral("Gap for origin=%1 seq=%2 exceeds threshold. "
-                        "A source-authoritative baseline is required (FR-8). "
-                        "Quarantining pending artifact until source baseline is received.")
+        {err::E_SYNC_GAP, Severity::Warning, QStringLiteral("baseline"), dec.header.origin,
+         QStringLiteral("Gap for origin=%1 seq=%2: BaselineRequest sent, waiting for response")
              .arg(dec.header.origin)
              .arg(dec.header.originSeq)});
-
-    // Move the gap artifact to quarantine so it doesn't endlessly re-trigger this fallback.
-    if (!config_.quarantineDir().isEmpty()) {
-        QDir qDir(config_.quarantineDir());
-        qDir.mkpath(QStringLiteral("."));
-        if (QFile::copy(path, qDir.filePath(artifactName)))
-            QFile::remove(path);
-    }
-    // Mark consumed in ledger so the rescan doesn't re-attempt.
-    ledger_->markConsumed(*wconnPtr_, artifactName, nullptr);
     return false;
 }
 

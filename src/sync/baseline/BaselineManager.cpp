@@ -225,11 +225,43 @@ bool BaselineManager::applyBaseline(QSqlDatabase& wconn, sqlite3* /*h*/,
         return false;
     }
 
+    // M-4 fix: temporarily disable FK enforcement during baseline apply.
+    // The baseline data does DELETE + full re-INSERT per table. Without FK OFF, deleting a
+    // parent table before a child table (or vice versa) would violate FK constraints.
+    // Since we verify the source DB was consistent, re-enabling FK after all INSERTs is safe.
+    {
+        QSqlQuery pragmaOff(wconn);
+        if (!pragmaOff.exec(QStringLiteral("PRAGMA foreign_keys=OFF"))) {
+            txn.rollback();
+            if (err)
+                *err = QStringLiteral("%1: cannot disable FK enforcement: %2")
+                           .arg(QLatin1String(err::E_SYNC_BASELINE_FAILED),
+                                pragmaOff.lastError().text());
+            return false;
+        }
+    }
+
     QStringList tables;
     if (!deserializeAndApply(wconn, art.data, &tables, err)) {
+        QSqlQuery pragmaOn(wconn);
+        pragmaOn.exec(QStringLiteral("PRAGMA foreign_keys=ON"));
         txn.rollback();
         wrapErr(err);
         return false;
+    }
+
+    // Re-enable FK enforcement before commit so any FK inconsistency in the baseline data
+    // is caught by SQLite's deferred constraint check at commit time.
+    {
+        QSqlQuery pragmaOn(wconn);
+        if (!pragmaOn.exec(QStringLiteral("PRAGMA foreign_keys=ON"))) {
+            txn.rollback();
+            if (err)
+                *err = QStringLiteral("%1: cannot re-enable FK enforcement: %2")
+                           .arg(QLatin1String(err::E_SYNC_BASELINE_FAILED),
+                                pragmaOn.lastError().text());
+            return false;
+        }
     }
 
     // Reset applied vector for this origin/epoch.

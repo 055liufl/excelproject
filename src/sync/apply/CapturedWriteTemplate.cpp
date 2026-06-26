@@ -9,6 +9,7 @@
 #include <QSqlRecord>
 #include <QStringList>
 
+#include "sql/SqlBuilder.h"
 #include <sqlite3.h>
 
 namespace dbridge::sync {
@@ -237,7 +238,8 @@ WriteResult CapturedWriteTemplate::branchBC(const WriteParams& p) {
     auto buildWhereParts = [](const RowMutation& m) {
         QStringList parts;
         for (const QString& pk : m.pkColumns)
-            parts << QStringLiteral("\"%1\"=?").arg(pk);
+            // H-1 fix: use quoteIdent to handle column names with embedded double-quotes.
+            parts << detail::SqlBuilder::quoteIdent(pk) + QStringLiteral("=?");
         return parts;
     };
     auto bindPkValues = [](QSqlQuery& q, const RowMutation& m) {
@@ -272,8 +274,10 @@ WriteResult CapturedWriteTemplate::branchBC(const WriteParams& p) {
         if (!m.pkColumns.isEmpty() && !m.table.isEmpty()) {
             QStringList wp = buildWhereParts(m);
             QSqlQuery existQ(wconn_);
-            existQ.prepare(QStringLiteral("SELECT * FROM \"%1\" WHERE %2 LIMIT 1")
-                               .arg(m.table, wp.join(QLatin1String(" AND "))));
+            // H-2 fix: use quoteIdent for table name.
+            existQ.prepare(
+                QStringLiteral("SELECT * FROM %1 WHERE %2 LIMIT 1")
+                    .arg(detail::SqlBuilder::quoteIdent(m.table), wp.join(QLatin1String(" AND "))));
             bindPkValues(existQ, m);
             if (existQ.exec() && existQ.next()) {
                 ps.rowExists = true;

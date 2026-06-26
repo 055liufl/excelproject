@@ -102,7 +102,8 @@ struct ImportRunner {
     QString dbPath;
     SchemaCatalog catalog;
 
-    dbridge::ImportResult run(const ProfileSpec& spec, const QString& xlsxPath) {
+    dbridge::ImportResult run(const ProfileSpec& spec, const QString& xlsxPath,
+                              bool abortOnError = true) {
         QString conn = QStringLiteral("run_") + makeUuid();
         auto db = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), conn);
         db.setDatabaseName(dbPath);
@@ -113,6 +114,7 @@ struct ImportRunner {
 
         ImportService svc;
         dbridge::ImportOptions opts;
+        opts.abortOnError = abortOnError;
         auto res = svc.run(spec, catalog, xlsxPath, opts, db);
 
         db.close();
@@ -268,7 +270,9 @@ class TstTemporalImport : public QObject {
                               {QVariant(3), QStringLiteral("2025-03-15")},
                           }));
 
-        auto res = runner.run(spec, xlsxPath);
+        // C-2: use abortOnError=false (row-resilient mode, per time-format OpenSpec) so that a
+        // row with E_TIME_PARSE is skipped while other valid rows are still written.
+        auto res = runner.run(spec, xlsxPath, /*abortOnError=*/false);
 
         // E_TIME_PARSE must be emitted for the failing row
         QVERIFY2(hasCode(res, QStringLiteral("E_TIME_PARSE")), "Expected E_TIME_PARSE");

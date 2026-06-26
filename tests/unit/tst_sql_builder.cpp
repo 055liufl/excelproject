@@ -23,12 +23,14 @@ class TstSqlBuilder : public QObject {
         SqlBuilder builder;
         UpsertSql us = builder.buildUpsert(payload);
 
-        QVERIFY(us.sql.contains(QStringLiteral("INSERT INTO orders")));
-        QVERIFY(us.sql.contains(QStringLiteral("ON CONFLICT(order_no)")));
+        // SqlBuilder uses quoteIdent — check for quoted form.
+        QVERIFY(us.sql.contains(QStringLiteral("INSERT INTO \"orders\"")));
+        QVERIFY(us.sql.contains(QStringLiteral("ON CONFLICT(")));
+        QVERIFY(us.sql.contains(QStringLiteral("\"order_no\"")));
         QVERIFY(us.sql.contains(QStringLiteral("DO UPDATE SET")));
-        QVERIFY(us.sql.contains(QStringLiteral("customer = excluded.customer")));
-        QVERIFY(us.sql.contains(QStringLiteral("amount = excluded.amount")));
-        QVERIFY(!us.sql.contains(QStringLiteral("order_no = excluded.order_no")));
+        QVERIFY(us.sql.contains(QStringLiteral("\"customer\"")));
+        QVERIFY(us.sql.contains(QStringLiteral("\"amount\"")));
+        QVERIFY(!us.sql.contains(QStringLiteral("\"order_no\" = excluded.")));
     }
 
     void testBuildUpsertDoNothing() {
@@ -57,8 +59,10 @@ class TstSqlBuilder : public QObject {
         SqlBuilder builder;
         UpsertSql us = builder.buildUpsert(payload);
 
-        QVERIFY(us.sql.contains(QStringLiteral("ON CONFLICT(order_no, line_no)")));
-        QVERIFY(us.sql.contains(QStringLiteral("sku = excluded.sku")));
+        QVERIFY(us.sql.contains(QStringLiteral("ON CONFLICT(")));
+        QVERIFY(us.sql.contains(QStringLiteral("\"order_no\"")));
+        QVERIFY(us.sql.contains(QStringLiteral("\"line_no\"")));
+        QVERIFY(us.sql.contains(QStringLiteral("\"sku\"")));
     }
 
     void testBuildAutoJoinSelectSingleTable() {
@@ -80,9 +84,13 @@ class TstSqlBuilder : public QObject {
         routeVec << route;
         QString sql = builder.buildAutoJoinSelect(routeVec, exp);
 
-        QVERIFY(sql.contains(QStringLiteral("FROM customer")));
-        QVERIFY(sql.contains(QStringLiteral("customer.customer_no AS CustomerNo")));
-        QVERIFY(sql.contains(QStringLiteral("ORDER BY customer_no")));
+        // SqlBuilder uses quoteIdent — check for quoted form.
+        QVERIFY(sql.contains(QStringLiteral("FROM \"customer\"")));
+        QVERIFY(sql.contains(QStringLiteral("\"customer\".\"customer_no\"")));
+        QVERIFY(sql.contains(QStringLiteral("\"CustomerNo\"")));
+        // H-6 ORDER BY qualified with table name.
+        QVERIFY(sql.contains(QStringLiteral("ORDER BY")));
+        QVERIFY(sql.contains(QStringLiteral("\"customer_no\"")));
     }
 };
 

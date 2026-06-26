@@ -164,20 +164,28 @@ CREATE TABLE IF NOT EXISTS __sync_inbox_ledger (
 }
 
 // Canonical artifact naming helpers.
+// M-03 fix: artifact names follow the stable contract:
+//   origin__epoch__kind__seq__[peer-]uuid.payload
+// kind is now at a fixed position (field 3), and a UUID suffix is always appended for
+// global uniqueness.  This matches the specification's stable naming contract and allows
+// peer information to be embedded before the UUID without shifting the kind field.
 // H-08 fix: include target peer so the same changelog entry written for different peers
 // produces distinct file names (same outbox dir cannot hold two files with the same name).
 inline QString changesetArtifactName(const QString& origin, qint64 epoch, qint64 seq,
                                      const QString& targetPeer = QString()) {
+    const QString uuid = QUuid::createUuid().toString(QUuid::WithoutBraces).left(8);
     if (targetPeer.isEmpty())
-        return QStringLiteral("%1__%2__%3__changeset.payload")
+        return QStringLiteral("%1__%2__changeset__%3__%4.payload")
             .arg(origin)
             .arg(epoch)
-            .arg(seq, 12, 10, QLatin1Char('0'));
-    return QStringLiteral("%1__%2__%3__%4__changeset.payload")
+            .arg(seq, 12, 10, QLatin1Char('0'))
+            .arg(uuid);
+    return QStringLiteral("%1__%2__changeset__%3__%4-%5.payload")
         .arg(origin)
         .arg(epoch)
         .arg(seq, 12, 10, QLatin1Char('0'))
-        .arg(targetPeer);
+        .arg(targetPeer)
+        .arg(uuid);
 }
 
 inline QString selectionPushArtifactName(const QString& pushId, int chunkSeq,

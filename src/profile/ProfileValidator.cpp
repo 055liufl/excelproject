@@ -26,6 +26,10 @@ bool ProfileValidator::isConflictValid(const ConflictSpec& conflict, const Table
     for (const auto& idx : table.indexes) {
         if (!idx.unique)
             continue;
+        // H-02 fix: partial UNIQUE indexes are not valid ON CONFLICT targets in SQLite —
+        // the database engine requires the conflict clause to reference a non-partial constraint.
+        if (idx.partial)
+            continue;
         QSet<QString> idxSet = QSet<QString>::fromList(idx.columns);
         if (idxSet == conflictSet)
             return true;

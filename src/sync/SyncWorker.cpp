@@ -500,8 +500,15 @@ bool SyncWorker::processArtifact(const QString& path) {
             return true;  // already processed
         ledger_->markSeen(*wconnPtr_, name, nullptr);
         const bool ok = processAckArtifact(path, name);
-        if (ok)
+        if (ok) {
             ledger_->markConsumed(*wconnPtr_, name, nullptr);
+        } else {
+            // M-01 fix: mark corrupt so this ACK artifact is not re-processed on subsequent scans.
+            ledger_->markCorrupt(*wconnPtr_, name, nullptr);
+            emit errorOccurred({err::E_SYNC_PAYLOAD_CORRUPT, Severity::Warning,
+                                QStringLiteral("ack"), QString(),
+                                QStringLiteral("ACK artifact could not be parsed: ") + name});
+        }
         return ok;
     }
 
@@ -513,7 +520,13 @@ bool SyncWorker::processArtifact(const QString& path) {
     // Read artifact
     QFile f(path);
     if (!f.open(QIODevice::ReadOnly)) {
-        qWarning() << "[SyncWorker] Cannot open artifact:" << path;
+        // M-02 fix: the .ready marker exists but the payload file is missing or unreadable.
+        // This is a transport-layer failure, not a sequence gap — mark corrupt so stalePending()
+        // does not include it and trigger a spurious E_SYNC_GAP / baseline fallback.
+        ledger_->markCorrupt(*wconnPtr_, name, nullptr);
+        emit errorOccurred({err::E_SYNC_TRANSPORT, Severity::Warning, QStringLiteral("inbox"),
+                            QString(),
+                            QStringLiteral("Cannot open artifact (transport error): ") + path});
         return false;
     }
     QByteArray data = f.readAll();

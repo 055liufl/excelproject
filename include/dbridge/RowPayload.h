@@ -14,6 +14,10 @@ struct RoutePayload {
     QVector<QVariant> binds;
     QStringList conflictKey;
     QVector<QVariant> conflictVals;
+    // H-01 fix: set by Mapper when a validator or temporal-conversion error occurs for this route.
+    // Allows ImportService to add only the affected routeIndex to failedRouteIndices rather than
+    // marking the entire row hasNonRouteError.
+    bool hasError = false;
 
     int indexOf(const QString& col) const {
         for (int i = 0; i < dbColumns.size(); ++i) {

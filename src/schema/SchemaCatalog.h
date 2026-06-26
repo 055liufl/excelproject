@@ -20,6 +20,9 @@ struct IndexInfo {
     QString name;
     bool unique = false;
     QStringList columns;
+    // H-02 fix: partial indexes are not valid UPSERT conflict targets because SQLite requires the
+    // ON CONFLICT clause to match a non-partial UNIQUE constraint or PRIMARY KEY.
+    bool partial = false;
 };
 
 struct FkInfo {

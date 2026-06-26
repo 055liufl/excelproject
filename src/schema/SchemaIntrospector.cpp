@@ -91,23 +91,31 @@ bool SchemaIntrospector::readIndexes(QSqlDatabase& db, TableInfo* info, QString*
         return false;
     }
     // seq, name, unique, origin, partial
-    QVector<QPair<QString, bool>> idxList;
+    struct IdxMeta {
+        QString name;
+        bool unique;
+        bool partial;
+    };
+    QVector<IdxMeta> idxList;
     while (q.next()) {
-        QString idxName = q.value(1).toString();
-        bool unique = q.value(2).toBool();
-        idxList.append({idxName, unique});
+        IdxMeta m;
+        m.name = q.value(1).toString();
+        m.unique = q.value(2).toBool();
+        m.partial = q.value(4).toBool();  // H-02 fix: column index 4 = partial flag
+        idxList.append(m);
     }
 
-    for (auto& [idxName, unique] : idxList) {
+    for (auto& meta : idxList) {
         IndexInfo idx;
-        idx.name = idxName;
-        idx.unique = unique;
+        idx.name = meta.name;
+        idx.unique = meta.unique;
+        idx.partial = meta.partial;  // H-02 fix: propagate partial flag
 
         QSqlQuery qi(db);
         // M-01 fix: double-quote index name.
         const QString quotedIdx =
             QStringLiteral("\"") +
-            QString(idxName).replace(QLatin1Char('"'), QLatin1String("\"\"")) +
+            QString(meta.name).replace(QLatin1Char('"'), QLatin1String("\"\"")) +
             QStringLiteral("\"");
         qi.exec(QStringLiteral("PRAGMA index_info(") + quotedIdx + QLatin1Char(')'));
         while (qi.next()) {

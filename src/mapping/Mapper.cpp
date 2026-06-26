@@ -69,6 +69,10 @@ QVector<RoutePayload> Mapper::map(const QVector<RouteSpec>& routes, int excelRow
                                 errMsg);
                     normalizedVal = rawVal;
                     rowHasError = true;
+                    // H-01 fix: mark only this route's payload as failed so ImportService
+                    // inserts this routeIndex into failedRouteIndices instead of setting
+                    // hasNonRouteError (which skips the entire row).
+                    payload.hasError = true;
                 }
             }
 
@@ -96,6 +100,9 @@ QVector<RoutePayload> Mapper::map(const QVector<RouteSpec>& routes, int excelRow
                                         errMsg);
                             normalizedVal = rawVal;
                             rowHasError = true;
+                            // H-01 fix: temporal parse failure is route-local — only this route's
+                            // payload is invalid, not the entire row.
+                            payload.hasError = true;
                         } else {
                             QVariant serialized = tconv::formatValue(structured, kind, eff.db);
                             normalizedVal = (serialized.isValid() && !serialized.isNull())

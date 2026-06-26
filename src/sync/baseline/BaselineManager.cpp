@@ -2,6 +2,7 @@
 
 #include "dbridge/Errors.h"
 
+#include <QCryptographicHash>
 #include <QDataStream>
 #include <QSqlError>
 #include <QSqlQuery>
@@ -259,7 +260,8 @@ bool BaselineManager::applyBaseline(QSqlDatabase& wconn, sqlite3* /*h*/,
                                     const BaselineArtifact& art, AppliedVectorStore& av,
                                     TableStateStore& ts, RowWinnerStore& rw,
                                     ConsistencyCache& cache, qint64 epoch, const QString& origin,
-                                    const QString& schemaFp, qint64* newAnchorSeq, QString* err) {
+                                    const QString& schemaFp, qint64* newAnchorSeq, QString* err,
+                                    int baselineRank) {
     // I-20 helper: prefix err with E_SYNC_BASELINE_FAILED if not already an E_SYNC code.
     auto wrapErr = [&](QString* ep) {
         if (ep && !ep->startsWith(QLatin1String("E_SYNC")))
@@ -348,6 +350,62 @@ bool BaselineManager::applyBaseline(QSqlDatabase& wconn, sqlite3* /*h*/,
         restoreFk();
         wrapErr(err);
         return false;
+    }
+
+    // M-02 fix: after clearing row winners, seed RowWinner entries for every imported row so
+    // subsequent low-rank challengers cannot overwrite baseline truth.  We use the same
+    // pkHash format as ChangesetApplier: SHA-256(pk_value1\0pk_value2\0...).left(16).toHex().
+    // appliedSeq for baseline rows is sourceMaxSeq (the highest changelog seq on the exporter).
+    {
+        const qint64 baselineSeq = art.sourceMaxSeq;
+        for (const QString& tableName : tables) {
+            // Collect PK column names and their indices via PRAGMA table_info.
+            QStringList pkCols;
+            {
+                QSqlQuery pragmaQ(wconn);
+                pragmaQ.prepare(QStringLiteral("PRAGMA table_info(") +
+                                detail::SqlBuilder::quoteIdent(tableName) + QLatin1Char(')'));
+                if (pragmaQ.exec()) {
+                    while (pragmaQ.next()) {
+                        if (pragmaQ.value(QStringLiteral("pk")).toInt() > 0)
+                            pkCols << pragmaQ.value(QStringLiteral("name")).toString();
+                    }
+                }
+            }
+            if (pkCols.isEmpty())
+                continue;  // no PK — skip (cannot compute pk_hash)
+
+            QSqlQuery rowQ(wconn);
+            rowQ.prepare(QStringLiteral("SELECT * FROM ") +
+                         detail::SqlBuilder::quoteIdent(tableName));
+            if (!rowQ.exec())
+                continue;
+
+            const QSqlRecord rec = rowQ.record();
+            while (rowQ.next()) {
+                // Build pkMaterial in the same format as ChangesetApplier::extractHashMaterials:
+                // concatenate PK column values as UTF-8 bytes separated by \0.
+                QByteArray pkMaterial;
+                for (const QString& pkCol : pkCols) {
+                    const int colIdx = rec.indexOf(pkCol);
+                    if (colIdx >= 0) {
+                        pkMaterial.append(rowQ.value(colIdx).toString().toUtf8());
+                    }
+                    pkMaterial.append('\0');
+                }
+                const QString pkHashStr = QString::fromLatin1(
+                    QCryptographicHash::hash(pkMaterial, QCryptographicHash::Sha256)
+                        .left(16)
+                        .toHex());
+
+                RowWinner winner;
+                winner.origin = origin;
+                winner.rank = baselineRank;
+                winner.originSeq = baselineSeq;
+                // contentHash left empty — rank/seq comparison is sufficient for conflict logic.
+                rw.put(wconn, tableName, pkHashStr, winner, nullptr);
+            }
+        }
     }
 
     if (!txn.commit(err)) {

@@ -41,10 +41,13 @@ class BaselineManager {
     // Apply a baseline: import rows into wconn, then reset tracking stores.
     // H-05 fix: schemaFp is written into table_state so DiffEngine can compare fingerprints
     // correctly after baseline apply and avoid false "Different" diffs.
+    // M-02 fix: baselineRank is the rank of the baseline origin; used to seed RowWinner entries
+    // for every imported row so subsequent low-rank challengers cannot overwrite baseline truth.
     bool applyBaseline(QSqlDatabase& wconn, sqlite3* h, const BaselineArtifact& art,
                        AppliedVectorStore& av, TableStateStore& ts, RowWinnerStore& rw,
                        ConsistencyCache& cache, qint64 epoch, const QString& origin,
-                       const QString& schemaFp, qint64* newAnchorSeq, QString* err);
+                       const QString& schemaFp, qint64* newAnchorSeq, QString* err,
+                       int baselineRank = 0);
 
     // True if we should fall back to baseline (source has already compacted
     // the changesets we need).

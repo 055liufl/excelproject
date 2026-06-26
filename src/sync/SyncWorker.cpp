@@ -861,7 +861,10 @@ bool SyncWorker::processBaselineRequestArtifact(const DecodeResult& dec,
 
     PayloadHeader hdr;
     hdr.origin = config_.nodeId();
-    hdr.originSeq = nextLocalOriginSeq();
+    // H-01 fix: baseline response does not participate in the changeset sequence space.
+    // Setting originSeq = 0 prevents a gap in local changeset seq that would cause
+    // subsequent inbound changesets to be mis-judged as gaps and trigger another fallback.
+    hdr.originSeq = 0LL;
     hdr.streamEpoch = streamEpoch_;
     hdr.schemaVer = config_.schemaVersion();
     hdr.schemaFingerprint = guard_ ? guard_->fingerprint() : QString();
@@ -907,9 +910,11 @@ bool SyncWorker::processBaselineResponseArtifact(const DecodeResult& dec,
     qint64 newAnchorSeq = 0;
     QString applyErr;
     const QString schemaFp = guard_ ? guard_->fingerprint() : QString();
+    // M-02 fix: pass the baseline origin's rank so applyBaseline can seed RowWinner entries.
+    const int baselineRank = config_.originRank(resp.origin);
 
     if (!bm.applyBaseline(*wconnPtr_, hPtr_, art, *av_, *ts_, *rw_, cache, resp.streamEpoch,
-                          resp.origin, schemaFp, &newAnchorSeq, &applyErr)) {
+                          resp.origin, schemaFp, &newAnchorSeq, &applyErr, baselineRank)) {
         emit errorOccurred({err::E_SYNC_BASELINE_FAILED, Severity::Error,
                             QStringLiteral("baseline_response"), dec.header.origin, applyErr});
         return false;
@@ -1328,7 +1333,10 @@ bool SyncWorker::runBaselineFallbackFor(const QString& artifactName) {
 
     PayloadHeader reqHdr;
     reqHdr.origin = config_.nodeId();
-    reqHdr.originSeq = nextLocalOriginSeq();
+    // H-01 fix: baseline request does not participate in the changeset sequence space.
+    // Setting originSeq = 0 prevents a gap in local changeset seq that would cause
+    // subsequent inbound changesets to be mis-judged as gaps and trigger another fallback.
+    reqHdr.originSeq = 0LL;
     reqHdr.streamEpoch = streamEpoch_;
     reqHdr.schemaVer = config_.schemaVersion();
     reqHdr.schemaFingerprint = guard_ ? guard_->fingerprint() : QString();

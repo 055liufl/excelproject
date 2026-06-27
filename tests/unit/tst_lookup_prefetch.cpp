@@ -59,8 +59,8 @@ static ProfileSpec loadProfile(const QString& json) {
     ProfileLoader loader;
     ProfileSpec spec;
     QString err;
-    Q_ASSERT_X(loader.load(QJsonDocument::fromJson(json.toUtf8()), &spec, &err), "loadProfile",
-               err.toUtf8());
+    if (!loader.load(QJsonDocument::fromJson(json.toUtf8()), &spec, &err))
+        qFatal("%s failed: %s", "loadProfile", err.toUtf8().constData());
     return spec;
 }
 

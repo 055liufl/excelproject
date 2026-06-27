@@ -9,8 +9,9 @@ function(add_dbridge_test name sources)
   target_link_libraries(${name} PRIVATE dbridge QXlsx Qt5::Test Qt5::Sql
                                         Qt5::Core)
   target_include_directories(
-    ${name} PRIVATE ${CMAKE_SOURCE_DIR}/src
-                    ${CMAKE_SOURCE_DIR}/3rdparty/QXlsx/src)
+    ${name}
+    PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/3rdparty/QXlsx/src
+            ${CMAKE_SOURCE_DIR}/tests)
   add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
@@ -31,3 +32,26 @@ add_dbridge_test(tst_temporal_import unit/tst_temporal_import.cpp)
 add_dbridge_test(tst_temporal_export unit/tst_temporal_export.cpp)
 add_dbridge_test(tst_column_order_export unit/tst_column_order_export.cpp)
 add_dbridge_test(tst_import_single integration/tst_import_single.cpp)
+
+# ── sync unit tests ─────────────────────────────────────────────────────────
+add_dbridge_test(tst_sync_conflict_arbiter unit/tst_sync_conflict_arbiter.cpp)
+add_dbridge_test(tst_sync_routing_table unit/tst_sync_routing_table.cpp)
+add_dbridge_test(tst_sync_foreground_gate unit/tst_sync_foreground_gate.cpp)
+add_dbridge_test(tst_write_txn unit/tst_write_txn.cpp)
+add_dbridge_test(tst_sync_applied_vector unit/tst_sync_applied_vector.cpp)
+add_dbridge_test(tst_sync_row_winner unit/tst_sync_row_winner.cpp)
+add_dbridge_test(tst_sync_schema_guard unit/tst_sync_schema_guard.cpp)
+add_dbridge_test(tst_sync_quarantine_store unit/tst_sync_quarantine_store.cpp)
+add_dbridge_test(tst_sync_inbox_ledger unit/tst_sync_inbox_ledger.cpp)
+add_dbridge_test(tst_sync_outbound_ack unit/tst_sync_outbound_ack.cpp)
+add_dbridge_test(tst_sync_changelog_store unit/tst_sync_changelog_store.cpp)
+add_dbridge_test(tst_sync_table_state unit/tst_sync_table_state.cpp)
+add_dbridge_test(tst_sync_payload_codec unit/tst_sync_payload_codec.cpp)
+add_dbridge_test(tst_sync_schema_eligibility
+                 unit/tst_sync_schema_eligibility.cpp)
+add_dbridge_test(tst_sync_inbound_table_gate
+                 unit/tst_sync_inbound_table_gate.cpp)
+add_dbridge_test(tst_sync_staging_buffer unit/tst_sync_staging_buffer.cpp)
+add_dbridge_test(tst_sync_upsert_executor unit/tst_sync_upsert_executor.cpp)
+add_dbridge_test(tst_sync_consistency_cache unit/tst_sync_consistency_cache.cpp)
+add_dbridge_test(tst_sync_dead_peer_evictor unit/tst_sync_dead_peer_evictor.cpp)

@@ -2,6 +2,8 @@
 
 #include <QCoreApplication>
 #include <QFileInfo>
+#include <QSqlError>
+#include <QSqlQuery>
 #include <QUuid>
 
 #ifdef Q_OS_WIN
@@ -110,6 +112,51 @@ void SyncContextRegistry::release(const QString& canonicalKey_) {
     if (--it.value()->refCount <= 0) {
         registry_.erase(it);
     }
+}
+
+bool SyncContextRegistry::ensureContextUuid(QSqlDatabase& db, const QString& uuid, QString* err) {
+    // H-01 fix: persist contextUuid to __sync_context_meta so that the UUID survives
+    // process restarts and cross-alias detection can verify identity consistency.
+    QSqlQuery ddl(db);
+    if (!ddl.exec(QStringLiteral("CREATE TABLE IF NOT EXISTS __sync_context_meta("
+                                 "k TEXT NOT NULL PRIMARY KEY, v TEXT NOT NULL)"))) {
+        if (err)
+            *err = QStringLiteral("cannot create __sync_context_meta: ") + ddl.lastError().text();
+        return false;
+    }
+
+    QSqlQuery sel(db);
+    sel.prepare(QStringLiteral("SELECT v FROM __sync_context_meta WHERE k='context_uuid'"));
+    if (!sel.exec()) {
+        if (err)
+            *err = QStringLiteral("cannot read context_uuid: ") + sel.lastError().text();
+        return false;
+    }
+    if (sel.next()) {
+        // UUID already stored; verify it matches.
+        const QString stored = sel.value(0).toString();
+        if (stored != uuid) {
+            if (err)
+                *err = QStringLiteral(
+                           "context_uuid mismatch: stored=%1, in-memory=%2 — "
+                           "possible alias collision or database corruption")
+                           .arg(stored)
+                           .arg(uuid);
+            return false;
+        }
+        return true;
+    }
+
+    // No row yet — insert.
+    QSqlQuery ins(db);
+    ins.prepare(QStringLiteral("INSERT INTO __sync_context_meta(k, v) VALUES('context_uuid', ?)"));
+    ins.addBindValue(uuid);
+    if (!ins.exec()) {
+        if (err)
+            *err = QStringLiteral("cannot persist context_uuid: ") + ins.lastError().text();
+        return false;
+    }
+    return true;
 }
 
 }  // namespace dbridge::sync

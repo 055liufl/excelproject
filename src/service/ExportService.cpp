@@ -434,11 +434,10 @@ void collectHValues(const QVector<RouteSpec>& routes, const SchemaCatalog& catal
 }
 
 // Resolve A-header values for a single row using the ReverseCache.
-// Returns QHash<A-header → resolved value>. On NOT_FOUND + "error": emits error and records
-// the failed A-header names in *failedAHeaders (so the caller can write NULL for those columns
-// while keeping other columns).  Sets *rowSkip=true only for AMBIGUOUS results, which are
-// whole-row errors (the data is fundamentally inconsistent and no partial write makes sense).
-// H-04 fix: previously any lookup error set rowSkip=true and skipped the entire row.
+// On NOT_FOUND + exportOnMissing=="error": emits error and sets *rowSkip=true so the entire
+// row is skipped (per spec §exportOnMissing:"error" → row SHALL be skipped not written to Excel).
+// AMBIGUOUS also sets rowSkip=true (data is fundamentally inconsistent).
+// "null"/"skip" write empty A-cells without skipping the row.
 QHash<QString, QVariant> resolveAHeaders(const QVector<RouteSpec>& routes,
                                          const SchemaCatalog& catalog,
                                          const QHash<QString, QVariant>& rowData,
@@ -487,8 +486,8 @@ QHash<QString, QVariant> resolveAHeaders(const QVector<RouteSpec>& routes,
                                 ctx + QStringLiteral("route '") + route.table +
                                     QStringLiteral("' lookup '") + lk.name +
                                     QStringLiteral("': H column is NULL — treating as no match"));
-                    // H-03 fix: exportOnMissing=="error" skips the entire row (rowSkip=true).
-                    // "null" and "skip" write empty A-columns but do not skip the row.
+                    // Per spec §exportOnMissing:"error": row SHALL be skipped (not written to
+                    // Excel).
                     *rowSkip = true;
                     return aVals;
                 }
@@ -516,8 +515,8 @@ QHash<QString, QVariant> resolveAHeaders(const QVector<RouteSpec>& routes,
                                     QStringLiteral("': no match in '") + lk.fromTable +
                                     QStringLiteral("' for (") + hDesc.join(QStringLiteral(", ")) +
                                     QStringLiteral(")"));
-                    // H-03 fix: exportOnMissing=="error" skips the entire row (rowSkip=true),
-                    // matching the OpenSpec contract. "null" and "skip" write empty A-columns.
+                    // Per spec §exportOnMissing:"error": row SHALL be skipped (not written to
+                    // Excel).
                     *rowSkip = true;
                     return aVals;
                 }

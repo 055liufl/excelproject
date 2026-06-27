@@ -73,6 +73,13 @@ class CapturedWriteTemplate {
 
     WriteResult execute(const WriteParams& params);
 
+    // M-01 fix: public static version so submitImportSync can extract incremental mutations
+    // from the import changeset without a resetFromBaseline() full table scan.
+    // syncTables is the canonical allow-list; tables not in the list are skipped.
+    static QList<TableMutation> extractMutationsStatic(const QByteArray& changeset,
+                                                       QSqlDatabase& db,
+                                                       const QStringList& syncTables);
+
    private:
     WriteResult branchA(const WriteParams& p);   // InboundChangeset
     WriteResult branchBC(const WriteParams& p);  // InboundSelectionPush or LocalWrite

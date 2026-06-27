@@ -46,9 +46,10 @@ class TableStateStore {
     // Convert first 8 bytes of hash to quint64 (big-endian).
     static quint64 hashToU64(const QByteArray& h);
 
-    // Upsert one table's state row, applying delta to checksum and row_count.
+    // Upsert one table's state row, applying unsigned delta to checksum and row_count.
+    // add/sub are quint64 hash contributions to add/subtract via modular arithmetic.
     bool updateRow(QSqlDatabase& db, const QString& table, qint64 streamEpoch,
-                   const QString& schemaFp, qint64 checksumDelta, qint64 rowCountDelta,
+                   const QString& schemaFp, quint64 add, quint64 sub, qint64 rowCountDelta,
                    qint64 highWaterSeq, QString* err);
 
     // Read current raw checksum as quint64 (0 if not found).

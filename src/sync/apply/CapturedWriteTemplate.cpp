@@ -627,6 +627,154 @@ QList<TableMutation> CapturedWriteTemplate::extractMutations(const QByteArray& c
     return muts;
 }
 
+// M-01 fix: static public wrapper so submitImportSync can call extractMutations without
+// instantiating a full CapturedWriteTemplate.
+QList<TableMutation> CapturedWriteTemplate::extractMutationsStatic(const QByteArray& changeset,
+                                                                   QSqlDatabase& db,
+                                                                   const QStringList& syncTables) {
+    // Delegate to the instance method by constructing a thin temporary adapter.
+    // We only need wconn_ from the instance for PRAGMA table_info lookups in extractMutations.
+    // Rather than instantiating the full template (which requires all store references), create
+    // a minimal local context using a placement-new-free helper class.
+    QList<TableMutation> muts;
+    if (changeset.isEmpty())
+        return muts;
+
+    // Re-implement the core of extractMutations here to avoid a full-template dependency.
+    // This shares the same logic as extractMutations() with db passed explicitly.
+    sqlite3_changeset_iter* iter = nullptr;
+    if (sqlite3changeset_start(
+            &iter, changeset.size(),
+            const_cast<void*>(static_cast<const void*>(changeset.constData()))) != SQLITE_OK)
+        return muts;
+
+    QMap<QString, QStringList> colNameCache;
+    auto getColNames = [&](const QString& tableName, int nCol) -> QStringList {
+        auto it = colNameCache.find(tableName);
+        if (it != colNameCache.end())
+            return it.value();
+        QStringList names;
+        QSqlQuery ti(db);
+        ti.prepare(QStringLiteral("PRAGMA table_info(\"%1\")")
+                       .arg(QString(tableName).replace(QLatin1Char('"'), QLatin1String("\"\""))));
+        if (ti.exec()) {
+            QMap<int, QString> cidMap;
+            while (ti.next())
+                cidMap.insert(ti.value(0).toInt(), ti.value(1).toString());
+            for (int i = 0; i < nCol; ++i)
+                names.append(cidMap.value(i, QStringLiteral("_col_%1").arg(i)));
+        } else {
+            for (int i = 0; i < nCol; ++i)
+                names.append(QStringLiteral("_col_%1").arg(i));
+        }
+        colNameCache.insert(tableName, names);
+        return names;
+    };
+
+    while (sqlite3changeset_next(iter) == SQLITE_ROW) {
+        const char* tbl = nullptr;
+        int nCol = 0, op = 0, indirect = 0;
+        sqlite3changeset_op(iter, &tbl, &nCol, &op, &indirect);
+        unsigned char* pkMask = nullptr;
+        sqlite3changeset_pk(iter, &pkMask, nullptr);
+        const QString tableName = QString::fromUtf8(tbl ? tbl : "");
+        if (!ChangesetApplier::isAllowedSyncTable(tableName, syncTables))
+            continue;
+        const QStringList colNames = getColNames(tableName, nCol);
+
+        auto rowHashFromIter = [&](bool useNew) -> QByteArray {
+            QVariantMap rowMap;
+            for (int i = 0; i < nCol; i++) {
+                sqlite3_value* val = nullptr;
+                if (useNew)
+                    sqlite3changeset_new(iter, i, &val);
+                else
+                    sqlite3changeset_old(iter, i, &val);
+                const QString colName =
+                    (i < colNames.size()) ? colNames[i] : QStringLiteral("_col_%1").arg(i);
+                if (!val) {
+                    rowMap.insert(colName, QVariant());
+                    continue;
+                }
+                const int vt = sqlite3_value_type(val);
+                if (vt == SQLITE_TEXT) {
+                    const char* txt = reinterpret_cast<const char*>(sqlite3_value_text(val));
+                    rowMap.insert(colName, QVariant(QString::fromUtf8(txt ? txt : "")));
+                } else if (vt == SQLITE_INTEGER) {
+                    rowMap.insert(colName,
+                                  QVariant(static_cast<qlonglong>(sqlite3_value_int64(val))));
+                } else if (vt == SQLITE_FLOAT) {
+                    rowMap.insert(colName, QVariant(sqlite3_value_double(val)));
+                } else if (vt == SQLITE_BLOB) {
+                    const void* b = sqlite3_value_blob(val);
+                    const int bl = sqlite3_value_bytes(val);
+                    rowMap.insert(colName, (b && bl > 0) ? QVariant(QByteArray(
+                                                               static_cast<const char*>(b), bl))
+                                                         : QVariant(QByteArray()));
+                } else {
+                    rowMap.insert(colName, QVariant());
+                }
+            }
+            return TableStateStore::rowHash(rowMap);
+        };
+
+        auto pkHashStr = [&](bool useNew) -> QString {
+            QByteArray mat;
+            for (int i = 0; i < nCol; i++) {
+                if (!pkMask || !pkMask[i])
+                    continue;
+                sqlite3_value* val = nullptr;
+                if (useNew)
+                    sqlite3changeset_new(iter, i, &val);
+                else
+                    sqlite3changeset_old(iter, i, &val);
+                if (!val) {
+                    mat.append('\0');
+                    continue;
+                }
+                const int vt = sqlite3_value_type(val);
+                if (vt == SQLITE_TEXT) {
+                    const char* txt = reinterpret_cast<const char*>(sqlite3_value_text(val));
+                    mat.append(txt ? txt : "");
+                } else if (vt == SQLITE_INTEGER) {
+                    mat.append(QByteArray::number(static_cast<qint64>(sqlite3_value_int64(val))));
+                } else if (vt == SQLITE_BLOB) {
+                    const void* b = sqlite3_value_blob(val);
+                    const int bl = sqlite3_value_bytes(val);
+                    if (b && bl > 0)
+                        mat.append(static_cast<const char*>(b), bl);
+                }
+                mat.append('\0');
+            }
+            if (mat.isEmpty())
+                mat = rowHashFromIter(useNew);
+            return QString::fromLatin1(
+                QCryptographicHash::hash(mat, QCryptographicHash::Sha256).left(16).toHex());
+        };
+
+        TableMutation tm;
+        tm.table = tableName;
+        if (op == SQLITE_INSERT) {
+            tm.pkHash = pkHashStr(true);
+            tm.afterHash = rowHashFromIter(true);
+            tm.isInsert = true;
+        } else if (op == SQLITE_DELETE) {
+            tm.pkHash = pkHashStr(false);
+            tm.beforeHash = rowHashFromIter(false);
+            tm.isDelete = true;
+        } else if (op == SQLITE_UPDATE) {
+            tm.pkHash = pkHashStr(false);
+            tm.beforeHash = rowHashFromIter(false);
+            tm.afterHash = rowHashFromIter(true);
+        } else {
+            continue;
+        }
+        muts.append(tm);
+    }
+    sqlite3changeset_finalize(iter);
+    return muts;
+}
+
 // L-02 fix: execMutation() was dead code with unquoted identifiers. Removed.
 
 }  // namespace dbridge::sync

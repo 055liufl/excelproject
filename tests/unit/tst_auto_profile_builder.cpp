@@ -100,8 +100,11 @@ class TstAutoProfileBuilder : public QObject {
         AutoProfileBuilder builder;
         ProfileSpec spec;
         QString err;
-        QVERIFY(!builder.build(*catalog.table("nopk"), &spec, &err));
-        QVERIFY(err.contains("E_PROFILE_NO_CONFLICT_KEY"));
+        // M-03 fix: build() now returns true for draft profiles (executable=false + issues).
+        QVERIFY(builder.build(*catalog.table("nopk"), &spec, &err));
+        QVERIFY(!spec.executable);
+        QVERIFY(!spec.issues.isEmpty());
+        QVERIFY(spec.issues.first().contains("E_PROFILE_NO_CONFLICT_KEY"));
     }
 
     void testJsonOutput() {

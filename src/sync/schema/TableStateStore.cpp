@@ -1,6 +1,7 @@
 #include "TableStateStore.h"
 
 #include <QCryptographicHash>
+#include <QDataStream>
 #include <QDateTime>
 #include <QSqlError>
 #include <QSqlQuery>
@@ -30,9 +31,12 @@ bool TableStateStore::init(QSqlDatabase& db, QString* err) {
 bool TableStateStore::applyMutations(QSqlDatabase& db, const QList<TableMutation>& muts,
                                      qint64 streamEpoch, const QString& schemaFp, qint64 originSeq,
                                      QString* err) {
-    // Aggregate per-table deltas to minimise SQL round-trips.
+    // Aggregate per-table deltas using unsigned quint64 to preserve modular-sum semantics.
+    // M-02 fix: use separate add/sub quint64 instead of signed checksumDelta to avoid
+    // signed-overflow UB when high bits are set.
     struct Delta {
-        qint64 checksumDelta = 0;
+        quint64 add = 0;
+        quint64 sub = 0;
         qint64 rowDelta = 0;
     };
     QMap<QString, Delta> deltas;
@@ -40,22 +44,19 @@ bool TableStateStore::applyMutations(QSqlDatabase& db, const QList<TableMutation
     for (const TableMutation& m : muts) {
         Delta& d = deltas[m.table];
         if (m.isInsert) {
-            // INSERT: +H(new)
-            d.checksumDelta += static_cast<qint64>(hashToU64(m.afterHash));
+            d.add += hashToU64(m.afterHash);
             d.rowDelta += 1;
         } else if (m.isDelete) {
-            // DELETE: -H(old)
-            d.checksumDelta -= static_cast<qint64>(hashToU64(m.beforeHash));
+            d.sub += hashToU64(m.beforeHash);
             d.rowDelta -= 1;
         } else {
-            // UPDATE: +H(new) - H(old)
-            d.checksumDelta += static_cast<qint64>(hashToU64(m.afterHash));
-            d.checksumDelta -= static_cast<qint64>(hashToU64(m.beforeHash));
+            d.add += hashToU64(m.afterHash);
+            d.sub += hashToU64(m.beforeHash);
         }
     }
 
     for (auto it = deltas.begin(); it != deltas.end(); ++it) {
-        if (!updateRow(db, it.key(), streamEpoch, schemaFp, it.value().checksumDelta,
+        if (!updateRow(db, it.key(), streamEpoch, schemaFp, it.value().add, it.value().sub,
                        it.value().rowDelta, originSeq, err)) {
             return false;
         }
@@ -158,16 +159,38 @@ bool TableStateStore::resetFromBaseline(QSqlDatabase& db, const QStringList& tab
 }
 
 QByteArray TableStateStore::rowHash(const QVariantMap& row) {
-    // Serialise map as "key=value\n" pairs in sorted key order, then SHA-256.
+    // H-04 fix: use length-prefix + type-tag encoding to prevent constructible collisions.
+    // Format: quint32 col_count, then per-column: quint32 key_len, key_bytes,
+    //   quint8 type (0=NULL, 1=int64, 2=double, 3=text, 4=blob), then value.
+    // Columns are iterated in QMap (sorted) key order so hashes are deterministic.
     QByteArray data;
-    for (auto it = row.begin(); it != row.end(); ++it) {
-        data.append(it.key().toUtf8());
-        data.append('=');
-        data.append(it.value().toByteArray());
-        data.append('\n');
+    QDataStream ds(&data, QIODevice::WriteOnly);
+    ds.setByteOrder(QDataStream::BigEndian);
+    ds << quint32(row.size());
+    for (auto it = row.cbegin(); it != row.cend(); ++it) {
+        const QByteArray key = it.key().toUtf8();
+        ds << quint32(key.size());
+        ds.writeRawData(key.constData(), key.size());
+        const QVariant& v = it.value();
+        if (v.isNull()) {
+            ds << quint8(0);
+        } else if (v.type() == QVariant::ByteArray) {
+            ds << quint8(4);
+            const QByteArray ba = v.toByteArray();
+            ds << quint32(ba.size());
+            ds.writeRawData(ba.constData(), ba.size());
+        } else if (v.canConvert<qlonglong>()) {
+            ds << quint8(1) << qint64(v.toLongLong());
+        } else if (v.canConvert<double>()) {
+            ds << quint8(2) << double(v.toDouble());
+        } else {
+            ds << quint8(3);
+            const QByteArray str = v.toString().toUtf8();
+            ds << quint32(str.size());
+            ds.writeRawData(str.constData(), str.size());
+        }
     }
-    QByteArray full = QCryptographicHash::hash(data, QCryptographicHash::Sha256);
-    return full.left(16);
+    return QCryptographicHash::hash(data, QCryptographicHash::Sha256).left(16);
 }
 
 // ---------------------------------------------------------------------------
@@ -185,13 +208,13 @@ quint64 TableStateStore::hashToU64(const QByteArray& h) {
 }
 
 bool TableStateStore::updateRow(QSqlDatabase& db, const QString& table, qint64 streamEpoch,
-                                const QString& schemaFp, qint64 checksumDelta, qint64 rowCountDelta,
-                                qint64 highWaterSeq, QString* err) {
+                                const QString& schemaFp, quint64 add, quint64 sub,
+                                qint64 rowCountDelta, qint64 highWaterSeq, QString* err) {
     const quint64 oldSum = readChecksum(db, table, streamEpoch);
     const qint64 oldRows = readRowCount(db, table, streamEpoch);
 
-    // Modular addition on quint64 (wraps naturally).
-    const quint64 newSum = static_cast<quint64>(static_cast<qint64>(oldSum) + checksumDelta);
+    // M-02 fix: pure unsigned modular arithmetic — no signed overflow UB.
+    const quint64 newSum = oldSum + add - sub;
     const qint64 newRows = oldRows + rowCountDelta;
     const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
 

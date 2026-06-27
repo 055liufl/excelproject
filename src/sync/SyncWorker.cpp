@@ -236,6 +236,20 @@ void SyncWorker::run() {
         return;
     }
 
+    // H-03 fix: exercise the session API against the actual DB handle so that symbol
+    // mismatches or disabled PREUPDATE hooks are caught at init time, not at first write.
+    {
+        QString sessionErr;
+        if (!SqliteHandle::exerciseSession(h, canonicalSyncTables_, &sessionErr)) {
+            initError_ = QStringLiteral("E_SYNC_SESSION_UNAVAILABLE: session self-check failed: ") +
+                         sessionErr;
+            initSemaphore_.release();
+            wconn.close();
+            QSqlDatabase::removeDatabase(connName);
+            return;
+        }
+    }
+
     // Expose pointers for task closures (valid only within this run() lifetime)
     wconnPtr_ = &wconn;
     hPtr_ = h;
@@ -337,12 +351,27 @@ void SyncWorker::run() {
     // modules (ComparisonSession, BatchTransfer, diagnostics) can read the same expanded set.
     // H-13 fix: also publish the active stream epoch so the ComparisonSession factory reads
     // __sync_table_state at the correct epoch (instead of a 0 placeholder).
+    // H-01 fix: persist contextUuid to __sync_context_meta so it survives process restarts
+    // and allows alias-collision detection.
     {
         auto ctx = SyncContextRegistry::instance().getExisting(config_.sqlitePath());
         if (ctx) {
             if (!canonicalSyncTables_.isEmpty())
                 ctx->canonicalSyncTables = canonicalSyncTables_;
             ctx->streamEpoch = streamEpoch_;
+
+            if (!ctx->contextUuid.isEmpty()) {
+                QString uuidErr;
+                if (!SyncContextRegistry::ensureContextUuid(wconn, ctx->contextUuid, &uuidErr)) {
+                    initError_ = QStringLiteral("E_SYNC_CONTEXT_UUID_MISMATCH: ") + uuidErr;
+                    initSemaphore_.release();
+                    wconnPtr_ = nullptr;
+                    hPtr_ = nullptr;
+                    wconn.close();
+                    QSqlDatabase::removeDatabase(connName);
+                    return;
+                }
+            }
         }
     }
 
@@ -1492,8 +1521,10 @@ ImportResult SyncWorker::submitImportSync(const ImportOptions& opts, const QStri
             const qint64 prevSeqImport = localOriginSeq_;
             const qint64 originSeq = nextLocalOriginSeq();
             // C-02 fix: check sealInto() return value.
+            QByteArray capturedChangeset;
             if (!rec_->sealInto(hPtr_, *clog_, *wconnPtr_, txn, config_.nodeId(), streamEpoch_,
-                                config_.schemaVersion(), fp, 0, originSeq, &localSeq, &sealErr)) {
+                                config_.schemaVersion(), fp, 0, originSeq, &localSeq, &sealErr,
+                                /*pushId=*/QString(), &capturedChangeset)) {
                 rec_->abort();
                 txn.rollback();
                 rollbackOriginSeq(prevSeqImport);  // H-01 fix
@@ -1513,26 +1544,27 @@ ImportResult SyncWorker::submitImportSync(const ImportOptions& opts, const QStri
                 rollbackOriginSeq(prevSeqImport);
             }
 
-            // M-01 fix: update __sync_table_state after import so that DiffEngine sees
-            // accurate checksums. Use resetFromBaseline() which does a full scan of the
-            // relevant tables — safe because import batches are typically large and
-            // incremental applyMutations() would require parsing the captured changeset
-            // which is not available here without an extra SessionRecorder round-trip.
-            // Roll back the whole transaction on failure (M-03 consistency principle).
+            // M-01 fix: update __sync_table_state incrementally from the captured changeset
+            // instead of a full resetFromBaseline() scan. This is O(changed rows) rather
+            // than O(all sync table rows), which is much cheaper for large tables.
             if (!canonicalSyncTables_.isEmpty() && ts_) {
                 QString tsErr;
-                if (!ts_->resetFromBaseline(*wconnPtr_, canonicalSyncTables_, streamEpoch_, fp,
-                                            &tsErr)) {
-                    txn.rollback();
-                    rollbackOriginSeq(prevSeqImport);  // H-01 fix
-                    result.ok = false;
-                    RowError e;
-                    e.code = QLatin1String(err::E_SYNC_INIT);
-                    e.message =
-                        QStringLiteral("table_state reset failed after import: %1").arg(tsErr);
-                    result.errors.append(e);
-                    sp->set_value(result);
-                    return;
+                if (!capturedChangeset.isEmpty()) {
+                    const QList<TableMutation> muts = CapturedWriteTemplate::extractMutationsStatic(
+                        capturedChangeset, *wconnPtr_, canonicalSyncTables_);
+                    if (!ts_->applyMutations(*wconnPtr_, muts, streamEpoch_, fp, originSeq,
+                                             &tsErr)) {
+                        txn.rollback();
+                        rollbackOriginSeq(prevSeqImport);
+                        result.ok = false;
+                        RowError e;
+                        e.code = QLatin1String(err::E_SYNC_INIT);
+                        e.message =
+                            QStringLiteral("table_state update failed after import: %1").arg(tsErr);
+                        result.errors.append(e);
+                        sp->set_value(result);
+                        return;
+                    }
                 }
             }
 

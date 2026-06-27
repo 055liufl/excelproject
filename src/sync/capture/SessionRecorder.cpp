@@ -44,7 +44,8 @@ bool SessionRecorder::begin(sqlite3* h, const QStringList& syncTables, QString* 
 bool SessionRecorder::sealInto(sqlite3* h, ChangelogStore& store, QSqlDatabase& db, WriteTxn& txn,
                                const QString& origin, qint64 epoch, qint64 schemaVer,
                                const QString& schemaFp, qint64 parentSeq, qint64 originSeq,
-                               qint64* outLocalSeq, QString* err, const QString& pushId) {
+                               qint64* outLocalSeq, QString* err, const QString& pushId,
+                               QByteArray* outChangeset) {
     if (!session_) {
         if (err)
             *err = QStringLiteral("SessionRecorder not active");
@@ -73,6 +74,10 @@ bool SessionRecorder::sealInto(sqlite3* h, ChangelogStore& store, QSqlDatabase& 
             *outLocalSeq = 0;
         return true;
     }
+
+    // M-01 fix: expose changeset bytes to caller for incremental table_state updates.
+    if (outChangeset)
+        *outChangeset = changeset;
 
     bool ok = store.append(db, QStringLiteral("changeset"), origin,
                            /*sourcePeer=*/QString(), originSeq, parentSeq, epoch, schemaVer,

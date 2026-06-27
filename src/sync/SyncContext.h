@@ -83,6 +83,11 @@ class SyncContextRegistry {
     // Decrement ref; destroys context if refCount reaches 0.
     void release(const QString& canonicalKey);
 
+    // H-01 fix: persist contextUuid into __sync_context_meta so that the same physical
+    // database is always associated with the same UUID, even across process restarts.
+    // Returns false + sets *err if the DB already contains a different UUID (alias collision).
+    static bool ensureContextUuid(QSqlDatabase& db, const QString& uuid, QString* err);
+
    private:
     SyncContextRegistry() = default;
 

@@ -130,6 +130,12 @@ struct ProfileSpec {
     // Info-level diagnostics captured during ProfileLoader::load (e.g. "dateFormat overrides
     // date:fmt"). Not errors — non-blocking and carried for CLI/test inspection.
     QStringList loadWarnings;
+
+    // M-03 fix: draft-profile support. When AutoProfileBuilder cannot produce an executable
+    // profile (e.g. table has no PRIMARY KEY or UNIQUE constraint), it sets executable=false
+    // and populates issues so callers can surface the problems to the user rather than failing.
+    bool executable = true;
+    QStringList issues;
 };
 
 // Side-level override: if column declares an excel/db side, it replaces the entire profile side.

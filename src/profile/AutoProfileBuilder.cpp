@@ -51,12 +51,19 @@ bool AutoProfileBuilder::build(const TableInfo& table, ProfileSpec* out, QString
         }
     }
 
+    // M-03 fix: instead of returning false when no conflict key is available, produce a
+    // draft profile with executable=false and a descriptive issue entry. This lets callers
+    // surface the mapping draft (column list) for the user to review and complete.
+    // *err is NOT set here — a draft is not an error; callers check out->executable.
     if (conflictCols.isEmpty()) {
-        if (err)
-            *err = QString::fromLatin1(err::E_PROFILE_NO_CONFLICT_KEY) +
-                   QStringLiteral(": table '") + table.name +
-                   QStringLiteral("' has no PRIMARY KEY or UNIQUE constraint");
-        return false;
+        out->executable = false;
+        out->issues.append(QString::fromLatin1(err::E_PROFILE_NO_CONFLICT_KEY) +
+                           QStringLiteral(": table '") + table.name +
+                           QStringLiteral("' has no PRIMARY KEY or UNIQUE constraint; "
+                                          "please add a unique constraint or specify "
+                                          "conflict.columns manually"));
+        // Fall through: populate column list in the draft so the caller can inspect the
+        // field mapping and decide which columns to use as a conflict key.
     }
 
     RouteSpec route;
@@ -99,6 +106,7 @@ bool AutoProfileBuilder::build(const TableInfo& table, ProfileSpec* out, QString
         out->exportSpec.orderBy.append(conflictCols.first());
     }
 
+    // Return true for both executable and draft profiles; callers check out->executable.
     return true;
 }
 
@@ -109,6 +117,13 @@ QString AutoProfileBuilder::toJson(const ProfileSpec& profile) const {
     root.insert(QStringLiteral("sheet"), profile.sheet);
     root.insert(QStringLiteral("headerRow"), profile.headerRow);
     root.insert(QStringLiteral("mode"), QStringLiteral("singleTable"));
+    if (!profile.executable) {
+        root.insert(QStringLiteral("executable"), false);
+        QJsonArray issArr;
+        for (const auto& iss : profile.issues)
+            issArr.append(iss);
+        root.insert(QStringLiteral("issues"), issArr);
+    }
 
     if (!profile.routes.isEmpty()) {
         const RouteSpec& route = profile.routes[0];

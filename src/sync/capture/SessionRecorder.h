@@ -38,10 +38,12 @@ class SessionRecorder {
     // On success, *outLocalSeq is the assigned local_seq.
     // H-01 fix: pushId is forwarded to ChangelogStore::append so selection-push changesets
     // have their push_id recorded, enabling the broadcast barrier to block only the specific push.
+    // M-01 fix: optional *outChangeset receives the raw changeset bytes so callers can apply
+    // incremental TableMutation updates instead of a full resetFromBaseline() scan.
     bool sealInto(sqlite3* h, ChangelogStore& store, QSqlDatabase& db, WriteTxn& txn,
                   const QString& origin, qint64 epoch, qint64 schemaVer, const QString& schemaFp,
                   qint64 parentSeq, qint64 originSeq, qint64* outLocalSeq, QString* err,
-                  const QString& pushId = QString());
+                  const QString& pushId = QString(), QByteArray* outChangeset = nullptr);
 
     // Detach and discard the session without writing.
     void abort();

@@ -11,6 +11,7 @@
 #include <QSqlDatabase>
 #include <QSqlError>
 #include <QSqlQuery>
+#include <QSqlRecord>
 #include <QUuid>
 
 #include "service/ImportService.h"
@@ -29,6 +30,7 @@
 #include "sync/selection/ChunkStreamer.h"
 #include "sync/selection/ConsistencyCache.h"
 #include "sync/selection/FkClosureBuilder.h"
+#include "sync/selection/FrozenManifest.h"
 #include "sync/selection/SelectionResolver.h"
 #include <future>
 #include <limits>
@@ -1038,6 +1040,50 @@ bool SyncWorker::processBaselineResponseArtifact(const DecodeResult& dec,
         return false;
     }
 
+    // M-01 fix: after baseline apply, stamp each sync-table row in consistencyCache_ so that
+    // pruneConsistentDependencies() can skip rows that are already consistent with the center.
+    // Fingerprint format mirrors FkClosureBuilder::rowFingerprint(): SHA1 of "col\0val\0..." pairs.
+    if (!canonicalSyncTables_.isEmpty()) {
+        for (const QString& tbl : canonicalSyncTables_) {
+            const QString pkColStmt =
+                QStringLiteral("PRAGMA table_info(\"") +
+                QString(tbl).replace(QLatin1Char('"'), QLatin1String("\"\"")) +
+                QStringLiteral("\")");
+            QSqlQuery pkQ(*wconnPtr_);
+            if (!pkQ.exec(pkColStmt))
+                continue;
+            QString pkCol;
+            while (pkQ.next()) {
+                if (pkQ.value(5).toInt() == 1) {
+                    pkCol = pkQ.value(1).toString();
+                    break;
+                }
+            }
+            if (pkCol.isEmpty())
+                continue;
+
+            QSqlQuery rowQ(*wconnPtr_);
+            if (!rowQ.exec(QStringLiteral("SELECT * FROM \"") +
+                           QString(tbl).replace(QLatin1Char('"'), QLatin1String("\"\"")) +
+                           QStringLiteral("\"")))
+                continue;
+
+            const QSqlRecord rec = rowQ.record();
+            while (rowQ.next()) {
+                const QString pk = rowQ.value(pkCol).toString();
+                QByteArray buf;
+                for (int ci = 0; ci < rec.count(); ++ci) {
+                    buf += rec.fieldName(ci).toUtf8();
+                    buf += '\0';
+                    buf += rowQ.value(ci).toString().toUtf8();
+                    buf += '\0';
+                }
+                const QByteArray fp = QCryptographicHash::hash(buf, QCryptographicHash::Sha1);
+                consistencyCache_.stampFromAuthoritative(*wconnPtr_, tbl, pk, fp);
+            }
+        }
+    }
+
     // Remove from in-flight tracking so the next gap scan doesn't re-request.
     baselineRequestsInFlight_.remove(resp.pendingArtifactName);
 
@@ -1939,6 +1985,19 @@ void SyncWorker::enqueueSelectionPush(const SyncSelection& selection,
         // are ACKed, preventing stale or unrelated chunk ACKs from prematurely completing
         // the foreground sync() caller.
         pendingPushId_ = pushId;
+
+        // H-02 fix: persist FrozenManifest entries BEFORE writing outbox so that
+        // interrupted pushes can be resumed from the stored snapshot rather than
+        // re-reading the live database (which may have changed since the snapshot).
+        if (!pushId.isEmpty() && wconnPtr_) {
+            FrozenManifest fm;
+            for (const auto& chunk : chunks) {
+                QString fmErr;
+                fm.save(*wconnPtr_, chunk.pushId, chunk.chunkSeq, chunk.entries, &fmErr);
+                // Non-fatal: resume may re-read the DB, but functionality is not broken.
+                Q_UNUSED(fmErr)
+            }
+        }
 
         // M-05 / C-02: create push_progress(streaming) on the worker thread BEFORE writing chunks.
         // L-01 fix: ON CONFLICT DO UPDATE so re-sends refresh total_chunks/status/updated_ms.

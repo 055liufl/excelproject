@@ -1,5 +1,6 @@
 #include "ConsistencyCache.h"
 
+#include <QDateTime>
 #include <QSqlError>
 #include <QSqlQuery>
 #include <QVariant>
@@ -69,13 +70,16 @@ void ConsistencyCache::stampFromAuthoritative(QSqlDatabase& db, const QString& t
 
 bool ConsistencyCache::persistStamp(QSqlDatabase& db, const QString& table, const QString& pk,
                                     const QByteArray& fp) {
+    // M-01 fix: include updated_ms (NOT NULL in DDL) to prevent INSERT failure.
     QSqlQuery q(db);
     q.prepare(
         QStringLiteral("INSERT OR REPLACE INTO __sync_consistency_cache"
-                       " (table_name, primary_key, center_fingerprint) VALUES (?, ?, ?)"));
+                       " (table_name, primary_key, center_fingerprint, updated_ms)"
+                       " VALUES (?, ?, ?, ?)"));
     q.addBindValue(table);
     q.addBindValue(pk);
     q.addBindValue(fp);
+    q.addBindValue(QDateTime::currentMSecsSinceEpoch());
     return q.exec();
 }
 

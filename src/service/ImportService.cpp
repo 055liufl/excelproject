@@ -41,12 +41,14 @@ QString buildIdentityKey(const LookupSpec& lk) {
 // Returns an invalid QVariant on type-mismatch (cast failure).
 // Numeric zero is a valid (non-empty) value.
 QVariant castToAffinity(const QVariant& raw, const ColumnInfo& gCol) {
+    // Applies SQLite column affinity coercion per row-lookup spec §affinity-coercion table.
+    // Priority order matches SQLite's own affinity determination rules.
     QString type = gCol.declaredType.trimmed().toUpper();
     if (type.contains(QStringLiteral("INT"))) {
         bool ok;
         qlonglong iv = raw.toLongLong(&ok);
         if (!ok)
-            return QVariant();  // cast failed
+            return QVariant();
         return QVariant(iv);
     }
     if (type.contains(QStringLiteral("REAL")) || type.contains(QStringLiteral("FLOA")) ||
@@ -57,14 +59,21 @@ QVariant castToAffinity(const QVariant& raw, const ColumnInfo& gCol) {
             return QVariant();
         return QVariant(dv);
     }
-    // H-7 fix: BLOB columns keep binary payload; NONE/TEXT use string.
     if (type.contains(QStringLiteral("BLOB"))) {
         if (raw.type() == QVariant::ByteArray)
             return raw;
         const QByteArray ba = raw.toByteArray();
         return ba.isEmpty() ? QVariant() : QVariant(ba);
     }
-    return QVariant(raw.toString());  // TEXT / NONE: string affinity
+    // TEXT affinity: declared type contains CHAR, CLOB, or TEXT.
+    if (type.contains(QStringLiteral("CHAR")) || type.contains(QStringLiteral("CLOB")) ||
+        type.contains(QStringLiteral("TEXT"))) {
+        return QVariant(raw.toString());
+    }
+    // H-01 fix: empty type (BLOB/none affinity) and NUMERIC affinity (NUMERIC, DECIMAL,
+    // BOOLEAN, DATE, DATETIME, etc.) must preserve the raw QVariant, not coerce to string.
+    // Per row-lookup spec: "BLOB or no declared type → preserve raw QVariant".
+    return raw;
 }
 
 // Serialize a match-key tuple to a stable, type-aware string for use as QHash key.

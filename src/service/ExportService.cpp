@@ -139,6 +139,8 @@ QString makeTupleKey(const QVector<QVariant>& values) {
 // Cast a QVariant to the declared type affinity of a G-table column.
 // H-7 fix: BLOB columns keep binary payload; don't coerce to empty string.
 QVariant castToAffinity(const QVariant& raw, const ColumnInfo& gCol) {
+    // Mirrors the same function in ImportService.cpp — must stay in sync.
+    // Applies SQLite column affinity coercion per export-reverse-lookup spec §coercion-semantics.
     QString type = gCol.declaredType.trimmed().toUpper();
     if (type.contains(QStringLiteral("INT"))) {
         bool ok;
@@ -157,7 +159,13 @@ QVariant castToAffinity(const QVariant& raw, const ColumnInfo& gCol) {
         const QByteArray ba = raw.toByteArray();
         return ba.isEmpty() ? QVariant() : QVariant(ba);
     }
-    return QVariant(raw.toString());  // TEXT / NONE
+    // TEXT affinity: declared type contains CHAR, CLOB, or TEXT.
+    if (type.contains(QStringLiteral("CHAR")) || type.contains(QStringLiteral("CLOB")) ||
+        type.contains(QStringLiteral("TEXT"))) {
+        return QVariant(raw.toString());
+    }
+    // H-01 fix: empty type (none/BLOB affinity) and NUMERIC affinity preserve raw QVariant.
+    return raw;
 }
 
 // Per-hit storage: A-column values from G (match[].G_column order) + cardinality count.

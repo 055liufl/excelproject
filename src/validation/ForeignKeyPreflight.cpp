@@ -13,10 +13,14 @@ namespace dbridge::detail {
 
 bool ForeignKeyPreflight::check(QVector<RowContext>& contexts, const QVector<RouteSpec>& allRoutes,
                                 QSqlDatabase& db, const QString& sheet, ErrorCollector* errors) {
+    // M-02 fix: exclude already-failed routes from the in-batch parent cache.
+    // Including failed payloads would let a child route incorrectly pass FK preflight
+    // even when its parent will not actually be written (because it failed earlier).
     QHash<QString, QVector<RoutePayload>> batchParentPayloads;
     for (const auto& ctx : contexts) {
-        for (const auto& payload : ctx.payloads) {
-            batchParentPayloads[payload.table].append(payload);
+        for (int pi = 0; pi < ctx.payloads.size(); ++pi) {
+            if (!ctx.failedRouteIndices.contains(pi))
+                batchParentPayloads[ctx.payloads[pi].table].append(ctx.payloads[pi]);
         }
     }
 

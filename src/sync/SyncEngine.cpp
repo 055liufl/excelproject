@@ -225,25 +225,14 @@ bool SyncEngine::sync(QString* err) {
 bool SyncEngine::stop(QString* err) {
     if (!initialized_)
         return true;
-    if (worker_) {
-        worker_->requestStop();
-        bool finished = worker_->wait(3000);
-        if (!finished) {
-            if (err)
-                *err = QStringLiteral("Worker did not stop in time");
-            return false;
-        }
-    }
+    // C-01 fix: stop() cancels only the current foreground operation (sync/syncSelected), NOT
+    // the background SyncWorker loop. The worker keeps running: inbox scan, apply, ACK, broadcast.
+    // Only the ACK wait for the active foreground operation is cancelled; the gate is released so
+    // the next caller can start a new foreground operation.
+    if (worker_)
+        worker_->cancelAckWait();
     setProgress(SyncState::Stopped);
     releaseGateIfTerminal(SyncState::Stopped);  // H-02 fix: gate must be released on stop
-    // M-10 fix: clear context-bound worker callbacks so a surviving ComparisonSession (which may
-    // still hold the shared SyncContext) cannot dispatch save()/rescan() to a stopped worker.
-    if (ctx_) {
-        ctx_->importFn = nullptr;
-        ctx_->workerWriteFn = nullptr;
-        ctx_->workerCaptureWriteFn = nullptr;
-        ctx_->rescanFn = nullptr;
-    }
     return true;
 }
 
@@ -276,6 +265,13 @@ bool SyncEngine::syncSelected(const SyncSelection& selection, QString* err) {
     if (!initialized_) {
         if (err)
             *err = QStringLiteral("Not initialized");
+        return false;
+    }
+    // H-03 fix: pre-validate empty selection synchronously before occupying the gate.
+    // Per spec, empty/invalid selection is a pre-acceptance error that must not acquire gate.
+    if (selection.isEmpty()) {
+        if (err)
+            *err = QString::fromLatin1(err::E_SYNC_SELECTION_EMPTY);
         return false;
     }
     if (!ctx_->gate.tryAcquire(err))

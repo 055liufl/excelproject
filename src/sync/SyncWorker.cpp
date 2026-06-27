@@ -351,10 +351,26 @@ void SyncWorker::run() {
     // modules (ComparisonSession, BatchTransfer, diagnostics) can read the same expanded set.
     // H-13 fix: also publish the active stream epoch so the ComparisonSession factory reads
     // __sync_table_state at the correct epoch (instead of a 0 placeholder).
-    // H-01 fix: persist contextUuid to __sync_context_meta so it survives process restarts
-    // and allows alias-collision detection.
+    // H-01 fix: persist contextUuid to __sync_context_meta so it survives process restarts.
+    // M-03 fix: use the resolved main-library path from the open connection (PRAGMA database_list)
+    // instead of the raw config path, so URI/relative/alias paths find the same SyncContext.
     {
-        auto ctx = SyncContextRegistry::instance().getExisting(config_.sqlitePath());
+        // Resolve the actual main DB path from the open write connection.
+        QString resolvedPath = config_.sqlitePath();
+        {
+            QSqlQuery pragmaQ(wconn);
+            if (pragmaQ.exec(QStringLiteral("PRAGMA database_list"))) {
+                while (pragmaQ.next()) {
+                    if (pragmaQ.value(1).toString() == QLatin1String("main")) {
+                        const QString p = pragmaQ.value(2).toString();
+                        if (!p.isEmpty())
+                            resolvedPath = QFileInfo(p).absoluteFilePath();
+                        break;
+                    }
+                }
+            }
+        }
+        auto ctx = SyncContextRegistry::instance().getExisting(resolvedPath);
         if (ctx) {
             if (!canonicalSyncTables_.isEmpty())
                 ctx->canonicalSyncTables = canonicalSyncTables_;

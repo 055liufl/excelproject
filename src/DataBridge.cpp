@@ -3,6 +3,7 @@
 #include "dbridge/Errors.h"
 
 #include <QFile>
+#include <QFileInfo>
 #include <QJsonDocument>
 #include <QSqlError>
 #include <QSqlQuery>
@@ -58,6 +59,20 @@ bool DataBridgePrivate::openDb(const ConnectionSpec& spec, QString* err) {
     }
     q.exec(QStringLiteral("PRAGMA foreign_keys = ON"));
 
+    // H-02 fix: resolve the actual main-library path via PRAGMA database_list so that
+    // URI paths, relative paths and SQLite aliases all map to the same OS file identity.
+    resolvedDbPath_ = spec.sqlitePath;  // fallback
+    if (q.exec(QStringLiteral("PRAGMA database_list"))) {
+        while (q.next()) {
+            if (q.value(1).toString() == QLatin1String("main")) {
+                const QString p = q.value(2).toString();
+                if (!p.isEmpty())
+                    resolvedDbPath_ = QFileInfo(p).absoluteFilePath();
+                break;
+            }
+        }
+    }
+
     dbOpen_ = true;
     return true;
 }
@@ -81,6 +96,30 @@ bool DataBridgePrivate::loadProfileDoc(const QJsonDocument& doc, QString* err) {
     ProfileSpec spec;
     if (!loader.load(doc, &spec, err))
         return false;
+
+    // H-01 fix: run schema/cross-field validation at load time (not only at import/export time)
+    // so callers get immediate feedback for structurally invalid profiles.
+    // Requires an open DB for cross-field column/table checks; skips if DB not yet opened.
+    if (dbOpen_) {
+        QString catErr;
+        if (refreshCatalog(&catErr)) {
+            // Use export-mode validation: checks table/column existence, conflict keys,
+            // columnOrder, fkInject, reverse lookup — but not Excel-header-specific rules.
+            ErrorCollector valErrors;
+            ProfileValidator validator;
+            if (!validator.validateForExport(spec, catalog_, &valErrors)) {
+                if (err) {
+                    QStringList msgs;
+                    for (const auto& e : valErrors.list())
+                        msgs.append(e.message.isEmpty() ? e.code : e.message);
+                    *err = msgs.isEmpty() ? QStringLiteral("Profile validation failed")
+                                          : msgs.join(QStringLiteral("; "));
+                }
+                return false;
+            }
+        }
+    }
+
     profiles_[spec.name] = spec;
     return true;
 }
@@ -250,7 +289,9 @@ ImportResult DataBridge::importExcel(const QString& xlsxPath, const ImportOption
 }
 
 QString DataBridge::dbPath() const {
-    return d_->dbOpen_ ? d_->db_.databaseName() : QString();
+    // H-02 fix: return the resolved canonical path (from PRAGMA database_list) so that
+    // BatchTransfer and other callers use the same OS-identity key as SyncContextRegistry.
+    return d_->dbOpen_ ? d_->resolvedDbPath_ : QString();
 }
 
 ImportResult DataBridge::runImportOnDb(const QString& xlsxPath, const ImportOptions& options,

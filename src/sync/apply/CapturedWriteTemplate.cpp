@@ -261,15 +261,17 @@ WriteResult CapturedWriteTemplate::branchBC(const WriteParams& p) {
     preScan.reserve(p.mutations.size());
     for (const RowMutation& m : p.mutations) {
         PreScan ps;
-        // pkHash
-        QByteArray pkMat;
-        for (int i = 0; i < m.columns.size(); ++i) {
-            if (m.pkColumns.contains(m.columns[i])) {
-                pkMat.append(m.values[i].toString().toUtf8());
-                pkMat.append('\0');
+        // H-04 fix: use canonical type-tagged encoding (same as RowWinnerStore::pkHash)
+        // so TableMutation.pkHash is consistent with the winner-store key space.
+        {
+            QVariantMap pkMap;
+            for (int i = 0; i < m.columns.size(); ++i) {
+                if (m.pkColumns.contains(m.columns[i]))
+                    pkMap[m.columns[i]] = m.values[i];
             }
+            const QString pkHex = RowWinnerStore::pkHash(pkMap);
+            ps.pkHash = QByteArray::fromHex(pkHex.toLatin1());
         }
-        ps.pkHash = QCryptographicHash::hash(pkMat, QCryptographicHash::Sha256).left(16);
         // M-02 fix: afterHash must use the same column-name-sorted QVariantMap format as
         // TableStateStore::rowHash() so that incremental mutations produce checksums
         // consistent with resetFromBaseline().  Build a QVariantMap keyed by column name
@@ -565,38 +567,44 @@ QList<TableMutation> CapturedWriteTemplate::extractMutations(const QByteArray& c
             return TableStateStore::rowHash(rowMap);
         };
 
+        // H-04 fix: use canonical type-tagged encoding via RowWinnerStore::pkHash()
+        // so pkHash in extractMutations() is consistent with the winner-store key space.
         auto pkHashStr = [&](bool useNew) -> QString {
-            QByteArray mat;
+            QVariantMap pkMap;
             for (int i = 0; i < nCol; i++) {
                 if (!pkMask || !pkMask[i])
                     continue;
+                const QString cname =
+                    (i < colNames.size()) ? colNames[i] : QStringLiteral("_col_%1").arg(i);
                 sqlite3_value* val = nullptr;
                 if (useNew)
                     sqlite3changeset_new(iter, i, &val);
                 else
                     sqlite3changeset_old(iter, i, &val);
                 if (!val) {
-                    mat.append('\0');
+                    pkMap[cname] = QVariant();
                     continue;
                 }
                 const int vt = sqlite3_value_type(val);
                 if (vt == SQLITE_TEXT) {
                     const char* txt = reinterpret_cast<const char*>(sqlite3_value_text(val));
-                    mat.append(txt ? txt : "");
+                    pkMap[cname] = QString::fromUtf8(txt ? txt : "");
                 } else if (vt == SQLITE_INTEGER) {
-                    mat.append(QByteArray::number(static_cast<qint64>(sqlite3_value_int64(val))));
+                    pkMap[cname] = QVariant(static_cast<qlonglong>(sqlite3_value_int64(val)));
+                } else if (vt == SQLITE_FLOAT) {
+                    pkMap[cname] = sqlite3_value_double(val);
                 } else if (vt == SQLITE_BLOB) {
                     const void* b = sqlite3_value_blob(val);
                     const int bl = sqlite3_value_bytes(val);
-                    if (b && bl > 0)
-                        mat.append(static_cast<const char*>(b), bl);
+                    pkMap[cname] = (b && bl > 0)
+                                       ? QVariant(QByteArray(static_cast<const char*>(b), bl))
+                                       : QVariant(QByteArray());
+                } else {
+                    pkMap[cname] = QVariant();
                 }
-                mat.append('\0');
             }
-            if (mat.isEmpty())
-                mat = rowHashFromIter(useNew);  // fallback: hash all cols
-            QByteArray h = QCryptographicHash::hash(mat, QCryptographicHash::Sha256).left(16);
-            return QString::fromLatin1(h.toHex());
+            return pkMap.isEmpty() ? QString::fromLatin1(rowHashFromIter(useNew).toHex())
+                                   : RowWinnerStore::pkHash(pkMap);
         };
 
         TableMutation tm;
@@ -718,38 +726,43 @@ QList<TableMutation> CapturedWriteTemplate::extractMutationsStatic(const QByteAr
             return TableStateStore::rowHash(rowMap);
         };
 
+        // H-04 fix: same canonical encoding as extractMutations() above.
         auto pkHashStr = [&](bool useNew) -> QString {
-            QByteArray mat;
+            QVariantMap pkMap;
             for (int i = 0; i < nCol; i++) {
                 if (!pkMask || !pkMask[i])
                     continue;
+                const QString cname =
+                    (i < colNames.size()) ? colNames[i] : QStringLiteral("_col_%1").arg(i);
                 sqlite3_value* val = nullptr;
                 if (useNew)
                     sqlite3changeset_new(iter, i, &val);
                 else
                     sqlite3changeset_old(iter, i, &val);
                 if (!val) {
-                    mat.append('\0');
+                    pkMap[cname] = QVariant();
                     continue;
                 }
                 const int vt = sqlite3_value_type(val);
                 if (vt == SQLITE_TEXT) {
                     const char* txt = reinterpret_cast<const char*>(sqlite3_value_text(val));
-                    mat.append(txt ? txt : "");
+                    pkMap[cname] = QString::fromUtf8(txt ? txt : "");
                 } else if (vt == SQLITE_INTEGER) {
-                    mat.append(QByteArray::number(static_cast<qint64>(sqlite3_value_int64(val))));
+                    pkMap[cname] = QVariant(static_cast<qlonglong>(sqlite3_value_int64(val)));
+                } else if (vt == SQLITE_FLOAT) {
+                    pkMap[cname] = sqlite3_value_double(val);
                 } else if (vt == SQLITE_BLOB) {
                     const void* b = sqlite3_value_blob(val);
                     const int bl = sqlite3_value_bytes(val);
-                    if (b && bl > 0)
-                        mat.append(static_cast<const char*>(b), bl);
+                    pkMap[cname] = (b && bl > 0)
+                                       ? QVariant(QByteArray(static_cast<const char*>(b), bl))
+                                       : QVariant(QByteArray());
+                } else {
+                    pkMap[cname] = QVariant();
                 }
-                mat.append('\0');
             }
-            if (mat.isEmpty())
-                mat = rowHashFromIter(useNew);
-            return QString::fromLatin1(
-                QCryptographicHash::hash(mat, QCryptographicHash::Sha256).left(16).toHex());
+            return pkMap.isEmpty() ? QString::fromLatin1(rowHashFromIter(useNew).toHex())
+                                   : RowWinnerStore::pkHash(pkMap);
         };
 
         TableMutation tm;

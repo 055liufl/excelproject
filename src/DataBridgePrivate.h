@@ -33,6 +33,7 @@ class DataBridgePrivate {
     QSqlDatabase db_;
     QString connName_;
     bool dbOpen_ = false;
+    QString resolvedDbPath_;  // H-02 fix: canonical main-library path from PRAGMA database_list
     std::atomic<bool> syncActive_{
         false};  // L-01 fix: atomic to avoid data race between SyncEngine init and importExcel
     QStringList syncTables_;  // M-02: tables monitored by sync; empty = no info (guard all)

@@ -1,309 +1,87 @@
-# 代码审查报告 — SQLite同步工具+Excel导入导出
+# 代码审查报告 — 第三十一轮
 
 ## 总览
 
-- 审查范围：`src/` 目录下全部 `.h` / `.cpp` 源文件，共 122 个文件；重点覆盖 profile 加载/校验、Excel 导入导出、lookup/fkInject/time-format、SQLite 同步捕获/应用/传输/table_state 等实现。
-- 规范文档列表：
-  1. `specs/Qt-SQLite-Excel-批量导入导出-设计文档.md`
-  2. `specs/MVP-Qt-SQLite-Excel-批量导入导出-实现设计.md`
-  3. `specs/SQLite-同步工具-设计文档.md`
-  4. `specs/SQLite-同步工具-plan.md`
-  5. `openspec/specs/export-column-order/spec.md`
-  6. `openspec/specs/export-reverse-lookup/spec.md`
-  7. `openspec/specs/fk-injection/spec.md`
-  8. `openspec/specs/row-lookup/spec.md`
-  9. `openspec/specs/time-format/spec.md`
-- 总体评分：78 / 100
-- 问题数量统计：Critical 0，High 4，Medium 3，Low 1。
+- 审查范围：`src/` 目录下全部源文件，共 122 个文件，约 17,676 行；对照 9 个指定规范文档逐项审查。
+- 总体评分：80 / 100
+- 问题数量统计：Critical 0，High 4，Medium 2，Low 2。
+- 回归结论：上一轮的 Session 运行期自检、`table_state` 规范行编码、无符号模加、导入后增量维护、auto profile draft 输出已基本闭合；但 `SyncContext` 身份修复引入重启后 UUID 不匹配，反向 lookup 的 route-local 语义仍未闭合，selection push 完成状态会被重复分片回退。
 
-主要结论：Excel 导入主链路的大部分关键要求已经实现，包括 `ON CONFLICT DO UPDATE`、绑定参数、批量 lookup 预取、fkInject 数组形态、route-local 失败集合、时间格式解析、`columnOrder` 校验以及多数同步三分支骨架。但同步上下文身份、Session 初始化硬门禁、反向 lookup 的 route-local 导出语义和 `table_state` 校验和规范仍有明显偏差，会影响同步正确性或导出结果可靠性。
+## Critical 问题
 
-## Critical 问题（必须修复，阻断功能）
+本轮未确认到 Critical 级别问题。当前实现有多处 High 级正确性问题，建议发布前修复。
 
-本轮未确认到 Critical 级别问题。当前实现不是完全不可运行，但存在 High 级正确性问题，建议在发布前修复。
+## High 问题
 
-## High 问题（严重，影响正确性）
+### H-01：`context_uuid` 持久化实现会导致进程重启后同步初始化失败
 
-### H-01：SyncContext 未按实际 SQLite 主库身份解析，也未落库校验 `context_uuid`
+- 文件位置：`src/sync/SyncContext.cpp:67`、`src/sync/SyncContext.cpp:84`、`src/sync/SyncContext.cpp:117`、`src/sync/SyncWorker.cpp:357`
+- 违反规范：`specs/SQLite-同步工具-设计文档.md` §4.3；`specs/SQLite-同步工具-plan.md` T1.0b / R-06。
+- 问题描述：`getOrCreate()` 每次新建进程内 `SyncContext` 都生成新的随机 `contextUuid`，`ensureContextUuid()` 却要求库内已存在的 `context_uuid` 必须等于这个新随机值。首次初始化会写入 UUID；进程退出后再次初始化同一个库时，新 UUID 与库内旧 UUID 必然不一致，`SyncWorker` 报 `E_SYNC_CONTEXT_UUID_MISMATCH`。
+- 影响：同步库一旦写入过 `__sync_context_meta.context_uuid`，后续进程重启可能无法再进入同步模式。这不是兜底校验，而是把持久身份当成一次性随机会话 ID。
+- 修复建议：`ensureContextUuid()` 应返回库内已存在 UUID 并回填到 `ctx->contextUuid`；仅当同一个 OS 文件身份下发现两个不同的库内 UUID，或同一进程内已有 context 与库内 UUID 不一致时才报错。首次没有 UUID 时才生成并写入。
 
-- 文件位置：`src/sync/SyncContext.cpp:20`，`src/sync/SyncContext.cpp:65`，`src/sync/SyncContext.h:28`
-- 问题描述：`SyncContextRegistry::canonicalKey()` 直接对调用方传入的 `sqlitePath` 做 `stat()` / Windows file index。规范要求先打开 SQLite 连接，通过 `PRAGMA database_list` 读取 `main` 库的已解析路径，再基于 OS 文件身份生成 key，并在库内写入/校验 `context_uuid` 作为兜底。当前 `contextUuid` 只在内存生成，未写入任何 `__sync_*` 元数据表；同时 URI 路径、SQLite 解析后的相对路径、新建库路径迁移等场景没有按规范处理。
-- 违反规范：`specs/SQLite-同步工具-设计文档.md` §4.3 / G-07；`specs/SQLite-同步工具-plan.md` T1.0b。
-- 影响：同一物理库通过 SQLite URI、不同路径表示或平台特定路径规则打开时，可能无法复用同一个 `SyncContext`，从而破坏前台互斥 gate 和单写线程假设；反过来，也缺少库内 UUID 兜底来防止错误合并两个物理库上下文。
-- 修复建议：把 context key 解析移到“已打开 SQLite 主库”之后，使用 `PRAGMA database_list` 的 main 路径做 OS identity，并在同一库内持久化 UUID。
+### H-02：`SyncContext` key 仍未按 SQLite 实际 main 库路径解析，URI/别名场景未闭合
 
-```cpp
-// 示例：打开连接后解析 main 库真实路径，再生成 registry key。
-static QString resolvedMainPath(QSqlDatabase& db, QString* err) {
-    QSqlQuery q(db);
-    if (!q.exec(QStringLiteral("PRAGMA database_list"))) {
-        if (err) *err = q.lastError().text();
-        return {};
-    }
-    while (q.next()) {
-        if (q.value(1).toString() == QLatin1String("main"))
-            return QFileInfo(q.value(2).toString()).canonicalFilePath();
-    }
-    if (err) *err = QStringLiteral("main database not found");
-    return {};
-}
+- 文件位置：`src/sync/SyncContext.cpp:22`、`src/sync/SyncContext.cpp:54`、`src/sync/SyncEngine.cpp:52`
+- 违反规范：`specs/SQLite-同步工具-设计文档.md` §4.3；`specs/SQLite-同步工具-plan.md` T1.0b DoD。
+- 问题描述：`canonicalKey()` 仍直接对调用方传入的 `sqlitePath` 做 `stat()` / Windows file identity，未在打开 SQLite 后通过 `PRAGMA database_list` 读取 `main` 库解析路径。规范明确要求先以 SQLite 连接解析 URI、相对路径和主库真实路径，再使用 OS 文件身份作为 registry key。
+- 影响：`file:foo.db?...` URI、相对路径、SQLite 解析后的路径、尚未创建库路径等情况下仍可能无法合并为同一个 `SyncContext`，破坏同库单写线程和前台互斥假设；也可能错误拒绝 SQLite 本可创建的新库。
+- 修复建议：把 registry 获取延后到 `QSqlDatabase` 打开后，基于 `PRAGMA database_list` 中 `main` 的实际路径生成 key；对未建库的临时路径按规范使用受限的临时 path key，并在建库后升级为 OS identity。
 
-static bool ensureContextUuid(QSqlDatabase& db, const QString& expected, QString* err) {
-    QSqlQuery ddl(db);
-    if (!ddl.exec(QStringLiteral(
-            "CREATE TABLE IF NOT EXISTS __sync_context_meta("
-            "k TEXT PRIMARY KEY, v TEXT NOT NULL)"))) {
-        if (err) *err = ddl.lastError().text();
-        return false;
-    }
+### H-03：反向 lookup `exportOnMissing:"error"` 仍跳过整条 Excel 行
 
-    QSqlQuery sel(db);
-    sel.prepare(QStringLiteral("SELECT v FROM __sync_context_meta WHERE k='context_uuid'"));
-    if (!sel.exec()) {
-        if (err) *err = sel.lastError().text();
-        return false;
-    }
-    if (sel.next())
-        return sel.value(0).toString() == expected;
+- 文件位置：`src/service/ExportService.cpp:441`、`src/service/ExportService.cpp:480`、`src/service/ExportService.cpp:520`、`src/service/ExportService.cpp:778`、`src/service/ExportService.cpp:962`
+- 违反规范：`openspec/specs/export-reverse-lookup/spec.md` 中 `exportOnMissing` route-local 语义。
+- 问题描述：`resolveAHeaders()` 在 NULL H 值或未命中 G 表时仍设置 `*rowSkip = true` 并返回；调用方随后 `continue`，整条 Excel 行被跳过。虽然调用方传入了 `failedAHeaders`，但 miss 分支没有填充该集合，注释“只空出失败列”与实际行为相反。
+- 影响：MultiTable/Mixed 导出时，一个 route 的 lookup miss 会丢掉同一 Excel 行中其他 route 已可导出的字段，违反“other routes contributing to the same Excel row are unaffected”。当前 `tests/unit/tst_reverse_lookup_export.cpp` 还把“整行跳过”写成期望，测试本身也与规范冲突。
+- 修复建议：把 NOT_FOUND / NULL H 的 `error` 分支改为 route-local 失败：记录失败 lookup 的 A headers 或 route id，输出时仅清空该 route 贡献的 A cells；只有 ambiguity 或结构性不可恢复错误才整行跳过。
 
-    QSqlQuery ins(db);
-    ins.prepare(QStringLiteral(
-        "INSERT INTO __sync_context_meta(k, v) VALUES('context_uuid', ?)"));
-    ins.addBindValue(expected);
-    return ins.exec();
-}
-```
+### H-04：重复 selection push 分片会把已完成 `push_progress` 回退为 `streaming`
 
-### H-02：反向 lookup `exportOnMissing:"error"` 会跳过整条导出行，而不是只跳过声明 route 的贡献
+- 文件位置：`src/sync/SyncWorker.cpp:717`、`src/sync/SyncWorker.cpp:724`、`src/sync/apply/CapturedWriteTemplate.cpp:196`、`src/sync/SyncWorker.cpp:1210`
+- 违反规范：`specs/SQLite-同步工具-设计文档.md` §5.5 / §6；`specs/SQLite-同步工具-plan.md` T2.9。
+- 问题描述：`processSelectionPushArtifact()` 对任意到达分片执行 `ON CONFLICT(push_id) DO UPDATE SET status='streaming'`。如果一个已完成 push 的重复分片到达，`CapturedWriteTemplate` 会因 `push_chunk_progress` 已 applied 而幂等 no-op 返回，不会重新把 `push_progress` 标回 `done`。随后 `broadcastTopeer()` 看到该 `push_id` 状态不是 `done/failed`，会继续跳过相关 changelog。
+- 影响：一次重复投递即可把已完成 push 重新置为未完成状态，导致该 push 产生的 changeset 被永久挡在广播屏障后，中心到其他节点不再收敛。
+- 修复建议：`ON CONFLICT` 时不要无条件覆盖 `done/failed`；可使用 `WHERE status NOT IN ('done','failed')`，或在发现分片已 applied 且全部 chunks 已 applied 时重新保持/恢复 `done`。
 
-- 文件位置：`src/service/ExportService.cpp:479`，`src/service/ExportService.cpp:503`，`src/service/ExportService.cpp:779`，`src/service/ExportService.cpp:963`
-- 问题描述：`resolveAHeaders()` 遇到 NULL H 值或未命中 G 表时，将 `*rowSkip = true` 并返回；调用方随后 `continue`，整条 Excel 输出行被丢弃。规范要求 `exportOnMissing:"error"` 对声明 lookup 的 route 生效，“other routes contributing to the same Excel row are unaffected”。在多表 auto-join 或 Mixed 导出中，这会把同一 Excel 行中父 route / 兄弟 route 已经可导出的字段一并丢掉。
-- 违反规范：`openspec/specs/export-reverse-lookup/spec.md` 的 `exportOnMissing` 行为和 row-resilient 要求。
-- 影响：导出数据丢失，尤其是父表字段本来可导出、子 route 的反向 lookup 缺失时，当前实现会连父表字段也不写。
-- 修复建议：把 `rowSkip` 改为 route-local 失败集合，例如记录失败 route 或失败 header，最终只屏蔽该 route 的 A headers / 该 route 拥有的输出字段；不要在 `E_REVERSE_LOOKUP_NOT_FOUND` 时整行 `continue`。只有无法安全构造整行的结构性错误才整行跳过。
+## Medium 问题
 
-```cpp
-struct ReverseResolution {
-    QHash<QString, QVariant> aValues;
-    QSet<QString> failedAHeaders;
-    QSet<QString> failedRouteTables;
-    bool fatalRowSkip = false;
-};
+### M-01：`__sync_row_winner.pk_hash` 仍使用非规范编码，可能串行化碰撞
 
-// NOT_FOUND: route-local error，不设置 fatalRowSkip。
-if (lk.exportOnMissing == QLatin1String(ExportOnMissing::kError)) {
-    errors->add(sheet, rowIndex, lk.name, tkey,
-                QString::fromLatin1(err::E_REVERSE_LOOKUP_NOT_FOUND),
-                message);
-    out.failedRouteTables.insert(route.table);
-    for (const auto& mp : lk.match)
-        out.failedAHeaders.insert(mp.second);
-    continue;
-}
+- 文件位置：`src/sync/apply/ChangesetApplier.cpp:43`、`src/sync/apply/ChangesetApplier.cpp:58`、`src/sync/apply/RowWinnerStore.cpp:611`、`src/sync/baseline/BaselineManager.cpp:360`
+- 违反规范：`specs/SQLite-同步工具-设计文档.md` §5.6 / §6.1；`specs/SQLite-同步工具-plan.md` R-01。
+- 问题描述：`extractHashMaterials()` 将 PK/内容值直接拼接 `bytes + '\0'`，`RowWinnerStore::pkHash()` 仍是 `key=value\n`。这些编码没有长度前缀、类型标签和列序声明，和本轮已修复的 `TableStateStore::rowHash()` 不是同一套规范编码。
+- 影响：构造性碰撞会让两个不同 PK 行共用同一个 winner，冲突裁决可能读到错误 incumbent，导致低 rank/高 rank 裁决污染其他行。
+- 修复建议：复用 `TableStateStore::rowHash()` 风格的类型标签 + 长度前缀编码，单独实现 `canonicalPkHash(table, pkColumns, values)`，changeset、baseline、RowWinnerStore 全部调用同一函数。
 
-// 写行时只清空失败 route 的字段。
-if (failedRouteTables.contains(ownerRouteByHeader.value(h))) {
-    rowVals.append(QVariant());
-} else {
-    rowVals.append(valueForHeader(h));
-}
-```
+### M-02：`push_chunk_progress` 幂等键未绑定 `origin/stream_epoch`
 
-### H-03：同步初始化硬门禁只检查 compile option，没有在实际 Qt SQLite 句柄上执行 session 调用
+- 文件位置：`src/sync/SyncDDL.h:116`、`src/sync/SyncWorker.cpp:717`、`src/sync/apply/CapturedWriteTemplate.cpp:190`
+- 违反规范：`specs/SQLite-同步工具-设计文档.md` §6，G-05；`specs/SQLite-同步工具-plan.md` T2.9 / R-07。
+- 问题描述：规范要求 selection push 分片幂等键为 `(origin, stream_epoch, push_id, chunk_seq)`，或保证 `push_id` 全局唯一且绑定 origin/epoch。当前 DDL 只有 `(push_id, chunk_seq)`，`__sync_push_progress` 也只有 `push_id` 主键，未持久绑定并校验 origin/epoch。
+- 影响：正常 UUID 碰撞概率很低，但协议层没有防止跨 origin/epoch 重用同一 `push_id` 的保护；一旦发生，会把不同推送的分片进度和 checksum 混在一起。
+- 修复建议：将 `origin`、`stream_epoch` 加入 `push_progress`/`push_chunk_progress` 主键或唯一约束；处理分片时校验 header origin/epoch 与已存在 push 元数据一致。
 
-- 文件位置：`src/sync/capture/SqliteHandle.cpp:15`，`src/sync/SyncWorker.cpp:184`
-- 问题描述：`SqliteHandle::sessionAvailable()` 只调用 `sqlite3_compileoption_used("ENABLE_SESSION")` 和 `sqlite3_compileoption_used("ENABLE_PREUPDATE_HOOK")`。规范要求运行期必须从同一个 `QSqlDatabase` 取出的 `sqlite3*` 成功调用 `sqlite3session_create/attach/changeset`。当前初始化阶段通过 compile option 后就继续 DDL 和 eligibility，真正的 `SessionRecorder::begin()` 要到首次本地写/导入时才执行；如果 Qt QSQLITE 插件和链接到的 SQLite 符号不一致，初始化可能成功，首次写才失败。
-- 违反规范：`specs/SQLite-同步工具-设计文档.md` §13.1 硬验收；`specs/SQLite-同步工具-plan.md` T1.11 初始化门禁。
-- 影响：同步模式可能在不可捕获 changeset 的环境中被标记为可用，直到业务写入时才失败，破坏“初始化阶段失败、不得静默降级”的契约。
-- 修复建议：在 `SyncWorker::run()` 展开 `canonicalSyncTables_` 并通过 schema eligibility 后，对实际 `wconn` 的 `sqlite3*` 做一次短命 session 自检。
+## Low 问题
 
-```cpp
-static bool exerciseSession(sqlite3* h, const QStringList& tables, QString* err) {
-    sqlite3_session* s = nullptr;
-    int rc = sqlite3session_create(h, "main", &s);
-    if (rc != SQLITE_OK) {
-        if (err) *err = QStringLiteral("sqlite3session_create failed");
-        return false;
-    }
-    for (const QString& table : tables) {
-        const QByteArray name = table.toUtf8();
-        rc = sqlite3session_attach(s, name.constData());
-        if (rc != SQLITE_OK) {
-            sqlite3session_delete(s);
-            if (err) *err = QStringLiteral("sqlite3session_attach failed for %1").arg(table);
-            return false;
-        }
-    }
-    int n = 0;
-    void* p = nullptr;
-    rc = sqlite3session_changeset(s, &n, &p);
-    sqlite3_free(p);
-    sqlite3session_delete(s);
-    return rc == SQLITE_OK;
-}
-```
+### L-01：`OutboxWriter` 仍是 POSIX-only，Windows 构建不可用
 
-### H-04：`table_state` 行哈希不是规范编码，可能发生可构造碰撞并导致差异误判
+- 文件位置：`src/sync/transport/OutboxWriter.cpp:9`、`src/sync/transport/OutboxWriter.cpp:59`、`src/sync/transport/OutboxWriter.cpp:114`
+- 违反规范：`specs/Qt-SQLite-Excel-批量导入导出-设计文档.md` 跨平台动态库目标；`specs/SQLite-同步工具-设计文档.md` 同步工具跨平台语境。
+- 问题描述：文件直接包含 `<unistd.h>`，调用 `::fsync()`、`::open()`、`::close()`，没有 `Q_OS_WIN` 分支。
+- 影响：Windows/MSVC 下无法编译或需要外部兼容层。
+- 修复建议：使用平台封装：POSIX 保留 `fsync/open/close`；Windows 用 `_get_osfhandle` + `FlushFileBuffers`，目录 flush 明确实现或文档化为 no-op。
 
-- 文件位置：`src/sync/schema/TableStateStore.cpp:160`，`src/sync/apply/CapturedWriteTemplate.cpp:532`
-- 问题描述：`TableStateStore::rowHash()` 将行序列化为 `key=value\n`，并直接使用 `QVariant::toByteArray()`。该格式没有类型标签和长度前缀，文本中包含换行、等号、列分隔符时可构造相同字节流；数值 `1`、文本 `"1"`、部分 BLOB/文本也可能被归一到相同字节表示。同步设计要求 `H(row)` 使用“按列序的规范编码强哈希”，`content_checksum` 是 DiffEngine 表级判等的权威依据。
-- 违反规范：`specs/SQLite-同步工具-设计文档.md` §6.2；`specs/SQLite-同步工具-plan.md` T1.6 / T4.1。
-- 影响：两个内容不同的表可能得到相同 `content_checksum`，DiffEngine 误判 Identical；反向也可能因为编码不稳定造成假差异。
-- 修复建议：改为长度前缀 + 类型标签 + SQLite 值语义的规范编码，并保证 baseline 全扫路径和 changeset 增量路径共用同一个编码函数。
+### L-02：现有测试入口不可用，回归验证没有闭环
 
-```cpp
-static void writeBytes(QDataStream& ds, const QByteArray& bytes) {
-    ds << quint32(bytes.size());
-    ds.writeRawData(bytes.constData(), bytes.size());
-}
-
-QByteArray TableStateStore::rowHash(const QVariantMap& row) {
-    QByteArray data;
-    QDataStream ds(&data, QIODevice::WriteOnly);
-    ds.setByteOrder(QDataStream::BigEndian);
-
-    ds << quint32(row.size());
-    for (auto it = row.cbegin(); it != row.cend(); ++it) {
-        writeBytes(ds, it.key().toUtf8());
-        const QVariant& v = it.value();
-        if (v.isNull()) {
-            ds << quint8(0);
-        } else if (v.typeId() == QMetaType::QByteArray) {
-            ds << quint8(4);
-            writeBytes(ds, v.toByteArray());
-        } else if (v.canConvert<qlonglong>()) {
-            ds << quint8(1) << qint64(v.toLongLong());
-        } else if (v.canConvert<double>()) {
-            ds << quint8(2) << double(v.toDouble());
-        } else {
-            ds << quint8(3);
-            writeBytes(ds, v.toString().toUtf8());
-        }
-    }
-    return QCryptographicHash::hash(data, QCryptographicHash::Sha256).left(16);
-}
-```
-
-## Medium 问题（中等，影响质量）
-
-### M-01：同步导入后用全表扫描重建 `__sync_table_state`，违反常规写路径增量维护要求
-
-- 文件位置：`src/sync/SyncWorker.cpp:1516`
-- 问题描述：`submitImportSync()` 在导入成功后调用 `ts_->resetFromBaseline()`，注释也明确说明这是 full scan。规范要求 `table_state` 在 apply/import/save 等常规写路径中通过 changeset 或 `RowMutation` 增量维护；只有 re-baseline 允许全表扫描。
-- 违反规范：`specs/SQLite-同步工具-设计文档.md` §6.2；`specs/SQLite-同步工具-plan.md` T1.6、T3.1、T5.1。
-- 影响：大表导入后会 O(全同步表行数) 扫描，性能与数据规模绑定；如果扫描期间失败还会扩大事务持有时间，增加锁竞争。
-- 修复建议：让 `SessionRecorder::sealInto()` 返回本次 changeset，或者把导入写入改走 `CapturedWriteTemplate`，在同一事务内由 changeset 提取 `TableMutation` 后调用 `applyMutations()`。
-
-```cpp
-QByteArray captured;
-if (!rec_->sealInto(hPtr_, *clog_, *wconnPtr_, txn,
-                    config_.nodeId(), streamEpoch_,
-                    config_.schemaVersion(), fp,
-                    0, originSeq, &localSeq, &sealErr, {}, &captured)) {
-    txn.rollback();
-    return fail(sealErr);
-}
-
-const QList<TableMutation> muts =
-    CapturedWriteTemplate::extractMutations(captured, canonicalSyncTables_);
-if (!ts_->applyMutations(*wconnPtr_, muts, streamEpoch_, fp, originSeq, &tsErr)) {
-    txn.rollback();
-    return fail(tsErr);
-}
-```
-
-### M-02：`table_state` 模加实现使用有符号 `qint64` 中间值，存在溢出/实现定义行为
-
-- 文件位置：`src/sync/schema/TableStateStore.cpp:35`，`src/sync/schema/TableStateStore.cpp:44`，`src/sync/schema/TableStateStore.cpp:193`
-- 问题描述：代码注释说 checksum 是 `quint64 modular sum`，但 `Delta::checksumDelta` 是 `qint64`；`hashToU64()` 返回 `quint64` 后被强转为 `qint64` 累加，`updateRow()` 又执行 `static_cast<qint64>(oldSum) + checksumDelta`。当高位为 1 或批次较大时，有符号溢出在 C++ 中不是规范的无符号模加语义。
-- 违反规范：`specs/SQLite-同步工具-设计文档.md` §6.2 “模加”聚合要求。
-- 影响：不同编译器/优化级别下可能出现不一致 checksum，破坏跨节点判等稳定性。
-- 修复建议：所有 checksum 聚合使用 `quint64`；删除用负数表达 DELETE 的写法，改为显式加/减无符号值。
-
-```cpp
-struct Delta {
-    quint64 add = 0;
-    quint64 sub = 0;
-    qint64 rowDelta = 0;
-};
-
-if (m.isInsert) {
-    d.add += hashToU64(m.afterHash);
-    d.rowDelta += 1;
-} else if (m.isDelete) {
-    d.sub += hashToU64(m.beforeHash);
-    d.rowDelta -= 1;
-} else {
-    d.add += hashToU64(m.afterHash);
-    d.sub += hashToU64(m.beforeHash);
-}
-
-const quint64 newSum = oldSum + delta.add - delta.sub;
-```
-
-### M-03：自动 profile 对无 PK/UNIQUE 的表直接失败，未提供规范要求的 draft/issues 形态
-
-- 文件位置：`src/profile/AutoProfileBuilder.cpp:54`，`src/DataBridge.cpp:152`
-- 问题描述：`AutoProfileBuilder::build()` 在找不到 conflict key 时直接返回 `E_PROFILE_NO_CONFLICT_KEY`。MVP 文档允许以错误形式阻止不可执行 profile，但完整设计文档要求未知单表场景生成可检查的草稿，标记 `executable=false` 并携带 issues，便于用户补全唯一键/冲突策略后再执行。
-- 违反规范：`specs/Qt-SQLite-Excel-批量导入导出-设计文档.md` 的自动配置草稿/问题收集要求；与 `specs/MVP-Qt-SQLite-Excel-批量导入导出-实现设计.md` 的最小实现边界存在取舍差异。
-- 影响：用户无法从 API 获取列映射草稿，只得到失败；交互式修正 profile 的工作流不完整。
-- 修复建议：保留现有 `generateAutoProfileJson()` 的 MVP 行为也可以，但应新增 draft API 或在返回 JSON 中包含 `executable/issues`。
-
-```cpp
-struct ProfileDraft {
-    ProfileSpec profile;
-    bool executable = true;
-    QStringList issues;
-};
-
-if (conflictCols.isEmpty()) {
-    draft.executable = false;
-    draft.issues.append(QStringLiteral(
-        "table '%1' has no PRIMARY KEY or UNIQUE constraint; "
-        "please choose conflict.columns").arg(table.name));
-    // 仍填充 columns，方便 UI 展示和用户补全。
-}
-```
-
-## Low 问题（轻微，改善建议）
-
-### L-01：`OutboxWriter` 使用 POSIX `fsync/open/close`，未做 Windows 分支保护
-
-- 文件位置：`src/sync/transport/OutboxWriter.cpp:8`，`src/sync/transport/OutboxWriter.cpp:58`，`src/sync/transport/OutboxWriter.cpp:113`
-- 问题描述：文件直接包含 `<fcntl.h>` / `<unistd.h>` 并调用 `::fsync()`、`::open()`、`::close()`。项目主体是 Qt/C++ 跨平台工具，同步设计也覆盖 Windows 文件身份处理；该实现会在 MSVC/Windows 构建上失败或需要兼容层。
-- 违反规范：`specs/SQLite-同步工具-设计文档.md` 的跨平台同步实现目标；也与 `SyncContext.cpp` 已有 `Q_OS_WIN` 分支风格不一致。
-- 影响：Windows 构建/发布不可用，属于可移植性问题。
-- 修复建议：用 `#ifdef Q_OS_WIN` 分支调用 `FlushFileBuffers()`，POSIX 分支保留 `fsync()`；目录 fsync 在 Windows 上明确 no-op 或使用平台等价策略。
-
-```cpp
-#ifdef Q_OS_WIN
-#include <windows.h>
-#include <io.h>
-static bool flushFileHandle(QFile& f) {
-    HANDLE h = reinterpret_cast<HANDLE>(_get_osfhandle(static_cast<int>(f.handle())));
-    return h != INVALID_HANDLE_VALUE && FlushFileBuffers(h);
-}
-#else
-#include <fcntl.h>
-#include <unistd.h>
-static bool flushFileHandle(QFile& f) {
-    int fd = static_cast<int>(f.handle());
-    return fd >= 0 && ::fsync(fd) == 0;
-}
-#endif
-```
+- 文件位置：`build/tests/tst_auto_profile_builder`；`tests/CMakeLists.txt`
+- 问题描述：`ctest --test-dir build --output-on-failure` 返回 “No tests were found”；直接运行 `build/tests/tst_auto_profile_builder` 失败：`undefined symbol: _Z13qgpu_featuresRK7QString, version Qt_5`。
+- 影响：本轮无法用现有构建产物验证回归；特别是 H-03 的测试当前还编码了与规范相反的期望，容易让错误行为持续被“绿灯”保护。
+- 修复建议：修复 CTest 注册和 Qt 运行库链接/路径；同步更新反向 lookup 测试，使 `exportOnMissing:"error"` 覆盖 route-local 行为。
 
 ## 总结
 
-- 主要问题领域：
-  - 同步上下文与 Session 初始化门禁仍未完全达到“初始化即硬失败”的规范要求。
-  - 反向 lookup 导出错误处理仍有 route-local 与 whole-row 语义混淆，会造成数据丢失。
-  - `__sync_table_state` 的哈希/模加实现与规范编码不一致，影响 DiffEngine 的可信度。
-  - 常规导入路径存在全表重扫，性能不符合增量维护设计。
-  - 自动 profile 与跨平台传输实现仍有完整性/可移植性缺口。
-- 优先修复顺序：
-  1. P0：修复 H-01/H-03，确保同步上下文唯一性和 Session 硬门禁在初始化阶段闭合。
-  2. P0：修复 H-04/M-02，统一规范行编码和无符号模加，保证 `table_state` 判等可信。
-  3. P1：修复 H-02，调整反向 lookup miss 为 route-local 导出失败。
-  4. P1：修复 M-01，把同步导入后的 `table_state` 维护改为 changeset/RowMutation 增量更新。
-  5. P2：补齐 M-03 和 L-01，改善自动 profile 工作流与 Windows 可移植性。
+- 已闭合的上一轮重点：实际 SQLite 句柄上的 session 自检已加入初始化；`table_state` 行哈希改为长度前缀/类型标签；模加改为无符号；同步导入后改为 captured changeset 增量维护；auto profile 对无唯一键表已输出 `executable=false + issues`。
+- 未闭合或新引入的重点：`SyncContext` 身份模型仍未按规范完成，且当前 UUID 逻辑会阻断重启；反向 lookup 的 route-local 失败语义仍错误；selection push 完成状态可被重复分片回退；row winner 的 PK 哈希还需规范编码。
+- 建议修复顺序：先修 H-01/H-02，保证同步初始化和同库单写不变量；再修 H-04，避免推送完成后广播停滞；随后修 H-03 并改测试期望；最后统一 row-winner/push-progress 编码与键设计，并恢复测试入口。

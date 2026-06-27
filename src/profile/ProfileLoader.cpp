@@ -121,6 +121,16 @@ bool parseTemporalSide(const QJsonValue& v, TemporalSlotKind kind, const QString
     }
     out->format = fmtVal.toString();  // absent → empty string
 
+    // M-04 fix: fallback is only meaningful on the excel side (Excel→memory parse direction).
+    // Reject it on the db side to prevent silent misconfiguration.
+    if (sideName == QLatin1String("db") && !o.value(QStringLiteral("fallback")).isUndefined()) {
+        if (err)
+            *err = ownerLabel + QStringLiteral(
+                                    ": db.fallback is not allowed — fallback only applies to the "
+                                    "excel side (Excel→memory parse direction)");
+        return false;
+    }
+
     // fallback: null → error; absent/[] → empty list
     QJsonValue fbVal = o.value(QStringLiteral("fallback"));
     if (fbVal.isNull()) {

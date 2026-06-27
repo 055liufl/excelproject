@@ -4,7 +4,12 @@
 
 #include <QDateTime>
 #include <QDebug>
+#include <QFileInfo>
 #include <QObject>
+#include <QSqlDatabase>
+#include <QSqlError>
+#include <QSqlQuery>
+#include <QUuid>
 
 namespace dbridge::sync {
 
@@ -46,11 +51,38 @@ bool SyncEngine::initialize(const SyncConfig& config, QString* err) {
     configPtr_ = std::make_unique<SyncConfig>(config);
     setProgress(SyncState::Idle);
 
+    // H-02 fix: resolve the SQLite main library's actual path via PRAGMA database_list
+    // before calling getOrCreate(), so URI paths, relative paths, and platform-specific
+    // aliases all map to the same OS file identity (dev+inode / volume+fileindex).
+    QString resolvedPath = configPtr_->sqlitePath();
+    {
+        const QString tmpConn = QStringLiteral("dbridge_se_resolve_") +
+                                QUuid::createUuid().toString(QUuid::WithoutBraces);
+        {
+            QSqlDatabase tmp = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), tmpConn);
+            tmp.setDatabaseName(configPtr_->sqlitePath());
+            if (tmp.open()) {
+                QSqlQuery q(tmp);
+                if (q.exec(QStringLiteral("PRAGMA database_list"))) {
+                    while (q.next()) {
+                        if (q.value(1).toString() == QLatin1String("main")) {
+                            const QString p = q.value(2).toString();
+                            if (!p.isEmpty())
+                                resolvedPath = QFileInfo(p).absoluteFilePath();
+                            break;
+                        }
+                    }
+                }
+                tmp.close();
+            }
+        }
+        QSqlDatabase::removeDatabase(tmpConn);
+    }
+
     // Acquire (or create) the shared SyncContext for this database file.
     // canonicalKey_ receives the dev+inode key used for release() (I-12 fix).
     QString ctxErr;
-    ctx_ = SyncContextRegistry::instance().getOrCreate(configPtr_->sqlitePath(), &canonicalKey_,
-                                                       &ctxErr);
+    ctx_ = SyncContextRegistry::instance().getOrCreate(resolvedPath, &canonicalKey_, &ctxErr);
     if (!ctx_) {
         if (err)
             *err = ctxErr;

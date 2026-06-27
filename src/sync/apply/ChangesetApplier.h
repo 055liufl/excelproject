@@ -55,6 +55,9 @@ class ChangesetApplier {
         const QStringList* syncTables = nullptr;
         // M-01 fix: conflict resolution policy for non-authoritative changesets.
         ConflictPolicy conflictPolicy = ConflictPolicy::SourceWins;
+        // H-05 fix: column name cache for canonical pkHash computation.
+        // Populated lazily per table via PRAGMA table_info inside conflictCb.
+        QMap<QString, QStringList> colNameCache;
     };
 
     static int conflictCb(void* ctx, int conflict, sqlite3_changeset_iter* iter);

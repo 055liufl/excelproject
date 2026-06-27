@@ -200,14 +200,78 @@ int ChangesetApplier::conflictCb(void* ctx, int conflict, sqlite3_changeset_iter
             const QString table = QString::fromUtf8(tblName ? tblName : "");
 
             // Use PK mask to build pkHash from PK columns only (I-06).
+            // H-05 fix: use canonical type-tagged encoding via RowWinnerStore::pkHash()
+            // so that all pkHash producers (conflict, updateWinnersFromChangeset, baseline)
+            // are in the same key space.
             unsigned char* pkMask = nullptr;
             sqlite3changeset_pk(iter, &pkMask, nullptr);
 
-            QByteArray pkMaterial, contentMaterial;
-            extractHashMaterials(iter, nCol, /*useNew=*/true, pkMask, &pkMaterial,
-                                 &contentMaterial);
+            // Lazily resolve column names for this table.
+            auto& cache = c->colNameCache;
+            if (!cache.contains(table)) {
+                QStringList names;
+                QSqlQuery ti(*c->wconn);
+                ti.prepare(
+                    QStringLiteral("PRAGMA table_info(\"%1\")")
+                        .arg(QString(table).replace(QLatin1Char('"'), QLatin1String("\"\""))));
+                if (ti.exec()) {
+                    QMap<int, QString> cidMap;
+                    while (ti.next())
+                        cidMap.insert(ti.value(0).toInt(), ti.value(1).toString());
+                    for (int i = 0; i < nCol; ++i)
+                        names.append(cidMap.value(i, QStringLiteral("_col_%1").arg(i)));
+                } else {
+                    for (int i = 0; i < nCol; ++i)
+                        names.append(QStringLiteral("_col_%1").arg(i));
+                }
+                cache.insert(table, names);
+            }
+            const QStringList& colNames = cache.value(table);
 
-            const QString pkHashStr = computePkHashStr(pkMaterial, contentMaterial);
+            // Build PK QVariantMap and content material for hash computation.
+            QVariantMap pkMap;
+            QByteArray contentMaterial;
+            for (int i = 0; i < nCol; ++i) {
+                sqlite3_value* val = nullptr;
+                sqlite3changeset_new(iter, i, &val);
+                const QString cname =
+                    (i < colNames.size()) ? colNames[i] : QStringLiteral("_col_%1").arg(i);
+                QVariant qv;
+                QByteArray colBytes;
+                if (val) {
+                    const int vt = sqlite3_value_type(val);
+                    if (vt == SQLITE_TEXT) {
+                        const char* txt = reinterpret_cast<const char*>(sqlite3_value_text(val));
+                        qv = QVariant(QString::fromUtf8(txt ? txt : ""));
+                        colBytes = qv.toString().toUtf8();
+                    } else if (vt == SQLITE_INTEGER) {
+                        const qlonglong iv = static_cast<qlonglong>(sqlite3_value_int64(val));
+                        qv = QVariant(iv);
+                        colBytes = QByteArray::number(iv);
+                    } else if (vt == SQLITE_FLOAT) {
+                        qv = QVariant(sqlite3_value_double(val));
+                        colBytes = QByteArray::number(qv.toDouble(), 'g', 17);
+                    } else if (vt == SQLITE_BLOB) {
+                        const void* b = sqlite3_value_blob(val);
+                        const int bl = sqlite3_value_bytes(val);
+                        qv = (b && bl > 0) ? QVariant(QByteArray(static_cast<const char*>(b), bl))
+                                           : QVariant(QByteArray());
+                        colBytes = qv.toByteArray();
+                    }
+                }
+                if (pkMask && pkMask[i])
+                    pkMap[cname] = qv;
+                contentMaterial.append(colBytes);
+                contentMaterial.append('\0');
+            }
+
+            const QString pkHashStr =
+                pkMap.isEmpty()
+                    ? QString::fromLatin1(
+                          QCryptographicHash::hash(contentMaterial, QCryptographicHash::Sha256)
+                              .left(16)
+                              .toHex())
+                    : RowWinnerStore::pkHash(pkMap);
             QByteArray contentH =
                 QCryptographicHash::hash(contentMaterial, QCryptographicHash::Sha256).left(16);
 
@@ -280,12 +344,76 @@ bool ChangesetApplier::updateWinnersFromChangeset(const QByteArray& changeset,
         if (!isAllowedSyncTable(tableName, syncTables))
             continue;
 
-        // For DELETE: use old values to build the pk/content hash.
+        // H-05 fix: use canonical type-tagged pkHash, consistent with conflictCb.
         const bool useNew = (op != SQLITE_DELETE);
-        QByteArray pkMaterial, contentMaterial;
-        extractHashMaterials(iter, nCol, useNew, pkMask, &pkMaterial, &contentMaterial);
 
-        const QString pkHashStr = computePkHashStr(pkMaterial, contentMaterial);
+        // Resolve column names for this table (lazily cached).
+        static QMap<QString, QStringList> uwColCache;
+        if (!uwColCache.contains(tableName)) {
+            QStringList names;
+            QSqlQuery ti(wconn);
+            ti.prepare(
+                QStringLiteral("PRAGMA table_info(\"%1\")")
+                    .arg(QString(tableName).replace(QLatin1Char('"'), QLatin1String("\"\""))));
+            if (ti.exec()) {
+                QMap<int, QString> cidMap;
+                while (ti.next())
+                    cidMap.insert(ti.value(0).toInt(), ti.value(1).toString());
+                for (int i = 0; i < nCol; ++i)
+                    names.append(cidMap.value(i, QStringLiteral("_col_%1").arg(i)));
+            } else {
+                for (int i = 0; i < nCol; ++i)
+                    names.append(QStringLiteral("_col_%1").arg(i));
+            }
+            uwColCache.insert(tableName, names);
+        }
+        const QStringList& colNames = uwColCache.value(tableName);
+
+        QVariantMap pkMap;
+        QByteArray contentMaterial;
+        for (int i = 0; i < nCol; ++i) {
+            sqlite3_value* val = nullptr;
+            if (useNew)
+                sqlite3changeset_new(iter, i, &val);
+            else
+                sqlite3changeset_old(iter, i, &val);
+            const QString cname =
+                (i < colNames.size()) ? colNames[i] : QStringLiteral("_col_%1").arg(i);
+            QVariant qv;
+            QByteArray colBytes;
+            if (val) {
+                const int vt = sqlite3_value_type(val);
+                if (vt == SQLITE_TEXT) {
+                    const char* txt = reinterpret_cast<const char*>(sqlite3_value_text(val));
+                    qv = QVariant(QString::fromUtf8(txt ? txt : ""));
+                    colBytes = qv.toString().toUtf8();
+                } else if (vt == SQLITE_INTEGER) {
+                    const qlonglong iv = static_cast<qlonglong>(sqlite3_value_int64(val));
+                    qv = QVariant(iv);
+                    colBytes = QByteArray::number(iv);
+                } else if (vt == SQLITE_FLOAT) {
+                    qv = QVariant(sqlite3_value_double(val));
+                    colBytes = QByteArray::number(qv.toDouble(), 'g', 17);
+                } else if (vt == SQLITE_BLOB) {
+                    const void* b = sqlite3_value_blob(val);
+                    const int bl = sqlite3_value_bytes(val);
+                    qv = (b && bl > 0) ? QVariant(QByteArray(static_cast<const char*>(b), bl))
+                                       : QVariant(QByteArray());
+                    colBytes = qv.toByteArray();
+                }
+            }
+            if (pkMask && pkMask[i])
+                pkMap[cname] = qv;
+            contentMaterial.append(colBytes);
+            contentMaterial.append('\0');
+        }
+
+        const QString pkHashStr =
+            pkMap.isEmpty() ? QString::fromLatin1(QCryptographicHash::hash(
+                                                      contentMaterial, QCryptographicHash::Sha256)
+                                                      .left(16)
+                                                      .toHex())
+                            : RowWinnerStore::pkHash(pkMap);
 
         if (op == SQLITE_DELETE) {
             // C-12 fix: a DELETE from a node dominated by the current winner must NOT erase the
@@ -416,29 +544,14 @@ bool ChangesetApplier::updateWinnersFromChangeset(const QByteArray& changeset,
             QCryptographicHash::hash(contentMaterial, QCryptographicHash::Sha256).left(16);
 
         // C-08 fix: use real column names (not indices) so the DELETE recovery path can build
-        // a valid INSERT SQL. Fetch column name order from PRAGMA table_info keyed by 'cid'.
-        QStringList colNames;
-        {
-            QSqlQuery ti(wconn);
-            ti.prepare(
-                QStringLiteral("PRAGMA table_info(\"%1\")")
-                    .arg(QString(tableName).replace(QLatin1Char('"'), QLatin1String("\"\""))));
-            if (ti.exec()) {
-                QMap<int, QString> cidToName;
-                while (ti.next())
-                    cidToName.insert(ti.value(0).toInt(), ti.value(1).toString());
-                for (int i = 0; i < nCol; ++i)
-                    colNames.append(cidToName.value(i, QStringLiteral("_col_%1").arg(i)));
-            }
-        }
-
+        // a valid INSERT SQL. Re-use the cached colNames from the pkHash computation above.
         QJsonObject rowJson;
         for (int ci = 0; ci < nCol; ++ci) {
             sqlite3_value* newVal = nullptr;
             sqlite3changeset_new(iter, ci, &newVal);
             if (!newVal)
                 continue;
-            // Use real column name; fall back to "col_N" if PRAGMA failed.
+            // Use real column name from cache; fall back to "col_N" if cache missed.
             const QString colKey =
                 (ci < colNames.size()) ? colNames[ci] : QStringLiteral("col_%1").arg(ci);
             switch (sqlite3_value_type(newVal)) {

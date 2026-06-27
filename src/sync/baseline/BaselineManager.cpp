@@ -13,6 +13,7 @@
 
 #include "sql/SqlBuilder.h"
 #include "sync/WriteTxn.h"
+#include "sync/apply/RowWinnerStore.h"
 
 namespace dbridge::sync {
 
@@ -410,20 +411,14 @@ bool BaselineManager::applyBaseline(QSqlDatabase& wconn, sqlite3* /*h*/,
             const QSqlRecord rec = rowQ.record();
             const int colCount = rec.count();
             while (rowQ.next()) {
-                // Build pkMaterial in the same format as ChangesetApplier::extractHashMaterials:
-                // concatenate PK column values as UTF-8 bytes separated by \0.
-                QByteArray pkMaterial;
+                // H-05 fix: use canonical type-tagged pkHash (same as ChangesetApplier)
+                // so baseline-seeded winners share the same key space as changeset challengers.
+                QVariantMap pkMap;
                 for (const QString& pkCol : pkCols) {
                     const int colIdx = rec.indexOf(pkCol);
-                    if (colIdx >= 0) {
-                        pkMaterial.append(rowQ.value(colIdx).toString().toUtf8());
-                    }
-                    pkMaterial.append('\0');
+                    pkMap[pkCol] = (colIdx >= 0) ? rowQ.value(colIdx) : QVariant();
                 }
-                const QString pkHashStr = QString::fromLatin1(
-                    QCryptographicHash::hash(pkMaterial, QCryptographicHash::Sha256)
-                        .left(16)
-                        .toHex());
+                const QString pkHashStr = RowWinnerStore::pkHash(pkMap);
 
                 // H-01 fix: build winningContent (JSON) and contentHash so that
                 // ChangesetApplier::updateWinnersFromChangeset() can restore this row when a

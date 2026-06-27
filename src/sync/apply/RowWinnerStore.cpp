@@ -5,6 +5,7 @@
 #include <QSqlError>
 #include <QSqlQuery>
 
+#include "../schema/TableStateStore.h"
 #include <climits>
 
 namespace dbridge::sync {
@@ -104,17 +105,9 @@ bool RowWinnerStore::clear(QSqlDatabase& db, const QString& table, const QString
 }
 
 QString RowWinnerStore::pkHash(const QVariantMap& pkValues) {
-    // Canonical: sorted keys, "key=value\n" joined, SHA-256 first 16 bytes as hex.
-    QByteArray data;
-    // QVariantMap iterates in key order (sorted).
-    for (auto it = pkValues.begin(); it != pkValues.end(); ++it) {
-        data.append(it.key().toUtf8());
-        data.append('=');
-        data.append(it.value().toByteArray());
-        data.append('\n');
-    }
-    QByteArray hash = QCryptographicHash::hash(data, QCryptographicHash::Sha256);
-    return QString::fromLatin1(hash.left(16).toHex());
+    // M-01 fix: use the same canonical type-tagged encoding as TableStateStore::rowHash()
+    // to prevent constructible collisions between different PK rows.
+    return QString::fromLatin1(TableStateStore::rowHash(pkValues).toHex());
 }
 
 bool RowWinnerStore::putOrRefill(QSqlDatabase& db, const QString& table, const QString& pkHash_,

@@ -114,9 +114,16 @@ void SyncContextRegistry::release(const QString& canonicalKey_) {
     }
 }
 
-bool SyncContextRegistry::ensureContextUuid(QSqlDatabase& db, const QString& uuid, QString* err) {
-    // H-01 fix: persist contextUuid to __sync_context_meta so that the UUID survives
-    // process restarts and cross-alias detection can verify identity consistency.
+bool SyncContextRegistry::ensureContextUuid(QSqlDatabase& db, QString* uuid, QString* err) {
+    // H-01 fix: read-or-write the context UUID in __sync_context_meta.
+    // On restart the in-memory UUID is freshly generated; if the DB already holds a UUID
+    // from a previous run, we adopt that stored value so restart works correctly.
+    if (!uuid) {
+        if (err)
+            *err = QStringLiteral("uuid pointer is null");
+        return false;
+    }
+
     QSqlQuery ddl(db);
     if (!ddl.exec(QStringLiteral("CREATE TABLE IF NOT EXISTS __sync_context_meta("
                                  "k TEXT NOT NULL PRIMARY KEY, v TEXT NOT NULL)"))) {
@@ -133,24 +140,18 @@ bool SyncContextRegistry::ensureContextUuid(QSqlDatabase& db, const QString& uui
         return false;
     }
     if (sel.next()) {
-        // UUID already stored; verify it matches.
-        const QString stored = sel.value(0).toString();
-        if (stored != uuid) {
-            if (err)
-                *err = QStringLiteral(
-                           "context_uuid mismatch: stored=%1, in-memory=%2 — "
-                           "possible alias collision or database corruption")
-                           .arg(stored)
-                           .arg(uuid);
-            return false;
-        }
+        // UUID already stored — adopt the persisted value (supports restart across processes).
+        *uuid = sel.value(0).toString();
         return true;
     }
 
-    // No row yet — insert.
+    // No row yet — write the current in-memory UUID (generate one if empty).
+    if (uuid->isEmpty())
+        *uuid = QUuid::createUuid().toString(QUuid::WithoutBraces);
+
     QSqlQuery ins(db);
     ins.prepare(QStringLiteral("INSERT INTO __sync_context_meta(k, v) VALUES('context_uuid', ?)"));
-    ins.addBindValue(uuid);
+    ins.addBindValue(*uuid);
     if (!ins.exec()) {
         if (err)
             *err = QStringLiteral("cannot persist context_uuid: ") + ins.lastError().text();

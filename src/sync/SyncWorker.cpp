@@ -360,10 +360,11 @@ void SyncWorker::run() {
                 ctx->canonicalSyncTables = canonicalSyncTables_;
             ctx->streamEpoch = streamEpoch_;
 
-            if (!ctx->contextUuid.isEmpty()) {
+            // H-01 fix: read-or-write context UUID — adopt the DB-stored value on restart.
+            {
                 QString uuidErr;
-                if (!SyncContextRegistry::ensureContextUuid(wconn, ctx->contextUuid, &uuidErr)) {
-                    initError_ = QStringLiteral("E_SYNC_CONTEXT_UUID_MISMATCH: ") + uuidErr;
+                if (!SyncContextRegistry::ensureContextUuid(wconn, &ctx->contextUuid, &uuidErr)) {
+                    initError_ = QStringLiteral("E_SYNC_CONTEXT_UUID_DB_ERROR: ") + uuidErr;
                     initSemaphore_.release();
                     wconnPtr_ = nullptr;
                     hPtr_ = nullptr;
@@ -716,14 +717,18 @@ bool SyncWorker::processSelectionPushArtifact(const DecodeResult& dec, const QSt
     // Insert on first chunk arrival (ON CONFLICT DO NOTHING is idempotent for subsequent chunks).
     if (!pushId.isEmpty()) {
         QSqlQuery ins(*wconnPtr_);
-        // H-05 fix: ON CONFLICT DO UPDATE so re-sends refresh total_chunks/status/updated_ms.
+        // H-04 fix: only reset status to 'streaming' when NOT already done/failed.
+        // Duplicate chunk delivery must not revert a completed push back to streaming
+        // (which would stall the broadcast barrier forever).
         ins.prepare(
             QStringLiteral("INSERT INTO __sync_push_progress "
                            "(push_id, origin, peer, total_chunks, schema_ver, status, updated_ms) "
                            "VALUES (?, ?, ?, ?, ?, 'streaming', ?) "
                            "ON CONFLICT(push_id) DO UPDATE SET "
-                           "  status='streaming', total_chunks=excluded.total_chunks, "
-                           "  schema_ver=excluded.schema_ver, updated_ms=excluded.updated_ms"));
+                           "  total_chunks=excluded.total_chunks, "
+                           "  schema_ver=excluded.schema_ver, updated_ms=excluded.updated_ms, "
+                           "  status=CASE WHEN status IN ('done','failed') THEN status "
+                           "             ELSE 'streaming' END"));
         ins.addBindValue(pushId);
         ins.addBindValue(hdr.origin);
         ins.addBindValue(config_.nodeId());
@@ -731,6 +736,26 @@ bool SyncWorker::processSelectionPushArtifact(const DecodeResult& dec, const QSt
         ins.addBindValue(hdr.schemaVer);
         ins.addBindValue(QDateTime::currentMSecsSinceEpoch());
         ins.exec();  // non-fatal if table doesn't exist yet (pre-DDL edge case)
+    }
+
+    // M-02 fix: verify that subsequent chunks for an existing push_id come from the
+    // same origin to prevent cross-origin/epoch push_id collision (though UUIDs make this
+    // vanishingly rare, the protocol layer should enforce it explicitly).
+    if (!pushId.isEmpty()) {
+        QSqlQuery ck(*wconnPtr_);
+        ck.prepare(QStringLiteral("SELECT origin FROM __sync_push_progress WHERE push_id=?"));
+        ck.addBindValue(pushId);
+        if (ck.exec() && ck.next()) {
+            const QString storedOrigin = ck.value(0).toString();
+            if (!storedOrigin.isEmpty() && storedOrigin != hdr.origin) {
+                emit errorOccurred({err::E_SYNC_TRANSPORT, Severity::Error,
+                                    QStringLiteral("selection_push"), hdr.origin,
+                                    QStringLiteral("push_id %1 already registered for origin %2"
+                                                   ", rejecting chunk from %3")
+                                        .arg(pushId, storedOrigin, hdr.origin)});
+                return false;
+            }
+        }
     }
 
     // J-04: Reject the entire push if the sender's schema version has moved.

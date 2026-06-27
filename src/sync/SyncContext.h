@@ -85,8 +85,13 @@ class SyncContextRegistry {
 
     // H-01 fix: persist contextUuid into __sync_context_meta so that the same physical
     // database is always associated with the same UUID, even across process restarts.
-    // Returns false + sets *err if the DB already contains a different UUID (alias collision).
-    static bool ensureContextUuid(QSqlDatabase& db, const QString& uuid, QString* err);
+    // Behaviour:
+    //   - DB has no UUID yet   → write *uuid to DB; return true.
+    //   - DB UUID == *uuid     → no-op; return true.
+    //   - DB has a different UUID → read-back: set *uuid = stored value; return true.
+    //     (This is the normal restart case; the caller should update ctx->contextUuid.)
+    //   - Only returns false when a DB query itself fails (sets *err).
+    static bool ensureContextUuid(QSqlDatabase& db, QString* uuid, QString* err);
 
    private:
     SyncContextRegistry() = default;

@@ -1,87 +1,123 @@
-# 代码审查报告 — 第三十一轮
+# SQLite 同步工具实现深度审查报告
 
-## 总览
+审查日期：2026-06-26  
+审查范围：`src/` 全部源代码，对照以下规范：
 
-- 审查范围：`src/` 目录下全部源文件，共 122 个文件，约 17,676 行；对照 9 个指定规范文档逐项审查。
-- 总体评分：80 / 100
-- 问题数量统计：Critical 0，High 4，Medium 2，Low 2。
-- 回归结论：上一轮的 Session 运行期自检、`table_state` 规范行编码、无符号模加、导入后增量维护、auto profile draft 输出已基本闭合；但 `SyncContext` 身份修复引入重启后 UUID 不匹配，反向 lookup 的 route-local 语义仍未闭合，selection push 完成状态会被重复分片回退。
+- `specs/Qt-SQLite-Excel-批量导入导出-设计文档.md`
+- `specs/MVP-Qt-SQLite-Excel-批量导入导出-实现设计.md`
+- `specs/SQLite-同步工具-设计文档.md`
+- `specs/SQLite-同步工具-plan.md`
+- `openspec/specs/export-column-order/spec.md`
+- `openspec/specs/export-reverse-lookup/spec.md`
+- `openspec/specs/fk-injection/spec.md`
+- `openspec/specs/row-lookup/spec.md`
+- `openspec/specs/time-format/spec.md`
 
-## Critical 问题
+## 总体结论
 
-本轮未确认到 Critical 级别问题。当前实现有多处 High 级正确性问题，建议发布前修复。
+当前实现已经补齐不少基础能力：`context_uuid` 的读或写语义已修正，接收端 `push_progress` 重复分片状态回退已用 `CASE WHEN` 保护，`export.columnOrder`、lookup/fkInject 校验、时间格式的大部分 loader 规则、同步 session 可用性自检、表态增量维护等都有实际落点。
 
-## High 问题
+但仍不满足“可按规范交付”的标准。剩余主要风险集中在同步身份模型、反向 lookup route-local 语义、row-winner PK 哈希一致性、selection push 分片 origin/epoch 绑定，以及当前测试环境无法执行。
 
-### H-01：`context_uuid` 持久化实现会导致进程重启后同步初始化失败
+## 重点修复闭合状态
 
-- 文件位置：`src/sync/SyncContext.cpp:67`、`src/sync/SyncContext.cpp:84`、`src/sync/SyncContext.cpp:117`、`src/sync/SyncWorker.cpp:357`
-- 违反规范：`specs/SQLite-同步工具-设计文档.md` §4.3；`specs/SQLite-同步工具-plan.md` T1.0b / R-06。
-- 问题描述：`getOrCreate()` 每次新建进程内 `SyncContext` 都生成新的随机 `contextUuid`，`ensureContextUuid()` 却要求库内已存在的 `context_uuid` 必须等于这个新随机值。首次初始化会写入 UUID；进程退出后再次初始化同一个库时，新 UUID 与库内旧 UUID 必然不一致，`SyncWorker` 报 `E_SYNC_CONTEXT_UUID_MISMATCH`。
-- 影响：同步库一旦写入过 `__sync_context_meta.context_uuid`，后续进程重启可能无法再进入同步模式。这不是兜底校验，而是把持久身份当成一次性随机会话 ID。
-- 修复建议：`ensureContextUuid()` 应返回库内已存在 UUID 并回填到 `ctx->contextUuid`；仅当同一个 OS 文件身份下发现两个不同的库内 UUID，或同一进程内已有 context 与库内 UUID 不一致时才报错。首次没有 UUID 时才生成并写入。
+| 项 | 状态 | 结论 |
+|---|---|---|
+| H-01 `context_uuid ensureContextUuid` 读取-或-写入语义 | 已闭合 | `SyncContextRegistry::ensureContextUuid()` 现在读取既有 `__sync_context_meta.context_uuid` 并回填传入 uuid，仅首次为空时写入。见 `src/sync/SyncContext.cpp:117`、`src/sync/SyncWorker.cpp:363`。 |
+| H-02 `SyncContext` key 是否基于 `PRAGMA database_list` | 未闭合 | registry 仍在 worker 打开 SQLite 前直接对传入 `sqlitePath` 做 `stat()`/文件标识。没有通过已打开连接读取 `PRAGMA database_list` 的 `main` 路径。见 `src/sync/SyncEngine.cpp:52`、`src/sync/SyncContext.cpp:22`、`src/sync/SyncWorker.cpp:167`。 |
+| H-03 `exportOnMissing:"error"` 规范行为 | 未闭合 | 规范要求 route-local：声明该 lookup 的 route 本行跳过，其他 route 贡献不受影响。当前 `resolveAHeaders()` 仍设置整条输出行 `rowSkip=true` 并返回。见 `src/service/ExportService.cpp:436`、`src/service/ExportService.cpp:480`、`src/service/ExportService.cpp:504`。 |
+| H-04 `push_progress ON CONFLICT CASE WHEN` 保护 | 接收端已闭合 | 接收 selection push 分片时 `ON CONFLICT(push_id)` 已保护 `done/failed` 不回退到 `streaming`。见 `src/sync/SyncWorker.cpp:723`。发起端仍有无条件 `status='streaming'`，但常规路径使用新 UUID，风险低。 |
+| M-01 `RowWinnerStore::pkHash` 是否使用 `TableStateStore::rowHash` | 部分闭合 | `RowWinnerStore::pkHash()` helper 已改用 `TableStateStore::rowHash()`，但实际 changeset、CapturedWriteTemplate、BaselineManager 仍各自使用 `value + '\0'` 材料计算 pkHash。见 `src/sync/apply/RowWinnerStore.cpp:107`、`src/sync/apply/ChangesetApplier.cpp:28`、`src/sync/apply/CapturedWriteTemplate.cpp:265`、`src/sync/baseline/BaselineManager.cpp:358`。 |
+| M-02 push chunk origin 校验 | 部分闭合 | `processSelectionPushArtifact()` 只校验已存在 `push_id` 的 `origin`，未持久绑定/校验 `stream_epoch`，DDL 主键仍只有 `push_id` 或 `(push_id, chunk_seq)`。见 `src/sync/SyncDDL.h:101`、`src/sync/SyncWorker.cpp:741`。 |
 
-### H-02：`SyncContext` key 仍未按 SQLite 实际 main 库路径解析，URI/别名场景未闭合
+## Critical
 
-- 文件位置：`src/sync/SyncContext.cpp:22`、`src/sync/SyncContext.cpp:54`、`src/sync/SyncEngine.cpp:52`
-- 违反规范：`specs/SQLite-同步工具-设计文档.md` §4.3；`specs/SQLite-同步工具-plan.md` T1.0b DoD。
-- 问题描述：`canonicalKey()` 仍直接对调用方传入的 `sqlitePath` 做 `stat()` / Windows file identity，未在打开 SQLite 后通过 `PRAGMA database_list` 读取 `main` 库解析路径。规范明确要求先以 SQLite 连接解析 URI、相对路径和主库真实路径，再使用 OS 文件身份作为 registry key。
-- 影响：`file:foo.db?...` URI、相对路径、SQLite 解析后的路径、尚未创建库路径等情况下仍可能无法合并为同一个 `SyncContext`，破坏同库单写线程和前台互斥假设；也可能错误拒绝 SQLite 本可创建的新库。
-- 修复建议：把 registry 获取延后到 `QSqlDatabase` 打开后，基于 `PRAGMA database_list` 中 `main` 的实际路径生成 key；对未建库的临时路径按规范使用受限的临时 path key，并在建库后升级为 OS identity。
+无新的 Critical。当前问题里没有看到会在普通单进程、规范路径下必然造成不可恢复数据破坏的单点；但 High 项足以阻断交付。
 
-### H-03：反向 lookup `exportOnMissing:"error"` 仍跳过整条 Excel 行
+## High
 
-- 文件位置：`src/service/ExportService.cpp:441`、`src/service/ExportService.cpp:480`、`src/service/ExportService.cpp:520`、`src/service/ExportService.cpp:778`、`src/service/ExportService.cpp:962`
-- 违反规范：`openspec/specs/export-reverse-lookup/spec.md` 中 `exportOnMissing` route-local 语义。
-- 问题描述：`resolveAHeaders()` 在 NULL H 值或未命中 G 表时仍设置 `*rowSkip = true` 并返回；调用方随后 `continue`，整条 Excel 行被跳过。虽然调用方传入了 `failedAHeaders`，但 miss 分支没有填充该集合，注释“只空出失败列”与实际行为相反。
-- 影响：MultiTable/Mixed 导出时，一个 route 的 lookup miss 会丢掉同一 Excel 行中其他 route 已可导出的字段，违反“other routes contributing to the same Excel row are unaffected”。当前 `tests/unit/tst_reverse_lookup_export.cpp` 还把“整行跳过”写成期望，测试本身也与规范冲突。
-- 修复建议：把 NOT_FOUND / NULL H 的 `error` 分支改为 route-local 失败：记录失败 lookup 的 A headers 或 route id，输出时仅清空该 route 贡献的 A cells；只有 ambiguity 或结构性不可恢复错误才整行跳过。
+### H-02：`SyncContext` 身份没有基于 SQLite 实际 main 库路径
 
-### H-04：重复 selection push 分片会把已完成 `push_progress` 回退为 `streaming`
+- 位置：`src/sync/SyncEngine.cpp:52`、`src/sync/SyncContext.cpp:22-64`、`src/sync/SyncWorker.cpp:167-170`
+- 违反规范：同步设计 §2.4 / plan T1.0b 要求通过 SQLite 连接解析主库真实路径，再以 OS 文件标识作为 registry key。
+- 问题：`getOrCreate(config.sqlitePath())` 在 worker 打开数据库前执行，`canonicalKey()` 只对调用方传入路径做 `stat()`。URI、相对路径、SQLite 解析后的 main 路径、未创建数据库路径都没有按规范收口。
+- 影响：同一物理库可能被不同别名拆成多个 `SyncContext`/写线程，破坏单写者和前台互斥；也可能错误拒绝 SQLite 本可创建的新库。
+- 建议：先用临时连接打开数据库，读取 `PRAGMA database_list` 中 `main` 的路径，再生成 OS identity key；新库/临时库场景按规范使用临时 path key 并在创建后升级。
 
-- 文件位置：`src/sync/SyncWorker.cpp:717`、`src/sync/SyncWorker.cpp:724`、`src/sync/apply/CapturedWriteTemplate.cpp:196`、`src/sync/SyncWorker.cpp:1210`
-- 违反规范：`specs/SQLite-同步工具-设计文档.md` §5.5 / §6；`specs/SQLite-同步工具-plan.md` T2.9。
-- 问题描述：`processSelectionPushArtifact()` 对任意到达分片执行 `ON CONFLICT(push_id) DO UPDATE SET status='streaming'`。如果一个已完成 push 的重复分片到达，`CapturedWriteTemplate` 会因 `push_chunk_progress` 已 applied 而幂等 no-op 返回，不会重新把 `push_progress` 标回 `done`。随后 `broadcastTopeer()` 看到该 `push_id` 状态不是 `done/failed`，会继续跳过相关 changelog。
-- 影响：一次重复投递即可把已完成 push 重新置为未完成状态，导致该 push 产生的 changeset 被永久挡在广播屏障后，中心到其他节点不再收敛。
-- 修复建议：`ON CONFLICT` 时不要无条件覆盖 `done/failed`；可使用 `WHERE status NOT IN ('done','failed')`，或在发现分片已 applied 且全部 chunks 已 applied 时重新保持/恢复 `done`。
+### H-03：反向 lookup 的 `exportOnMissing:"error"` 仍是整行跳过
 
-## Medium 问题
+- 位置：`src/service/ExportService.cpp:436-546`、`src/service/ExportService.cpp:773-779`、`src/service/ExportService.cpp:955-963`
+- 违反规范：`openspec/specs/export-reverse-lookup/spec.md` 明确要求 `"error"` 跳过 declaring route 的行，其他 routes contributing to the same Excel row unaffected。
+- 问题：`resolveAHeaders()` 在 NULL H 值或 miss 时设置 `*rowSkip=true` 并立即返回；调用点虽传入 `failedAHeaders`，但函数从未写入该集合。注释与实现相互矛盾。
+- 影响：MultiTable/Mixed 导出中，一个 route 的反查 miss 会丢掉同一 Excel 行内其他 route 可导出的数据。
+- 测试问题：`tests/unit/tst_reverse_lookup_export.cpp:449-486` 仍把“整行跳过”写成期望，测试本身与规范冲突。
+- 建议：把 reverse lookup resolution 改成 route-local 结果模型，例如返回失败 route/header 集合；`E_REVERSE_LOOKUP_NOT_FOUND` 只屏蔽该 route 恢复出的 A 列或该 route 的投影，不得跳过整条 Mixed/MultiTable 输出行。同步修正测试。
 
-### M-01：`__sync_row_winner.pk_hash` 仍使用非规范编码，可能串行化碰撞
+### H-05：Row winner 的实际 pkHash 编码仍不一致
 
-- 文件位置：`src/sync/apply/ChangesetApplier.cpp:43`、`src/sync/apply/ChangesetApplier.cpp:58`、`src/sync/apply/RowWinnerStore.cpp:611`、`src/sync/baseline/BaselineManager.cpp:360`
-- 违反规范：`specs/SQLite-同步工具-设计文档.md` §5.6 / §6.1；`specs/SQLite-同步工具-plan.md` R-01。
-- 问题描述：`extractHashMaterials()` 将 PK/内容值直接拼接 `bytes + '\0'`，`RowWinnerStore::pkHash()` 仍是 `key=value\n`。这些编码没有长度前缀、类型标签和列序声明，和本轮已修复的 `TableStateStore::rowHash()` 不是同一套规范编码。
-- 影响：构造性碰撞会让两个不同 PK 行共用同一个 winner，冲突裁决可能读到错误 incumbent，导致低 rank/高 rank 裁决污染其他行。
-- 修复建议：复用 `TableStateStore::rowHash()` 风格的类型标签 + 长度前缀编码，单独实现 `canonicalPkHash(table, pkColumns, values)`，changeset、baseline、RowWinnerStore 全部调用同一函数。
+- 位置：`src/sync/apply/RowWinnerStore.cpp:107-110`、`src/sync/apply/ChangesetApplier.cpp:28-71`、`src/sync/apply/CapturedWriteTemplate.cpp:265-272`、`src/sync/apply/CapturedWriteTemplate.cpp:568-600`、`src/sync/baseline/BaselineManager.cpp:358-426`
+- 违反规范：plan G-01/R-01/M-01 的逐行胜者状态要求同一行在 changeset、baseline、row_winner 中有统一、无构造碰撞的 PK 身份。
+- 问题：helper `RowWinnerStore::pkHash()` 已使用 `TableStateStore::rowHash()`，但实际写入 `__sync_row_winner` 的主路径没有调用它。changeset 路径和 baseline seeding 仍使用未带长度/类型/列名标签的 `value + '\0'` 拼接。
+- 影响：不同路径可能为同一 PK 产生不同 pkHash；也可能出现可构造碰撞。baseline 后 seeded winner 与后续 changeset winner 不在同一 key 空间时，低 rank 后到保护会失效。
+- 建议：新增一个唯一的 `canonicalPkHash(table, pkColumns, values)`，使用列名排序、类型标签、长度前缀；changeset iterator、CapturedWriteTemplate、BaselineManager、RowWinnerStore 全部调用它。
 
-### M-02：`push_chunk_progress` 幂等键未绑定 `origin/stream_epoch`
+## Medium
 
-- 文件位置：`src/sync/SyncDDL.h:116`、`src/sync/SyncWorker.cpp:717`、`src/sync/apply/CapturedWriteTemplate.cpp:190`
-- 违反规范：`specs/SQLite-同步工具-设计文档.md` §6，G-05；`specs/SQLite-同步工具-plan.md` T2.9 / R-07。
-- 问题描述：规范要求 selection push 分片幂等键为 `(origin, stream_epoch, push_id, chunk_seq)`，或保证 `push_id` 全局唯一且绑定 origin/epoch。当前 DDL 只有 `(push_id, chunk_seq)`，`__sync_push_progress` 也只有 `push_id` 主键，未持久绑定并校验 origin/epoch。
-- 影响：正常 UUID 碰撞概率很低，但协议层没有防止跨 origin/epoch 重用同一 `push_id` 的保护；一旦发生，会把不同推送的分片进度和 checksum 混在一起。
-- 修复建议：将 `origin`、`stream_epoch` 加入 `push_progress`/`push_chunk_progress` 主键或唯一约束；处理分片时校验 header origin/epoch 与已存在 push 元数据一致。
+### M-02：selection push 分片幂等键未绑定 `stream_epoch`
 
-## Low 问题
+- 位置：`src/sync/SyncDDL.h:101-124`、`src/sync/SyncWorker.cpp:741-759`
+- 违反规范：分片幂等键应为 `(origin, stream_epoch, push_id, chunk_seq)`，或证明 `push_id` 全局唯一且持久绑定 origin/epoch。
+- 问题：DDL 中 `__sync_push_progress` 主键为 `push_id`，`__sync_push_chunk_progress` 主键为 `(push_id, chunk_seq)`；处理分片时只读取并校验 `origin`，没有校验 `hdr.streamEpoch`。
+- 影响：跨 epoch 重用同一 `push_id` 时，进度和 checksum 可混入旧 push。UUID 碰撞概率低，但协议层没有规范要求的防线。
+- 建议：为 push progress 表加入 `stream_epoch`，唯一键至少覆盖 `(origin, stream_epoch, push_id)`，chunk 表覆盖 `(origin, stream_epoch, push_id, chunk_seq)`；兼容迁移时对旧表补列并回填。
 
-### L-01：`OutboxWriter` 仍是 POSIX-only，Windows 构建不可用
+### M-03：测试套件当前无法执行，阻断回归验证
 
-- 文件位置：`src/sync/transport/OutboxWriter.cpp:9`、`src/sync/transport/OutboxWriter.cpp:59`、`src/sync/transport/OutboxWriter.cpp:114`
-- 违反规范：`specs/Qt-SQLite-Excel-批量导入导出-设计文档.md` 跨平台动态库目标；`specs/SQLite-同步工具-设计文档.md` 同步工具跨平台语境。
-- 问题描述：文件直接包含 `<unistd.h>`，调用 `::fsync()`、`::open()`、`::close()`，没有 `Q_OS_WIN` 分支。
-- 影响：Windows/MSVC 下无法编译或需要外部兼容层。
-- 修复建议：使用平台封装：POSIX 保留 `fsync/open/close`；Windows 用 `_get_osfhandle` + `FlushFileBuffers`，目录 flush 明确实现或文档化为 no-op。
+- 位置：构建/运行环境，影响全部测试。
+- 现象：在 `build/` 下执行 `ctest --output-on-failure`，17/17 测试全部失败，均为 Qt 符号解析错误，例如 `_Z13qgpu_featuresRK7QString, version Qt_5` 或 `qgpu_features_ptr, version Qt_5`。
+- 影响：无法用现有单测验证 columnOrder、reverse lookup、time-format、lookup/fkInject、导入导出回归；当前报告只能基于静态审查和局部命令验证。
+- 建议：修正 Qt 运行库路径/链接一致性，确保测试二进制加载与编译时一致的 Qt 5.12.12 运行库。
 
-### L-02：现有测试入口不可用，回归验证没有闭环
+### M-04：`time-format` 的 `db.fallback` 未被拒绝
 
-- 文件位置：`build/tests/tst_auto_profile_builder`；`tests/CMakeLists.txt`
-- 问题描述：`ctest --test-dir build --output-on-failure` 返回 “No tests were found”；直接运行 `build/tests/tst_auto_profile_builder` 失败：`undefined symbol: _Z13qgpu_featuresRK7QString, version Qt_5`。
-- 影响：本轮无法用现有构建产物验证回归；特别是 H-03 的测试当前还编码了与规范相反的期望，容易让错误行为持续被“绿灯”保护。
-- 修复建议：修复 CTest 注册和 Qt 运行库链接/路径；同步更新反向 lookup 测试，使 `exportOnMissing:"error"` 覆盖 route-local 行为。
+- 位置：`src/profile/ProfileLoader.cpp:124-149`
+- 违反规范：`fallback` 只能出现在 `excel` side，且只在 Excel→内存解析方向生效。
+- 问题：`parseTemporalSide()` 对任意 side 都解析并接受 `fallback`，没有在 `sideName == "db"` 时拒绝。
+- 影响：非法 profile 会被接受，旧版本/新版本 profile 的前向错误行为不稳定；用户可能误以为 DB→内存解析会使用 db fallback。
+- 建议：在 loader 中对 `db.fallback` 直接 `E_PROFILE_PARSE`，错误信息注明 fallback 仅允许在 excel side。
 
-## 总结
+## Low
 
-- 已闭合的上一轮重点：实际 SQLite 句柄上的 session 自检已加入初始化；`table_state` 行哈希改为长度前缀/类型标签；模加改为无符号；同步导入后改为 captured changeset 增量维护；auto profile 对无唯一键表已输出 `executable=false + issues`。
-- 未闭合或新引入的重点：`SyncContext` 身份模型仍未按规范完成，且当前 UUID 逻辑会阻断重启；反向 lookup 的 route-local 失败语义仍错误；selection push 完成状态可被重复分片回退；row winner 的 PK 哈希还需规范编码。
-- 建议修复顺序：先修 H-01/H-02，保证同步初始化和同库单写不变量；再修 H-04，避免推送完成后广播停滞；随后修 H-03 并改测试期望；最后统一 row-winner/push-progress 编码与键设计，并恢复测试入口。
+### L-01：selection push 发起端的 `push_progress` upsert 仍无状态保护
+
+- 位置：`src/sync/SyncWorker.cpp:1898-1914`
+- 问题：发起端创建 push progress 的 `ON CONFLICT(push_id)` 仍无条件 `status='streaming'`。常规路径每次生成新 UUID，冲突概率极低，因此不是 H-04 的主风险。
+- 建议：为一致性也改成接收端同款 `CASE WHEN status IN ('done','failed') THEN status ELSE 'streaming' END`。
+
+### L-02：代码注释中仍保留与规范相反的反向 lookup 表述
+
+- 位置：`src/service/ExportService.cpp:436-440`、`src/service/ExportService.cpp:957-958`
+- 问题：函数头注释说 NOT_FOUND 会整行跳过；调用点注释说只收集 per-lookup failures。两处都不足以作为规范依据，且会误导后续修复。
+- 建议：修复 H-03 时同步改注释，明确 route-local 行为。
+
+## 已符合或基本符合的点
+
+- `export-column-order`：loader 拒绝非数组，validator 覆盖未知 header、重复项、raw SQL 互斥、classColumn 显式/默认位置；导出路径用 `reorderHeaders()` 保持列值身份。
+- `fk-injection`：数组形式、旧对象形式拒绝、复合/多父注入、冲突值按列名更新、NULL 父值报 `E_VALIDATE_FK`、preflight 复合谓词与 lookup-derived group skip 均有实现。
+- `row-lookup`：lookup identity 合并、批量预取、严格 cardinality、空 key、类型 affinity、route-local 失败和 cascade suppression 有实现。
+- `time-format`：legacy/new side-object、side-level overwrite、epochSec 限定、格式 token 校验、有效 spec 校验基本实现；剩余缺口为 `db.fallback`。
+- 同步 apply：严格连续/GAP_PENDING、schema guard、appendForward 保留 origin、ACK timeout、session self-check、同步表 eligibility 均有实现落点。
+
+## 验证记录
+
+- `ctest --output-on-failure`（工作目录 `build/`）：失败。17 个测试均因 Qt 符号解析错误无法启动。
+- 由于测试环境失败，本报告未声称任何自动测试通过。
+
+## 建议修复顺序
+
+1. 修 H-02：先把 `SyncContext` key 改为基于 `PRAGMA database_list` 的 main 库 OS identity。
+2. 修 H-03：把 reverse lookup miss/ambiguous 语义改为 route-local，并更新冲突测试。
+3. 修 H-05：统一所有 pkHash 生成点，尤其是 changeset 与 baseline seeding。
+4. 修 M-02：push progress/chunk progress schema 加入 origin+epoch 绑定并迁移旧表。
+5. 修测试运行环境，恢复 17 个测试的可执行性。
+6. 补 M-04/L 项和相应 profile loader 单测。

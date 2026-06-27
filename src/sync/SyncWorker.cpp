@@ -535,14 +535,23 @@ void SyncWorker::scanInbox() {
 
     // M-1 fix: gap timeout is now configurable via SyncConfig (default 30 s).
     QStringList stale = ledger_->stalePending(*wconnPtr_, config_.gapTimeoutMs());
-    if (!stale.isEmpty()) {
+    // H-03 fix: only changeset artifacts represent strict sequence gaps that require
+    // E_SYNC_GAP and baseline fallback.  Selection push chunks waiting for predecessor
+    // chunks and gate-deferred artifacts have their own timeout/retry semantics and
+    // must not trigger changeset gap handling.
+    QStringList staleChangeset;
+    for (const QString& sn : stale) {
+        if (sn.contains(QLatin1String("__changeset__")))
+            staleChangeset.append(sn);
+    }
+    if (!staleChangeset.isEmpty()) {
         emit errorOccurred(
             {err::E_SYNC_GAP, Severity::Error, QStringLiteral("scanInbox"), QString(),
              QStringLiteral("Changeset gap unresolved after %1ms; %2 artifact(s) pending. "
                             "Baseline fallback required.")
                  .arg(config_.gapTimeoutMs())
-                 .arg(stale.size())});
-        for (const QString& artifactName : stale)
+                 .arg(staleChangeset.size())});
+        for (const QString& artifactName : staleChangeset)
             runBaselineFallbackFor(artifactName);
     }
 }
@@ -627,12 +636,11 @@ bool SyncWorker::processArtifact(const QString& path) {
     }
 
     if (ok) {
-        ledger_->markConsumed(*wconnPtr_, name, nullptr);
         if (dec.kind == PayloadKind::Changeset) {
+            // H-01 fix: schedule + flush ACK BEFORE marking consumed so a crash between
+            // apply-commit and markConsumed leaves the artifact in 'seen' state and causes
+            // an idempotent re-apply + re-ACK on restart, rather than silently losing the ACK.
             // C-05 fix: ACK the physical sender (senderPeer), not the business origin.
-            // When the center forwards B's changeset to C, C must ACK the center so the
-            // center's outbound_ack[peer=C, origin=B] watermark advances.  If senderPeer is
-            // empty (old artifact without the field), fall back to the origin for compatibility.
             ChangesetAck ack;
             ack.origin = dec.header.origin;
             ack.streamEpoch = dec.header.streamEpoch;
@@ -643,8 +651,16 @@ bool SyncWorker::processArtifact(const QString& path) {
             if (!ackChan_->scheduleChangesetAck(ack, *codec_, &ackErr)) {
                 emit errorOccurred({err::E_SYNC_TRANSPORT, Severity::Warning, QStringLiteral("ack"),
                                     dec.header.origin, ackErr});
+            } else {
+                // Force flush so ACK file is durable on disk before we persist 'consumed'.
+                QString flushErr;
+                if (!ackChan_->flush(*codec_, &flushErr)) {
+                    emit errorOccurred({err::E_SYNC_TRANSPORT, Severity::Warning,
+                                        QStringLiteral("ack"), dec.header.origin, flushErr});
+                }
             }
         }
+        ledger_->markConsumed(*wconnPtr_, name, nullptr);
     }
     return ok;
 }
@@ -2010,7 +2026,16 @@ void SyncWorker::enqueueSelectionPush(const SyncSelection& selection,
             ins.addBindValue(chunks.size());
             ins.addBindValue(config_.schemaVersion());
             ins.addBindValue(QDateTime::currentMSecsSinceEpoch());
-            ins.exec();
+            // H-02 fix: check exec() so FK violations and other DB errors surface at the
+            // root cause (parent row) rather than appearing later as a child manifest error.
+            if (!ins.exec()) {
+                cancelAckWait();
+                emit errorOccurred({err::E_SYNC_TRANSPORT, Severity::Error,
+                                    QStringLiteral("syncSelected"), QString(),
+                                    QStringLiteral("push_progress insert failed: %1")
+                                        .arg(ins.lastError().text())});
+                return;
+            }
         }
 
         // H-02 fix: persist FrozenManifest entries AFTER push_progress (parent) is inserted

@@ -723,22 +723,11 @@ ExportResult ExportService::run(const ProfileSpec& profile, const SchemaCatalog&
             }
         }
 
-        // Sort allRows by orderBy keys
-        if (!profile.exportSpec.orderBy.isEmpty()) {
-            QStringList sortKeys;
-            for (const QString& ob : profile.exportSpec.orderBy)
-                sortKeys.append(ob.contains('.') ? ob.section('.', -1) : ob);
-            std::stable_sort(allRows.begin(), allRows.end(),
-                             [&sortKeys](const MixedRow& a, const MixedRow& b) {
-                                 for (const QString& k : sortKeys) {
-                                     QString va = a.data.value(k).toString();
-                                     QString vb = b.data.value(k).toString();
-                                     if (va != vb)
-                                         return va < vb;
-                                 }
-                                 return false;
-                             });
-        }
+        // M-02 fix: removed in-memory string sort for orderBy.
+        // Per export-column-order spec "Orthogonality with orderBy", orderBy only affects
+        // SQL-level row ordering (applied per-class in each SQL query); a secondary
+        // string-comparison sort across merged classes violates SQLite collation semantics
+        // (numeric, date, NULL ordering differs from lexicographic string comparison).
 
         // Compute effective output headers for reverse-lookup mode
         QStringList mixedAllAHeaders;

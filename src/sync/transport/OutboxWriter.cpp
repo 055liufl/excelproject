@@ -5,8 +5,11 @@
 #include <QFileInfo>
 #include <QString>
 
+// M-03 fix: guard POSIX-only headers so the library compiles on non-UNIX targets.
+#ifdef Q_OS_UNIX
 #include <fcntl.h>
 #include <unistd.h>
+#endif
 
 namespace dbridge::sync {
 
@@ -48,13 +51,14 @@ bool OutboxWriter::writeAtomic(const QString& finalName, const QByteArray& data,
             f.remove();
             return false;
         }
-        // 2. flush + fsync
+        // 2. flush + fsync (POSIX only; Qt flush is best-effort on other platforms)
         if (!f.flush()) {
             if (err)
                 *err = QStringLiteral("flush failed: %1").arg(f.errorString());
             f.remove();
             return false;
         }
+#ifdef Q_OS_UNIX
         int fd = static_cast<int>(f.handle());
         if (fd >= 0 && ::fsync(fd) != 0) {
             // M-04 fix: treat fsync failure as a transport error — data may not be durable.
@@ -64,6 +68,7 @@ bool OutboxWriter::writeAtomic(const QString& finalName, const QByteArray& data,
             QFile::remove(tmpPath);
             return false;
         }
+#endif
         f.close();
     }
 
@@ -98,17 +103,20 @@ bool OutboxWriter::writeAtomic(const QString& finalName, const QByteArray& data,
         // I-11 fix: flush + fsync the .ready marker so it is durable before return.
         if (!rf.flush())
             return cleanupAndFail(QStringLiteral("flush .ready failed: %1").arg(rf.errorString()));
+#ifdef Q_OS_UNIX
         int rfd = static_cast<int>(rf.handle());
         if (rfd >= 0 && ::fsync(rfd) != 0) {
             rf.close();
             return cleanupAndFail(QStringLiteral("fsync .ready failed (errno=%1)").arg(errno));
         }
+#endif
         rf.close();
     }
 
     // 5. I-11 fix: fsync the containing directory so the rename and .ready creation
     // survive a crash (required on POSIX; no-op on Windows where QFile::rename uses
     // MoveFileEx which is already durable).
+#ifdef Q_OS_UNIX
     {
         QByteArray dirPath = d.absolutePath().toLocal8Bit();
         int dirFd = ::open(dirPath.constData(), O_RDONLY);
@@ -126,6 +134,7 @@ bool OutboxWriter::writeAtomic(const QString& finalName, const QByteArray& data,
                                       .arg(errno));
         }
     }
+#endif
 
     return true;
 }

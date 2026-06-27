@@ -291,7 +291,17 @@ WriteResult CapturedWriteTemplate::branchBC(const WriteParams& p) {
                 QStringLiteral("SELECT * FROM %1 WHERE %2 LIMIT 1")
                     .arg(detail::SqlBuilder::quoteIdent(m.table), wp.join(QLatin1String(" AND "))));
             bindPkValues(existQ, m);
-            if (existQ.exec() && existQ.next()) {
+            // M-01 fix: exec() failure must abort immediately so __sync_table_state is not
+            // stamped with a wrong insert/update classification (misread → wrong checksum).
+            if (!existQ.exec()) {
+                rec_.abort();
+                txn.rollback();
+                result.errorCode = QStringLiteral("E_DB_UPSERT");
+                result.errorMsg = QStringLiteral("pre-scan failed for '%1': %2")
+                                      .arg(m.table, existQ.lastError().text());
+                return result;
+            }
+            if (existQ.next()) {
                 ps.rowExists = true;
                 // M-02 fix: beforeHash must also use column-name-sorted QVariantMap so it
                 // matches the format produced by extractMutations (changeset path) and

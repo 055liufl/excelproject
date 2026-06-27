@@ -328,6 +328,9 @@ bool ChangesetApplier::updateWinnersFromChangeset(const QByteArray& changeset,
     if (rc != SQLITE_OK || !iter)
         return true;  // nothing to iterate — not a failure
 
+    // H-04 fix: column name cache is per-call (not static) so schema changes and
+    // multi-database use in the same process do not corrupt each other's PK resolution.
+    QMap<QString, QStringList> uwColCache;
     bool ok = true;
     while (sqlite3changeset_next(iter) == SQLITE_ROW) {
         const char* tbl = nullptr;
@@ -347,8 +350,7 @@ bool ChangesetApplier::updateWinnersFromChangeset(const QByteArray& changeset,
         // H-05 fix: use canonical type-tagged pkHash, consistent with conflictCb.
         const bool useNew = (op != SQLITE_DELETE);
 
-        // Resolve column names for this table (lazily cached).
-        static QMap<QString, QStringList> uwColCache;
+        // Resolve column names for this table (lazily cached across rows in this changeset).
         if (!uwColCache.contains(tableName)) {
             QStringList names;
             QSqlQuery ti(wconn);

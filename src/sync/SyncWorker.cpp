@@ -331,6 +331,16 @@ void SyncWorker::run() {
         return;
     }
 
+    // M-01 fix: initialize ConsistencyCache as a persistent SyncWorker member so that
+    // baseline/authoritative down-link applies can feed it and selection push can consume it.
+    {
+        QString cacheErr;
+        if (!consistencyCache_.init(wconn, config_.consistencyCacheDurable(), &cacheErr)) {
+            // Non-fatal: degrade to empty cache (no pruning benefit, but no functional breakage).
+            // Log but don't abort initialization.
+        }
+    }
+
     QString schemaFp = SchemaGuard::computeFingerprint(wconn, canonicalSyncTables_);
     guard_->setLocal(config_.schemaVersion(), schemaFp);
 
@@ -1013,15 +1023,16 @@ bool SyncWorker::processBaselineResponseArtifact(const DecodeResult& dec,
     art.originCuts =
         resp.originCuts;  // C-03 fix: per-origin (epoch, appliedSeq) from applied_vector
 
-    ConsistencyCache cache;
     qint64 newAnchorSeq = 0;
     QString applyErr;
     const QString schemaFp = guard_ ? guard_->fingerprint() : QString();
     // M-02 fix: pass the baseline origin's rank so applyBaseline can seed RowWinner entries.
     const int baselineRank = config_.originRank(resp.origin);
-
-    if (!bm.applyBaseline(*wconnPtr_, hPtr_, art, *av_, *ts_, *rw_, cache, resp.streamEpoch,
-                          resp.origin, schemaFp, &newAnchorSeq, &applyErr, baselineRank)) {
+    // M-01 fix: use the shared consistencyCache_ (initialized in run()) so baseline apply
+    // feeds the persistent cache that selection push reads for dependency pruning.
+    if (!bm.applyBaseline(*wconnPtr_, hPtr_, art, *av_, *ts_, *rw_, consistencyCache_,
+                          resp.streamEpoch, resp.origin, schemaFp, &newAnchorSeq, &applyErr,
+                          baselineRank)) {
         emit errorOccurred({err::E_SYNC_BASELINE_FAILED, Severity::Error,
                             QStringLiteral("baseline_response"), dec.header.origin, applyErr});
         return false;
@@ -1844,11 +1855,24 @@ void SyncWorker::enqueueSelectionPush(const SyncSelection& selection,
             return;
         }
 
+        // H-01 fix: open an explicit read transaction so that resolvePk() and
+        // FkClosureBuilder::build() share a single WAL snapshot.  Without a transaction,
+        // autocommit SELECTs in WAL mode can observe different database states (MVCC mismatch)
+        // if another writer commits between the two calls.
+        if (!rconn.transaction()) {
+            cleanupRconn();
+            emit errorOccurred({err::E_SYNC_INIT, Severity::Error, QStringLiteral("syncSelected"),
+                                QString(),
+                                QStringLiteral("Cannot begin read snapshot transaction")});
+            return;
+        }
+
         // Step 2: resolve PK set.
         SelectionResolver resolver;
         QList<SelectionResolver::ResolveResult> resolved;
         QString resolveErr;
         if (!resolver.resolvePk(rconn, selection, &resolved, &resolveErr)) {
+            rconn.rollback();
             cleanupRconn();
             // M-05 fix: cancel any pending ACK wait so the foreground caller is not left hanging.
             cancelAckWait();
@@ -1857,6 +1881,7 @@ void SyncWorker::enqueueSelectionPush(const SyncSelection& selection,
             return;
         }
         if (resolved.isEmpty()) {
+            rconn.rollback();
             cleanupRconn();
             // M-05 fix: cancel any pending ACK wait.
             cancelAckWait();
@@ -1867,13 +1892,16 @@ void SyncWorker::enqueueSelectionPush(const SyncSelection& selection,
         }
 
         // Step 3: FK closure + topo sort.
-        ConsistencyCache cache;
+        // M-01 fix: use the shared consistencyCache_ (initialized in run(), fed by baseline
+        // and authoritative applies) so pruneConsistentDependencies() actually works.
         FkClosureBuilder builder;
         QList<FkClosureBuilder::Entry> manifest;
         QString buildErr;
         // H-02 fix: pass SyncSelection flags so includeFkDeps and pruneConsistent are honoured.
-        if (!builder.build(rconn, resolved, catalog, cache, config_.maxSelectionSize(), &manifest,
-                           &buildErr, selection.includeFkDeps(), selection.pruneConsistent())) {
+        if (!builder.build(rconn, resolved, catalog, consistencyCache_, config_.maxSelectionSize(),
+                           &manifest, &buildErr, selection.includeFkDeps(),
+                           selection.pruneConsistent())) {
+            rconn.rollback();
             cleanupRconn();
             // M-05 fix: cancel any pending ACK wait.
             cancelAckWait();
@@ -1885,6 +1913,7 @@ void SyncWorker::enqueueSelectionPush(const SyncSelection& selection,
                 {code, Severity::Error, QStringLiteral("syncSelected"), QString(), buildErr});
             return;
         }
+        rconn.commit();
         cleanupRconn();  // release read snapshot promptly (design §5.5/E-11)
 
         // Step 4: chunk into outbox artifacts.

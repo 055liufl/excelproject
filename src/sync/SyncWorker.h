@@ -23,6 +23,7 @@
 #include "schema/SchemaCatalog.h"
 #include "schema/SchemaGuard.h"
 #include "schema/TableStateStore.h"
+#include "selection/ConsistencyCache.h"
 #include "transport/AckChannel.h"
 #include "transport/InboxLedger.h"
 #include "transport/InboxWatcher.h"
@@ -184,6 +185,10 @@ class SyncWorker : public QThread {
     qint64 localOriginSeq_ = 0;  // next seq for local node
     // C-08: canonical sync table list (expanded from empty = all user tables).
     QStringList canonicalSyncTables_;
+
+    // M-01 fix: shared ConsistencyCache for selection push dependency pruning.
+    // Initialized on worker startup; fed by baseline and authoritative down-link applies.
+    ConsistencyCache consistencyCache_;
 
     // I-16: Rebase buffers keyed by "origin/originSeq"; populated after each apply_v2.
     // J-13: Use insertion-ordered queue for correct LRU eviction.

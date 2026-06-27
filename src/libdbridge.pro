@@ -7,6 +7,15 @@ TARGET   = dbridge
 
 QT       = core sql gui
 
+# --- SQLite session/rebaser API (sync subsystem) ---
+# src/sync/** includes <sqlite3.h> for the session API, which is only declared
+# when SQLITE_ENABLE_SESSION is defined. Mirrors target_compile_definitions(
+# dbridge PRIVATE SQLITE_ENABLE_SESSION SQLITE_ENABLE_PREUPDATE_HOOK) in CMake.
+# The matching symbols come from the dbridge_sqlite3 static lib, linked by the
+# executables (cli / tests); this static lib only needs the header + the macros.
+include($$PWD/../qsqlite3.pri)
+DEFINES += $$DBRIDGE_SQLITE_DEFINES
+
 # Warnings parity with target_compile_options(... -Wall -Wextra -Wpedantic)
 QMAKE_CXXFLAGS += -Wall -Wextra -Wpedantic
 
@@ -24,7 +33,8 @@ INCLUDEPATH += \
     $$ROOT_SRC/include \
     $$ROOT_BUILD/include \
     $$PWD \
-    $$ROOT_SRC/3rdparty/QXlsx/header
+    $$ROOT_SRC/3rdparty/QXlsx/header \
+    $$QT_SQLITE_INC
 
 DEPENDPATH  += $$PWD $$ROOT_SRC/include
 
@@ -76,7 +86,14 @@ write_file($$EXPORT_FILE, EXPORT_LINES)
 HEADERS += \
     $$ROOT_SRC/include/dbridge/DataBridge.h \
     $$ROOT_SRC/include/dbridge/Types.h \
+    $$ROOT_SRC/include/dbridge/RowPayload.h \
     $$ROOT_SRC/include/dbridge/Errors.h \
+    $$ROOT_SRC/include/dbridge/IBatchTransfer.h \
+    $$ROOT_SRC/include/dbridge/sync/ISyncEngine.h \
+    $$ROOT_SRC/include/dbridge/sync/IComparisonSession.h \
+    $$ROOT_SRC/include/dbridge/sync/SyncConfig.h \
+    $$ROOT_SRC/include/dbridge/sync/SyncSelection.h \
+    $$ROOT_SRC/include/dbridge/sync/SyncTypes.h \
     $$EXPORT_FILE
 
 # --- Internal headers ---
@@ -106,6 +123,51 @@ HEADERS += \
     service/ImportService.h \
     service/ExportService.h
 
+# --- Internal headers: sync subsystem + batch transfer ---
+# SyncWorker.h and transport/InboxWatcher.h carry Q_OBJECT and MUST be listed
+# here so qmake runs moc on them (the rest are informational / Qt Creator tree).
+HEADERS += \
+    batch/BatchTransfer.h \
+    sync/SyncContext.h \
+    sync/SyncDDL.h \
+    sync/SyncEngine.h \
+    sync/SyncWorker.h \
+    sync/WriteTxn.h \
+    sync/ForegroundGate.h \
+    sync/anchor/OutboundAckStore.h \
+    sync/apply/AppliedVectorStore.h \
+    sync/apply/CapturedWriteTemplate.h \
+    sync/apply/ChangesetApplier.h \
+    sync/apply/RowWinnerStore.h \
+    sync/apply/SelectionPushApplier.h \
+    sync/apply/UpsertExecutor.h \
+    sync/baseline/BaselineManager.h \
+    sync/capture/ChangelogStore.h \
+    sync/capture/SessionRecorder.h \
+    sync/capture/SqliteHandle.h \
+    sync/conflict/ConflictArbiter.h \
+    sync/conflict/RebaseEngine.h \
+    sync/conflict/RoutingTable.h \
+    sync/diff/ComparisonSession.h \
+    sync/diff/DiffEngine.h \
+    sync/diff/InboundTableGate.h \
+    sync/diff/StagingBuffer.h \
+    sync/payload/PayloadCodec.h \
+    sync/peer/DeadPeerEvictor.h \
+    sync/schema/QuarantineStore.h \
+    sync/schema/SchemaEligibility.h \
+    sync/schema/SchemaGuard.h \
+    sync/schema/TableStateStore.h \
+    sync/selection/ChunkStreamer.h \
+    sync/selection/ConsistencyCache.h \
+    sync/selection/FkClosureBuilder.h \
+    sync/selection/FrozenManifest.h \
+    sync/selection/SelectionResolver.h \
+    sync/transport/AckChannel.h \
+    sync/transport/InboxLedger.h \
+    sync/transport/InboxWatcher.h \
+    sync/transport/OutboxWriter.h
+
 # --- Sources (mirror DBRIDGE_SOURCES in CMakeLists.txt) ---
 SOURCES += \
     DataBridge.cpp \
@@ -128,5 +190,46 @@ SOURCES += \
     service/ErrorCollector.cpp \
     service/ImportService.cpp \
     service/ExportService.cpp
+
+# --- Sources: sync subsystem + batch transfer (mirror DBRIDGE_SOURCES order) ---
+SOURCES += \
+    sync/WriteTxn.cpp \
+    sync/SyncContext.cpp \
+    sync/capture/SqliteHandle.cpp \
+    sync/schema/SchemaEligibility.cpp \
+    sync/schema/TableStateStore.cpp \
+    sync/apply/AppliedVectorStore.cpp \
+    sync/apply/RowWinnerStore.cpp \
+    sync/apply/ChangesetApplier.cpp \
+    sync/apply/CapturedWriteTemplate.cpp \
+    sync/capture/ChangelogStore.cpp \
+    sync/capture/SessionRecorder.cpp \
+    sync/schema/SchemaGuard.cpp \
+    sync/schema/QuarantineStore.cpp \
+    sync/payload/PayloadCodec.cpp \
+    sync/transport/OutboxWriter.cpp \
+    sync/transport/InboxLedger.cpp \
+    sync/transport/InboxWatcher.cpp \
+    sync/transport/AckChannel.cpp \
+    sync/anchor/OutboundAckStore.cpp \
+    sync/SyncWorker.cpp \
+    sync/SyncEngine.cpp \
+    sync/conflict/RoutingTable.cpp \
+    sync/conflict/ConflictArbiter.cpp \
+    sync/conflict/RebaseEngine.cpp \
+    sync/apply/UpsertExecutor.cpp \
+    sync/apply/SelectionPushApplier.cpp \
+    sync/selection/SelectionResolver.cpp \
+    sync/selection/ConsistencyCache.cpp \
+    sync/selection/FkClosureBuilder.cpp \
+    sync/selection/FrozenManifest.cpp \
+    sync/selection/ChunkStreamer.cpp \
+    batch/BatchTransfer.cpp \
+    sync/diff/DiffEngine.cpp \
+    sync/diff/InboundTableGate.cpp \
+    sync/diff/StagingBuffer.cpp \
+    sync/diff/ComparisonSession.cpp \
+    sync/baseline/BaselineManager.cpp \
+    sync/peer/DeadPeerEvictor.cpp
 
 CONFIG += skip_target_version_ext

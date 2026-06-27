@@ -1,7 +1,13 @@
-# dbridge — Qt + SQLite + Excel 批量导入导出动态库
+# dbridge — Qt + SQLite 数据动态库（Excel 批量导入导出 · 多节点增量同步）
 
 > 一份**面向新手**的详细架构文档。所有图都使用 Mermaid 语法（GitHub 网页端直接渲染），
 > 配套有大量"为什么这么设计"的注释。建议从上到下顺序阅读。
+>
+> **本文档覆盖 dbridge 的两个子系统**（编译进**同一个** `libdbridge`，功能正交）：
+> - **子系统 A — Excel 批量导入导出**（§1–§14）：Profile 驱动的 Excel ↔ SQLite 受控搬运（字段映射、Upsert、三级校验、多表/混编、反向 lookup、时间类型）。
+> - **子系统 B — SQLite 多节点增量同步**（§15）：以 SQLite **变更集（changeset）** 为载体，在星型拓扑的多个节点间做基线 + 增量同步，传输层无关（基于文件 inbox/outbox）。
+>
+> 只关心 Excel 导入导出，看 §1–§14 即可；只关心多节点同步，先读 §4/§5 建立分层心智，再直接跳 §15。
 
 ---
 
@@ -36,6 +42,19 @@
   - [14.13 CLI 工具完整参考](#1413-cli-工具完整参考)
   - [14.14 性能调优与实用技巧](#1414-性能调优与实用技巧)
   - [14.15 常见坑与排查](#1415-常见坑与排查)
+- [15. SQLite 同步工具（多节点增量同步）](#15-sqlite-同步工具多节点增量同步)
+  - [15.1 这个子系统要解决什么问题？](#151-这个子系统要解决什么问题)
+  - [15.2 核心术语词典（同步篇）](#152-核心术语词典同步篇)
+  - [15.3 整体架构（四层）](#153-整体架构四层)
+  - [15.4 线程与连接模型](#154-线程与连接模型)
+  - [15.5 端到端同步流程](#155-端到端同步流程)
+  - [15.6 局部架构（按模块）](#156-局部架构按模块)
+  - [15.7 关键算法与机制](#157-关键算法与机制)
+  - [15.8 公共 API 与配置](#158-公共-api-与配置)
+  - [15.9 同步元数据表（11 张 `__sync_*`）](#159-同步元数据表11-张-__sync_)
+  - [15.10 同步错误码（`E_SYNC_*` / `W_SYNC_*`）](#1510-同步错误码e_sync_--w_sync_)
+  - [15.11 与 Excel 子系统的关系](#1511-与-excel-子系统的关系)
+  - [15.12 构建、测试与实现状态](#1512-构建测试与实现状态)
 
 ---
 
@@ -54,8 +73,15 @@
 | 一行 Excel 数据要拆到多张表怎么办？ | 手写一堆 if-else | Profile 里描述映射关系，**声明式**搞定 |
 | 一个 Sheet 里 A/B/C 三种行混编？ | 一堆 if-else | Profile 用 `discriminator` + `classes` 声明 |
 
-**dbridge 是一个 C++ 动态库**，对外只暴露 3 个公开头文件（`DataBridge.h` / `Types.h` / `Errors.h`），
-宿主程序链接 `dbridge` 即可使用。
+**dbridge 是一个 C++ 动态库**。Excel 导入导出子系统对外只暴露 `DataBridge.h` / `Types.h` /
+`RowPayload.h` / `Errors.h`，宿主程序链接 `dbridge` 即可使用。
+
+**还有第二类问题：数据不只在一台机器上。** 同一份业务数据被分发到多个 SQLite 节点（一个中心 + 若干子节点），
+各自离线增删改，过一段时间要把它们**合并对齐**。直接互相覆盖整库会丢改动、破外键、撞主键；网络又可能只有
+2Mbps 的窄带、甚至只能靠 U 盘/文件交换。dbridge 的**第二个子系统**就解决这个：把本地变更打包成 SQLite
+**变更集（changeset）**，在节点间做基线 + 增量同步，自动仲裁冲突、补全外键依赖、断点续传、防回声。
+它和 Excel 子系统**编译进同一个库**，但接口独立（`include/dbridge/sync/*` 与 `IBatchTransfer.h`），
+详见 [§15](#15-sqlite-同步工具多节点增量同步)。
 
 ---
 
@@ -112,11 +138,19 @@ if (!result.ok) {
 
 ```text
 dbridge/
-├── include/dbridge/                    ← 公开头（只有这 4 个文件对外）
-│   ├── DataBridge.h                    ← 门面类，宿主只 #include 这个
+├── include/dbridge/                    ← 公开头（宿主只 #include 这里）
+│   ├── DataBridge.h                    ← 门面类，Excel 导入导出宿主只 #include 这个
 │   ├── Types.h                         ← ConnectionSpec/ImportOptions/RowError/ImportResult 等结构体
 │   ├── RowPayload.h                    ← RowContext/RoutePayload（dryRunPayloads 类型；由 Types.h 引入）
-│   └── Errors.h                        ← E_OPEN_DB / E_VALIDATE_NULL / E_LOOKUP_* ... 错误码常量
+│   ├── Errors.h                        ← E_OPEN_DB / E_VALIDATE_NULL / E_LOOKUP_* / E_SYNC_* ... 错误码常量
+│   ├── Export.h                        ← DBRIDGE_EXPORT 符号可见性宏
+│   ├── IBatchTransfer.h                ← 非阻塞批量导入导出接口（§15.8；与同步引擎共享前台门控）
+│   └── sync/                           ← 同步子系统公开接口（§15）
+│       ├── ISyncEngine.h               ← 同步引擎门面（8+1 接口）+ createSyncEngine 工厂
+│       ├── SyncConfig.h                ← SyncConfig + Builder（节点/路径/冲突策略/各类阈值）
+│       ├── SyncSelection.h             ← SyncSelection + Builder（上行选择集：表 + 主键）
+│       ├── SyncTypes.h                 ← NodeRole/SyncState/SyncProgress/SyncResult/PayloadHeader ...
+│       └── IComparisonSession.h        ← 场景 2 可视化差异比对/合并接口
 │
 ├── src/                                ← 实现细节（宿主看不到）
 │   ├── DataBridge.cpp                  ← PImpl 外壳，把请求转给具体 Service
@@ -153,16 +187,43 @@ dbridge/
 │   ├── sql/                            ← "怎么写 SQL" 由这里负责
 │   │   └── SqlBuilder.*                ← 生成 Upsert SQL 和导出 SELECT
 │   │
-│   └── service/                        ← "整个流程怎么编排" 由这里负责
-│       ├── ErrorCollector.*            ← 错误聚合容器
-│       ├── ExportHelpers.h             ← 导出辅助工具（列序合并、反向 lookup 调度等）
-│       ├── ImportService.*             ← 导入主流程（Phase A/B/C/D）
-│       └── ExportService.*             ← 导出主流程
+│   ├── service/                        ← "整个流程怎么编排" 由这里负责
+│   │   ├── ErrorCollector.*            ← 错误聚合容器
+│   │   ├── ExportHelpers.h             ← 导出辅助工具（列序合并、反向 lookup 调度等）
+│   │   ├── ImportService.*             ← 导入主流程（Phase A/B/C/D）
+│   │   └── ExportService.*             ← 导出主流程
+│   │
+│   ├── batch/                          ← 非阻塞批量导入导出（IBatchTransfer 实现，§15.8）
+│   │   └── BatchTransfer.*             ← 把导入路由进同步写线程，复用 ImportService/ExportService
+│   │
+│   └── sync/                           ← ★ 子系统 B：SQLite 多节点增量同步（§15）
+│       ├── SyncEngine.*                ← ISyncEngine 实现：装配 SyncContext + SyncWorker 的门面
+│       ├── SyncWorker.*                ← 唯一写线程（QThread）：扫 inbox / 应用 / 广播 outbox
+│       ├── SyncContext.*               ← 同一物理 .db 跨引擎共享的状态容器 + 进程级注册表
+│       ├── WriteTxn.*                  ← BEGIN IMMEDIATE/COMMIT/ROLLBACK 的 RAII 事务包装
+│       ├── ForegroundGate.h           ← 每库前台单活动互斥门（重入 → E_BUSY）
+│       ├── SyncDDL.h                   ← 11 张 __sync_* 元数据表 DDL + 制品命名规则（§15.9）
+│       ├── capture/                    ← 变更捕获：SqliteHandle / SessionRecorder / ChangelogStore
+│       ├── apply/                      ← 应用层：ChangesetApplier / SelectionPushApplier /
+│       │                                  UpsertExecutor / AppliedVectorStore / RowWinnerStore /
+│       │                                  CapturedWriteTemplate
+│       ├── conflict/                   ← 冲突仲裁：ConflictArbiter / RebaseEngine / RoutingTable
+│       ├── selection/                  ← 上行选择推送：SelectionResolver / FkClosureBuilder /
+│       │                                  ConsistencyCache / FrozenManifest / ChunkStreamer
+│       ├── transport/                  ← 文件传输：OutboxWriter / InboxWatcher / InboxLedger / AckChannel
+│       ├── schema/                     ← 模式守卫：SchemaGuard / SchemaEligibility / TableStateStore / QuarantineStore
+│       ├── peer/                       ← DeadPeerEvictor（死节点驱逐）
+│       ├── baseline/                   ← BaselineManager（基线导出/应用/回退）
+│       ├── anchor/                     ← OutboundAckStore（发送端锚点/ACK 水位）
+│       ├── payload/                    ← PayloadCodec（制品二进制编解码）
+│       └── diff/                       ← 场景 2：DiffEngine / ComparisonSession / StagingBuffer / InboundTableGate
 │
 ├── 3rdparty/QXlsx/                     ← QXlsx 第三方库（vendored）
 │
-├── tests/                              ← 单元 + 集成测试（17 套，CMake 列在 tests/CMakeLists.txt）
-│   ├── unit/                           ← 模块级单元测试（ProfileLoader/ProfileValidator/Schema/Validators/SqlBuilder/AutoProfileBuilder/Router/TopoSorter/FkPreflight/LookupPrefetch/LookupSemantics/ExportHelpers/ReverseLookupExport/TemporalImport/TemporalExport/ColumnOrderExport）
+├── tests/                              ← 单元 + 集成测试（38 套 CTest 目标，CMake 列在 tests/CMakeLists.txt）
+│   ├── unit/                           ← 模块级单元测试
+│   │                                     Excel 篇：ProfileLoader/ProfileValidator/Schema/Validators/SqlBuilder/AutoProfileBuilder/Router/TopoSorter/FkPreflight/LookupPrefetch/LookupSemantics/ExportHelpers/ReverseLookupExport/TemporalImport/TemporalExport/ColumnOrderExport
+│   │                                     同步篇（19 套，§15.12）：tst_sync_applied_vector/changelog_store/conflict_arbiter/consistency_cache/dead_peer_evictor/foreground_gate/inbound_table_gate/inbox_ledger/outbound_ack/payload_codec/quarantine_store/routing_table/row_winner/schema_eligibility/schema_guard/staging_buffer/table_state/upsert_executor + tst_write_txn
 │   ├── integration/                    ← DataBridge 端到端集成
 │   └── data/                           ← 测试夹具
 │       ├── sql/                        ← schema 初始化 SQL（01_customer / 02_orders / 03_mixed / 04_mixed_multitable / 05_time_formats / 06_column_order / 07_reverse_lookup）
@@ -1219,6 +1280,10 @@ graph LR
 
 宿主拿到 `errors` 列表后，可以一次性高亮全部错误单元格，**不需要让用户改一处跑一次**。
 
+> **同步子系统的错误码**（`E_SYNC_*` / `W_SYNC_*` / `E_BUSY`）同样定义在 `include/dbridge/Errors.h`，
+> 但语义、上报通道（同步返回值 vs 后台 `errors()` 环）和 `SyncError` 上下文字段都不同，集中在
+> [§15.10 同步错误码](#1510-同步错误码e_sync_--w_sync_) 单独讲。
+
 ---
 
 ## 14. 完整使用指南（手把手）
@@ -2257,6 +2322,547 @@ dbridge 在仓库内提供五个独立可复跑的端到端验证场景：
 | `tools/build_fixtures.py` | 生成所有 xlsx 夹具（纯 Python stdlib） |
 
 Excel 夹具已签入 `tests/data/xlsx/`，也可用 `python3 tools/build_fixtures.py` 重新生成。回归点 `tst_fk_preflight` 单元测试已锁住 mixed 模式 FK 预校验路径，`tst_temporal_import` 覆盖时间字段导入（含 epochSec 整数路径），`tst_temporal_export` 覆盖时间字段导出（含 epochSec 反序列化与 E_TIME_PARSE_DB），`tst_column_order_export` / `tst_reverse_lookup_export` 各自覆盖对应导出路径，`tst_profile_loader` 覆盖新旧形态 JSON 加载与 E_PROFILE_PARSE 负向用例。
+
+---
+
+## 15. SQLite 同步工具（多节点增量同步）
+
+> dbridge 的**第二个子系统**，与 §1–§14 的 Excel 导入导出**编译进同一个 `libdbridge`**，但功能正交：
+> 解决"多个 SQLite 节点之间如何安全地增量同步数据"。公开接口全部在 `include/dbridge/sync/` 与
+> `include/dbridge/IBatchTransfer.h`，宿主不碰 `importExcel`/`exportExcel` 也能单独用同步。
+>
+> **阅读顺序**：15.1（要解决什么）→ 15.2（行话）→ 15.3（分层）→ 15.5（一次同步怎么走完）→ 其余按需。
+
+### 15.1 这个子系统要解决什么问题？
+
+同一份业务数据被分发到多台机器，各自离线增删改，过段时间要**合并对齐**。朴素做法处处是坑：
+
+| 痛点 | 朴素做法的后果 | 同步工具的处理 |
+|---|---|---|
+| 多节点改了同一行 | 谁后写谁赢，改动随机丢失 | 按 `(origin rank, seq)` **确定性仲裁** + 逐行胜者表，结果**与到达顺序无关** |
+| 整库互相覆盖同步 | 删旧插新破坏外键、丢未同步列 | 以 **changeset** 为单位逐行 UPSERT，不动无关行/列 |
+| 子节点只想上行几条记录 | 手挑记录漏带父行 → 外键悬挂 | 自动求**外键依赖闭包** + 拓扑排序，父行先于子行落地 |
+| 窄带 / 离线链路 | 大事务一次发不完、断了重来 | 紧凑编码 + 按字节预算**分片** + **断点续传** |
+| changeset 乱序 / 重复到达 | 重复应用、丢更新 | `(origin, epoch)` **严格连续应用** + 制品级**幂等台账** |
+| 某节点长期掉线 | 中心 changelog 无限膨胀 | **死节点三维阈值驱逐** + outbox 坍缩成单个基线 |
+| 表结构对不上 | 应用到一半炸库 | **schema 指纹守卫** + 隔离区，升级后重放 |
+| 同步进行中崩溃 | 业务已提交但变更没记上，丢同步 | 收割与 changelog 落库**同事务原子提交**，零窗口 |
+
+**适用场景 / 部署形态**
+
+- **单域星型拓扑**：一个中心节点（`NodeRole::Center`，权威源）+ 若干子节点（`NodeRole::Edge`）。中心负责裁决并向全域广播；子节点只与中心来往。
+- **传输层无关**：同步逻辑只与本地 `outboxDir` / `inboxDir` 两个目录里的**文件制品**打交道。真正把文件从 A 搬到 B 的是**第三方黑盒工具**（rsync / U 盘 / 消息队列 / 自研网关都行），dbridge **不自带网络协议**。制品用"先写主文件、再落地 `.ready` 哨兵"保证接收端不会读到半截。
+- **窄带友好**：面向 2Mbps 量级链路 —— 紧凑二进制编码、按 `pushChunkBudgetBytes` 分片、断点续传、离线可投递。
+- **触发模型**：**上行（子节点 → 中心）人工发起**，由人指定要同步哪些记录（`syncSelected`）；**下行（中心 → 全域其它子节点）在中心固化裁决后自动广播**。
+
+**非目标（明确不做，YAGNI）**：DDL/schema 变更自动传播、多域跨桥、CRDT、自建网络协议、分布式共识（Paxos/Raft）、整库物理页复制、非 SQLite 数据库、内建 GUI。冲突仲裁**不是纯 LWW、也不是向量时钟**，而是 origin 优先级全序（见 §15.7.2）。
+
+---
+
+### 15.2 核心术语词典（同步篇）
+
+先把行话搞懂，再看后面的图。**这一节是同步篇的入门第一关**。
+
+| 术语 | 通俗解释 |
+|---|---|
+| **changelog** | 本地变更日志表 `__sync_changelog`：本地单调 `local_seq` 为主键，记录每笔变更（kind/origin/origin_seq/stream_epoch/schema 指纹/changeset blob）。增量同步和溯源裁决都从这里取数据 |
+| **changeset** | 对一行/一批记录的逻辑变更（插/改/删），由 SQLite Session 扩展产出，是同步与传播的**基本单位** |
+| **baseline（基线）** | 冷启动时一次性全量同步，把对端对齐到统一起点，之后切增量 |
+| **incremental（增量）** | 只传 `seq > 锚点` 的新增 changeset |
+| **origin（来源，不可变）** | 变更**最初产生**的节点标识，全生命周期不变，是防回声、规范序仲裁、幂等向量的分组键。它始终是 changelog/制品的**元数据列，不在 changeset blob 内** |
+| **rank（origin 优先级）** | 给每个 origin 预设的**全局唯一**排名，`(rank, seq)` 构成全序，仲裁靠它 |
+| **anchor（锚点）= `OutboundAckStore`** | **发送端**记某对端已收到/应用到的 seq 水位线，增量从锚点之后开始，按 ACK 前移 |
+| **ack（确认）** | 对端对"已成功收/应用"的确认。两型：`ChangesetAck{origin,epoch,appliedSeq}` 推进发送端锚点；`PushChunkAck{pushId,chunkSeq,checksum,ok}` 记分片进度，全片 ok 才算发完 |
+| **applied-vector** | **接收端**按 `(origin, stream_epoch)` 维护的已应用 seq 高水位，做跨源幂等去重 |
+| **winner（逐行胜者）= `__sync_row_winner`** | 持久化每行当前胜者的来源与规范序键，冲突回调据 `(rank, seq)` 裁决 REPLACE/OMIT，保证多源仲裁**到达序无关** |
+| **frozen manifest（冻结清单）** | 上行选择性推送在短读快照内一次性算出、并持久化的拓扑有序 `(表, 主键, 指纹)` 列表。算完即释放读快照（护 WAL），作为分片续传来源 |
+| **quarantine（隔离区）= `__sync_quarantine`** | schema 漂移（指纹/版本不符）时临时隔离暂不可安全应用的载荷，升级后重放 |
+| **rebase（变基）** | 中心把待广播 changeset 用 `sqlite3rebaser_*` 重新裁决到中心已固化的状态，使各节点在统一裁决下收敛 |
+| **conflict arbiter** | 确定性仲裁器：按 `(rank, seq)` 规范序产出"保留/丢弃/隔离"裁决 |
+| **routing table（防回声）** | 下行路由规则：只发 `origin ≠ 对端` 且 `seq > 对端锚点` 的条目，禁回推来源、禁子节点反推中心 |
+| **selection（上行选择集）** | 上行推送时人工界定的待同步记录集合（MVP：表 + 主键集合） |
+| **closure（外键依赖闭包）** | 对选择集沿外键递归求出的全部父记录，随选择集一并上行以保引用完整 |
+| **ConsistencyCache（一致性剪枝）** | Edge 侧按 `(表, 主键)` 记"中心当前持有该行内容"的指纹，**只由中心权威制品喂养，绝不由上行 ACK 盖章**；剪枝时把"本地行指纹 == 中心已知指纹"的**依赖父行**剪掉不发（人工直选的记录不剪） |
+| **staging（内存暂存）** | 场景 2 比对会话期间内存暂存待合并的差异，会话结束即释放，不落地 |
+| **PayloadCodec** | 制品二进制编解码（魔数 `DBSY`、版本 2），区分 Changeset / SelectionPush / BaselineRequest / BaselineResponse 四类载荷 |
+| **inbox / outbox** | 文件制品的收/发目录；`.ready` 哨兵表示主文件已写完可读 |
+| **streamEpoch（代际号）** | outbox 坍缩成基线后递增；接收端据此丢弃/隔离早于当前代际的旧增量 |
+| **quiescence（静默）** | 域内无新变更、无在途载荷的稳定态，用于"防回声/最终一致"验收 |
+
+---
+
+### 15.3 整体架构（四层）
+
+公开面薄、编排层厚、接入层窄、传输层在边界外。**自上而下 4 层 + 横切**：
+
+```mermaid
+graph TB
+    subgraph L1["公开面（纯抽象 + 工厂，宿主只见接口）"]
+        ISE["ISyncEngine<br/>（8+1 接口）"]
+        IBT["IBatchTransfer<br/>（非阻塞批量）"]
+        ICS["IComparisonSession<br/>（场景 2 比对/合并）"]
+        CFG["SyncConfig::Builder<br/>SyncSelection::Builder"]
+    end
+
+    subgraph L2["同步编排层（后台单写线程驱动）"]
+        SE["SyncEngine<br/>装配 + 门面"]
+        SW["SyncWorker<br/>唯一写连接所有者（QThread）"]
+        WT["WriteTxn<br/>两路写通道共用的事务"]
+        FG["ForegroundGate<br/>每库单活动互斥"]
+        SCx["SyncContext (+Registry)<br/>同库跨引擎共享状态"]
+    end
+
+    subgraph L3["SQLite 接入层（仅写线程）"]
+        SH["SqliteHandle<br/>driver()->handle() → sqlite3*"]
+        SR["SessionRecorder<br/>短命 session 录制"]
+    end
+
+    subgraph L4["传输适配层（dbridge 边界内）"]
+        OW["OutboxWriter"]
+        IW["InboxWatcher / InboxLedger"]
+        AC["AckChannel"]
+    end
+
+    BlackBox[("第三方搬运工具<br/>（rsync / U 盘 / MQ，黑盒）")]
+
+    ISE --> SE
+    IBT --> SE
+    ICS --> SE
+    SE --> SW
+    SW --> WT
+    SE --> FG
+    SE --> SCx
+    SW --> SH
+    SW --> SR
+    SW --> OW
+    SW --> IW
+    SW --> AC
+    OW -. 写文件 .-> BlackBox
+    BlackBox -. 投递文件 .-> IW
+```
+
+各层落到 `src/sync/` 的子目录：`capture/`（捕获）、`apply/`（应用）、`conflict/`（仲裁/变基/路由）、`selection/`（上行选择推送）、`transport/`（文件收发）、`schema/`（模式守卫/隔离/表态）、`peer/`（死节点驱逐）、`baseline/`（基线）、`anchor/`（发送端锚点）、`payload/`（编解码）、`diff/`（场景 2）。逐模块见 §15.6。
+
+> **两条独立写通道**：自动 changeset 走 `ChangesetApplier`（native `apply_v2`），上行选择推送走 `SelectionPushApplier`（逐行 UPSERT）。两者**只共享 `WriteTxn` / `SchemaGuard` / `ErrorCollector`，不共享行写实现**。
+
+---
+
+### 15.4 线程与连接模型
+
+这是整个子系统的设计根基，**一句话：所有写都串行经过唯一一个写线程**。
+
+| 约束 | 怎么做 | 为什么 |
+|---|---|---|
+| **唯一写连接** | `SyncWorker` 在自己线程里 `addDatabase` 打开指向同一 `.db` 的写连接 `wconn`，`SqliteHandle::of(wconn)` 取 `sqlite3*` 仅本线程用 | 所有写（changeset apply、上行 UPSERT、import/export、场景 2 save、广播前的本地捕获）入写队列**串行执行** → 天然无写写冲突、无死锁 |
+| **不移交主线程连接** | 禁止把 `DataBridge::db_`（主线程专属）交给后台线程 | `QSqlDatabase` 不可跨线程共享 |
+| **读写分离** | 读用独立连接（WAL 读不阻塞写者）；getter 不读库，只返回加锁快照 | 状态查询永不卡在写事务后面 |
+| **跨线程只传值** | 线程间只传 `QByteArray` 载荷、值类型快照、任务描述；**绝不传 `QSqlQuery` / `sqlite3*`** | 避免句柄逃逸到错误的线程 |
+
+`SyncContext` 按**物理文件标识**（POSIX `(st_dev, st_ino)` / Windows 卷序列号 + FileIndex）为 key 在进程内共享，消解 URI / 相对路径 / 符号链接 / 硬链接 / 大小写差异 —— 保证"同一个 `.db` 文件"无论用什么路径打开，都共用同一个写线程和前台门控。
+
+---
+
+### 15.5 端到端同步流程
+
+#### 15.5.1 自动增量：接收并应用一个下行 changeset
+
+```mermaid
+flowchart TB
+    s([第三方把 .payload + .ready 投进 inbox]) --> scan[InboxWatcher.scan<br/>见 .ready 哨兵 + 台账幂等]
+    scan --> dec[PayloadCodec.decode]
+    dec --> tx[[WriteTxn.begin: BEGIN IMMEDIATE]]
+    tx --> idem{AppliedVector.check<br/>是否紧接水位?}
+    idem -->|seq ≤ 水位：已见| noop[幂等 no-op，丢弃]
+    idem -->|seq 跳号：有缺口| gap[入 pending 缺口<br/>持续缺口 → E_SYNC_GAP → 回退基线]
+    idem -->|紧接水位：可应用| guard{SchemaGuard.verifyPayload<br/>指纹 / 版本一致?}
+    guard -->|否| quar[QuarantineStore 隔离<br/>升级后重放]
+    guard -->|是| apply[ChangesetApplier.apply_v2<br/>冲突回调查 RowWinner 裁决 REPLACE/OMIT]
+    apply --> upd[AppliedVector.advance + RowWinner/TableState 维护<br/>+ appendForward 写 changelog]
+    upd --> commit[[WriteTxn.commit（同事务原子）]]
+    commit --> ack[AckChannel 调度 ChangesetAck → outbox]
+    ack --> e([收到 ACK 才前移发送端锚点])
+```
+
+**关键点**：收割 changeset 和写 changelog 在 `COMMIT` **前同事务**完成 —— "业务已提交"与"已落 changelog"是同一个原子提交，崩溃零窗口。
+
+#### 15.5.2 中心下行广播 + rebase + 防回声
+
+中心把入站变更固化裁决后，自动向全域**其它**子节点广播：
+
+```mermaid
+flowchart LR
+    win[攒批窗口<br/>broadcastIntervalMs 或 broadcastThreshold 先到先发] --> arb[ConflictArbiter<br/>按 rank,seq 规范序]
+    arb --> reb[RebaseEngine<br/>sqlite3rebaser_* 变基为权威下行]
+    reb --> route[RoutingTable.shouldRoute<br/>仅 origin≠对端 且 seq 高于对端锚点]
+    route --> ow[OutboxWriter.write → 各对端 outbox]
+    ow --> down["下游 AuthoritativeApply<br/>（强制 REPLACE，豁免 ConflictPolicy）"]
+    down --> ack[收 ACK → 前移 per-peer 锚点]
+```
+
+> 上行 `selectionpush` 的 UPSERT **不走 rebaser**（无 rebase buffer），以普通 `origin=B` 的 changelog 记录广播；只有 `apply_v2` 路径用 rebaser。rebaser 失败 → `E_SYNC_REBASE_FAILED`，本轮不外发并回滚。
+
+#### 15.5.3 上行人工选择性推送 `syncSelected`
+
+```mermaid
+flowchart TB
+    s([syncSelected（selection）]) --> pre{受理前同步校验<br/>空选择 / Builder 非法?}
+    pre -->|是| eret[同步返回 E_SYNC_SELECTION_EMPTY<br/>不占前台槽]
+    pre -->|否| res[SelectionResolver<br/>只读快照解析 PK]
+    res --> clo[FkClosureBuilder<br/>外键闭包 + Kahn 拓扑 + 一致性剪枝]
+    clo -->|FK 环| cyc[E_SYNC_FK_CYCLE_UNSUPPORTED]
+    clo -->|悬挂父| miss[E_SYNC_FK_CLOSURE_MISSING]
+    clo --> froze[物化 FrozenManifest<br/>释放读快照（护 WAL）]
+    froze --> chunk[ChunkStreamer<br/>按 pushChunkBudgetBytes 拓扑序分片<br/>父片不晚于子片]
+    chunk --> ob[经 outbox/inbox 到中心]
+    ob --> push["中心 SelectionPushApplier 逐行 UPSERT<br/>直选 DO UPDATE / 依赖 DO NOTHING"]
+    push --> cack[分片 ACK]
+    cack --> done([全片 PushChunkAck → Completed<br/>超时 → E_SYNC_ACK_TIMEOUT])
+```
+
+**长推送"半截"语义**：分片直接落真实表、**不引入 per-push staging 表、不跨片回滚**。安全靠三道边界 —— ① FK 安全（父片不晚于子片，绝无悬挂）；② **半截不外泄下游**（中心推迟广播本 push 的直选变更，直到 `push_progress=done`）；③ 撞 schema 迁移时整发拒收（`E_SYNC_PUSH_SCHEMA_MOVED`）。
+
+---
+
+### 15.6 局部架构（按模块）
+
+逐目录列出每个类的职责（读 `src/sync/<目录>/` 的头文件即可对应）。
+
+**`capture/` 捕获层**
+
+| 类 | 职责 |
+|---|---|
+| `SqliteHandle` | 从 `QSqlDatabase` 取原生 `sqlite3*`；静态校验 SESSION / PREUPDATE_HOOK 编译与运行时可用 |
+| `SessionRecorder` | 短生命周期 `sqlite3_session` 管理：`begin`（事务后、业务写前）捕获同步表变更，`sealInto`（COMMIT 前）收集 changeset 写 changelog 并分离会话 |
+| `ChangelogStore` | `__sync_changelog` 读写：`append`（本地捕获）/`appendForward`（转发）/`readRange*`/`maxLocalSeq`/`truncate`（GC） |
+
+**`schema/` 模式层**
+
+| 类 | 职责 |
+|---|---|
+| `SchemaEligibility` | 会话附加前逐表校验是否支持 UPSERT（拒虚表/视图/影子表/无 PK/partial unique）；`expandSyncTables` 把空列表展开成全部用户表 |
+| `TableStateStore` | `__sync_table_state`：以**增量校验和**跟踪表级行状态，支撑场景 2 零全量拉取 |
+| `SchemaGuard` | 模式版本 + 指纹守卫，`verifyPayload` 拒绝与本地基线不一致的载荷；指纹 = 列名/类型/PK → SHA-256 |
+| `QuarantineStore` | `__sync_quarantine`：隔离 schema 超前的载荷，升级后 `drainReady` 重放 |
+
+**`apply/` 应用层**
+
+| 类 | 职责 |
+|---|---|
+| `AppliedVectorStore` | `__sync_applied_vector`：对每个 `(origin, epoch)` 强制连续严格序号，`check` 返回 `Apply/NoOp/Gap` |
+| `RowWinnerStore` | `__sync_row_winner`：`(rank, seq)` 极大元冲突解决（到达序无关） |
+| `ChangesetApplier` | 调 `sqlite3changeset_apply_v2` 应用原始 changeset，冲突回调查 `RowWinnerStore`；`xFilter` 限定接受的同步表 |
+| `CapturedWriteTemplate` | 核心**三分支写入模板**（A 权威下行 / B 选择推送 / C 本地写），统一管事务、应用向量、胜者、表态 |
+| `UpsertExecutor` | 批量 UPSERT 执行（缓存预编译语句、逐行收集 `RowError` 不中断）；**从 `ImportService` 提取，import / 场景 2 save / 上行推送三路共用** |
+| `SelectionPushApplier` | 应用入站选择推送的单个 chunk（经 `CapturedWriteTemplate` 分支 B + `UpsertExecutor`） |
+
+**`conflict/` 冲突层**
+
+| 类 | 职责 |
+|---|---|
+| `ConflictArbiter` | 规范排序仲裁（rank 降序、originSeq 降序）：`beats(a, b)` |
+| `RebaseEngine` | `sqlite3rebaser_*` 把 changeset 变基到权威 rebase 缓冲 |
+| `RoutingTable` | 防回声路由：仅 `origin ≠ peer` 且 `originSeq > peerAckedSeq` 才转发 |
+
+**`selection/` 上行选择推送层**
+
+| 类 | 职责 |
+|---|---|
+| `SelectionResolver` | 把 `SyncSelection`（PK 集）在只读连接上解析为具体行 |
+| `FkClosureBuilder` | 计算选中行的传递 FK 闭包并拓扑排序（复用 `SchemaIntrospector`/`TopoSorter`/`FkInjector`） |
+| `ConsistencyCache` | 内存（可选持久化 `__sync_consistency_cache`）指纹缓存，判断依赖行是否已与中心一致以剪枝 |
+| `FrozenManifest` | `__sync_frozen_manifest` 持久化 push 的拓扑清单，供续传恢复 |
+| `ChunkStreamer` | 按字节预算把清单切成 chunk 流式发送 |
+
+**`transport/` 传输层（文件 inbox/outbox）**
+
+| 类 | 职责 |
+|---|---|
+| `OutboxWriter` | 原子发布制品：`tmp → fsync → rename → .ready`；`write` / `writeAck` |
+| `InboxWatcher` | 扫 inbox 的 `*.ready`，更新台账，返回就绪制品路径 |
+| `InboxLedger` | `__sync_inbox_ledger`：制品级幂等消费（`seen/consumed/corrupt`）+ 缺口检测 |
+| `AckChannel` | 批量化 ACK 制品、定时/显式刷新 |
+
+**其余模块**
+
+| 类（目录） | 职责 |
+|---|---|
+| `DeadPeerEvictor`（`peer/`） | 三维阈值（序号/字节/时间，各软硬两级）评估对端 `Healthy/Lagging/Dead`，驱逐时标记 `pending_baseline` 并重置锚点 |
+| `BaselineManager`（`baseline/`） | 整表基线导出/应用（重置向量、状态、种子胜者）；源已压缩所需 changeset 时降级到基线 |
+| `OutboundAckStore`（`anchor/`） | `__sync_outbound_ack`：按 `(peer, origin, epoch)` 维护 ACK 水位；`minAckedSeq` 给出 changelog 截断水位 |
+| `PayloadCodec`（`payload/`） | 所有制品二进制编解码（魔数 `DBSY`、版本 2，向后兼容版本 1） |
+| `DiffEngine`/`ComparisonSession`/`StagingBuffer`/`InboundTableGate`（`diff/`） | 场景 2：表/行级 diff、内存暂存编辑、比对期对"被比对表"的 inbox 门控 |
+
+---
+
+### 15.7 关键算法与机制
+
+#### 15.7.1 变更捕获：短命 session，同事务
+
+用 SQLite **Session 扩展**（不是触发器、不是影子表），session 生命周期严格绑定**单个事务**，与业务写**同事务**写 changelog（`SessionRecorder.sealInto` 在 `COMMIT` 前完成）→ 崩溃零窗口。这也是为什么构建必须开 `SQLITE_ENABLE_SESSION` + `SQLITE_ENABLE_PREUPDATE_HOOK`（§15.12），且**阶段 0 不通过就停工、无降级**。
+
+#### 15.7.2 冲突仲裁：`(rank, seq)` + 逐行胜者表（到达序无关）
+
+纯 `(rank, seq)` 只在"同批仲裁"成立；现实分批到达会让低 rank 后到的变更覆盖高 rank。所以新增 `__sync_row_winner` **逐行胜者表**：冲突回调据持久化的当前胜者裁决 REPLACE / OMIT，终态 = 该行所有来源中 `(rank, origin_seq)` 的**极大元**，与到达顺序无关。仅作用于 changeset 自动路径（上行 UPSERT 不叠 rank）。
+
+#### 15.7.3 rebase：中心权威重放
+
+中心入站 changeset 重放产生权威 changelog，`apply_v2` 收集 rebase buffer，用 `sqlite3rebaser_create/configure/rebase/delete` 把待广播 changeset 变基到中心已裁决状态，使全域在统一裁决下收敛。
+
+#### 15.7.4 schema 守卫 + 隔离区
+
+`SchemaGuard.verifyPayload` 比对版本/指纹，不符 → `E_SYNC_SCHEMA_MISMATCH`；`QuarantineStore` 隔离 + 升级后重放；低于当前 `stream_epoch` 的载荷直接隔离/丢弃且不推进 applied-vector。**资格校验**在 `initialize` 硬前置：同步表必须是普通 rowid / WITHOUT ROWID 表 + 显式非空 PK + 完整唯一索引冲突目标，否则 `E_SYNC_UNSUPPORTED_SCHEMA` 拒绝进入同步模式（防"配置成功但变更静默漏同步"）。
+
+#### 15.7.5 外键依赖闭包选择 + 一致性剪枝
+
+`FkClosureBuilder` 用读快照取行值 + `SchemaCatalog` 的 FK 图 + Kahn 拓扑排序；把已与中心一致的**依赖父行**剪除（`ConsistencyCache`），但**人工直选的记录永不剪**。FK 环 → `E_SYNC_FK_CYCLE_UNSUPPORTED`，悬挂父 → `E_SYNC_FK_CLOSURE_MISSING`。
+
+#### 15.7.6 分块流式 + 断点续传 + 半截不外泄
+
+`ChunkStreamer` 按 `pushChunkBudgetBytes` 拓扑序分片，`(push_id, chunk_seq)` 幂等续传。半截语义见 §15.5.3（三道边界）。
+
+#### 15.7.7 幂等去重（两套机制分账）
+
+1. **changeset 流：严格连续应用** —— `applied_seq` 单调高水位，仅 `seq == applied_seq+1` 才应用；`seq <= applied_seq` 幂等 no-op；`seq > applied_seq+1` 缺口入 pending（复用 inbox + ledger 的 `seen` 状态，**不新建 pending 表**），持续缺口（超 `gapTimeoutMs`）→ `E_SYNC_GAP` → 回退基线。杜绝"乱序 seq=2 先到推高水位致 seq=1 被误判已见"的丢更。
+2. **selectionpush 分片：独立幂等** —— 幂等键 `(origin, epoch, push_id, chunk_seq)`，由 `__sync_push_chunk_progress` 承载。重复 chunk checksum 相同 = no-op，不同 = `E_SYNC_PAYLOAD_CORRUPT`。
+
+#### 15.7.8 死节点驱逐 + outbox 坍缩
+
+`DeadPeerEvictor` 三维阈值（commit 数 / 字节数 / 时长，各软+硬，取最严升档）：软阈值 → `W_SYNC_PEER_LAGGING`，硬上限 → `E_SYNC_PEER_DEAD` + 逐出（停保留增量、对其余对端恢复正常截断、打回归标记强制 re-baseline）。**outbox 有界**（`outboxMaxBytesPerPeer` / `outboxMaxArtifactsPerPeer`），溢出坍缩成单个待发基线，把单对端占用钳制为常数级。无独立心跳，存活性由 ACK 新鲜度推断。
+
+#### 15.7.9 表态增量校验和（顺序无关聚合）
+
+`TableStateStore.content_checksum` 取**顺序无关聚合**（所有行哈希的模加，优于 XOR），每次写增量更新（INSERT `+=H(new)`、DELETE `-=H(old)`、UPDATE `+=H(new)-H(old)`），**禁全表扫描**（仅 re-baseline 允许一次全扫重置）—— 这是场景 2 能"零全量拉取"判表是否相同的根。表级判等三元组 = `schema_fingerprint + row_count + content_checksum` 全等（`high_water_seq` 不参与判等）。
+
+---
+
+### 15.8 公共 API 与配置
+
+#### `ISyncEngine`（8 + 1 接口，`include/dbridge/sync/ISyncEngine.h`）
+
+| # | 方法 | 说明 |
+|---|---|---|
+| ① | `bool initialize(const SyncConfig&, QString* err)` | 载入配置、资格校验、挂 session、启动写线程 |
+| ② | `bool sync(QString* err)` | 手动 drain：扫 inbox + 打包 outbox。**非阻塞，不等第三方搬运** |
+| ③ | `bool stop(QString* err)` | 协作式中止当前**前台**操作（不拦后台 inbox/apply/广播） |
+| ④ | `SyncState state() const` | 前台操作状态快照（`Idle/Capturing/Exporting/Importing/Broadcasting/Completed/Stopped/Failed`） |
+| ⑤ | `SyncProgress progress() const` | 进度（percent / bytesPacked / bytesApplied / changesApplied / conflicts） |
+| ⑥ | `QList<SyncLogEntry> logs() const` | 日志环 |
+| ⑦ | `QList<SyncError> errors() const` | 错误环（后台失败落这里） |
+| ⑧ | `SyncResult result() const` | 上一次完成操作的结果（含 per-peer 状态） |
+| ⑨ | `bool syncSelected(const SyncSelection&, QString* err)` | 上行选择性推送（FR-17） |
+
+工厂：`std::unique_ptr<ISyncEngine> createSyncEngine(DataBridge& bridge);`
+
+#### `SyncConfig::Builder`（`SyncConfig.h`）—— `build(&err)` 产出**不可变值对象**（可跨线程传值）
+
+| 配置项（Builder 方法） | 默认值 | 含义 |
+|---|---|---|
+| `nodeId(id)` | （必填） | 本节点 id |
+| `role(NodeRole)` | `Edge` | `Center` / `Edge` |
+| `centerNodeId(id)` | — | Edge 必填 |
+| `addPeerNode(id)` | — | 对端列表（不含自身、去重、非空） |
+| `database(path)` | （必填） | `.db` 路径 |
+| `syncTables({...})` | 空=全部用户表 | 参与同步的表 |
+| `outboxDir / inboxDir / quarantineDir` | （前两个必填） | 收发/隔离目录 |
+| `conflictPolicy(p)` | `SourceWins` | `SourceWins` / `TargetWins` / `Manual` |
+| `originPriority(origin, rank)` | — | rank **全局唯一**，大者优先 |
+| `peerLagSoftLimit / HardLimit`（seq） | `10000` / `100000` | 滞后阈值（变更数） |
+| `peerLagSoftBytes / HardBytes` | `50 MiB` / `500 MiB` | 滞后阈值（字节） |
+| `peerLagSoftMs / HardMs` | `5 min` / `1 h` | 滞后阈值（时长） |
+| `outboxMaxBytesPerPeer / ArtifactsPerPeer` | `1 GiB` / `10000` | outbox 上界 |
+| `ackMaxDelayMs` | `5000` | ACK 批量最大延迟 |
+| `baselineSizeWarnBytes` | `100 MiB` | 基线过大告警阈值 |
+| `schemaVersion(v)` | `1` | schema 版本（≥1） |
+| `changelogRetention(n)` | `100000` | changelog 保留条数 |
+| `verifySchemaFingerprint(b)` | `true` | 是否校验指纹 |
+| `autoSyncAfterImport(b)` | `false` | 导入后自动同步 |
+| `broadcastIntervalMs / broadcastThreshold` | `5000` / `100` | 中心攒批窗口（先到先发） |
+| `maxSelectionSize` | `100000` | 上行选择集上限 → `E_SYNC_SELECTION_TOO_LARGE` |
+| `pushChunkBudgetBytes` | `2 MiB` | 分片字节预算 |
+| `consistencyCacheDurable(b)` | `true` | 一致性缓存是否持久化 |
+| `gapTimeoutMs(ms)` | `30000` | 缺口超时 → `E_SYNC_GAP` |
+
+`build()` 会做完整性校验（必填项、对端去重/不含自身、rank 全局唯一、各软阈值 ≤ 硬阈值且为正、Edge 必须有 center…），任一不满足返回非法对象并写 `*err`。
+
+#### `SyncSelection::Builder`（`SyncSelection.h`）
+
+`addRecord(table, pk)` / `addRecords(table, {pk...})` / `includeFkDependencies(bool)` / `pruneConsistentDependencies(bool)` / `build(&err)`。
+**MVP 仅支持"表 + 主键集合"**：`addWhere()` 传原始 SQL 会在 `build()` 报 `E_SYNC_SELECTION_EMPTY`（设计 §4.4）；非法表名（非 `[A-Za-z_]\w*`）同样在 `build()` 拒绝（防 SQL 注入）。
+
+#### `IBatchTransfer`（8 + 3 接口，`IBatchTransfer.h`）
+
+非阻塞批量导入导出，与同步引擎**共享同一 `ForegroundGate`**（同库单活动互斥）。
+`startImport` / `startExport` / `importProgress` / `importErrors` / `importResult` / `exportProgress` / `exportErrors` / `exportResult` / `stop` / `importState` / `exportState`。工厂 `createBatchTransfer(DataBridge&)`。
+
+#### `IComparisonSession`（场景 2，`IComparisonSession.h`）
+
+`initialize(remoteSnapshots, &err)` → `tableDiffs` / `rowDiffs` / `stageRow` / `stageTable` / `acceptLocal` / `acceptRemote` / `stageCell` / `save` / `discard`。工厂 `createComparisonSession(config, &err)`。
+
+#### 最小用法示例
+
+```cpp
+#include "dbridge/DataBridge.h"
+#include "dbridge/sync/ISyncEngine.h"
+using namespace dbridge;
+using namespace dbridge::sync;
+
+DataBridge bridge;
+ConnectionSpec cs; cs.sqlitePath = "node_b.db";
+bridge.open(cs, nullptr);
+
+QString err;
+SyncConfig cfg = SyncConfig::Builder()
+    .nodeId("B").role(NodeRole::Edge).centerNodeId("A")
+    .database("node_b.db")
+    .syncTables({"orders", "order_items"})
+    .outboxDir("/sync/B/out").inboxDir("/sync/B/in").quarantineDir("/sync/B/quar")
+    .originPriority("A", 100).originPriority("B", 50)   // rank 全局唯一，大者优先
+    .conflictPolicy(ConflictPolicy::SourceWins)
+    .build(&err);
+
+auto engine = createSyncEngine(bridge);
+engine->initialize(cfg, &err);     // 资格校验 + 挂 session + 启写线程
+engine->sync(&err);                // 收下行 + 发本地已捕获变更（非阻塞）
+
+// 人工上行：把这几笔订单推给中心，自动带外键依赖、剪掉与中心已一致的父行
+SyncSelection sel = SyncSelection::Builder()
+    .addRecords("orders", {"O1001", "O1002", "O1003"})
+    .includeFkDependencies(true)
+    .pruneConsistentDependencies(true)
+    .build(&err);
+engine->syncSelected(sel, &err);
+
+for (const auto& e : engine->errors())
+    qWarning() << e.code << e.phase << e.message;
+```
+
+---
+
+### 15.9 同步元数据表（11 张 `__sync_*`）
+
+同步工具在**本地库**自建以下元数据表（`src/sync/SyncDDL.h`，**不参与业务同步**）：
+
+| 表名 | 用途 |
+|---|---|
+| `__sync_changelog` | 本地/转发变更日志（`local_seq` 主键、kind/origin/origin_seq/stream_epoch/schema 指纹/changeset blob/authoritative/push_id） |
+| `__sync_applied_vector` | 每 `(origin, epoch)` 的 `applied_seq` + `baseline_generation`，序号连续性检查 |
+| `__sync_outbound_ack` | 每 `(peer, origin, epoch)` 的 `acked_seq` / `last_sent_seq` / `pending_baseline` / `last_push_id` |
+| `__sync_table_state` | 每 `(table, epoch)` 的 `schema_fingerprint` / `high_water_seq` / `content_checksum` / `row_count` |
+| `__sync_row_winner` | 行级冲突胜者（`table + pk_hash`、winning_origin/rank/origin_seq/content_hash） |
+| `__sync_consistency_cache` | `(table, primary_key) → center_fingerprint`，上行依赖剪枝 |
+| `__sync_quarantine` | 隔离 schema 超前的载荷（payload blob + payload_schema_ver） |
+| `__sync_inbox_ledger` | 制品级幂等消费台账（artifact_name 主键、status / first_seen_ms / consumed_ms） |
+| `__sync_push_progress` | 选择推送进度（push_id 主键、total_chunks / status / failed_code） |
+| `__sync_push_chunk_progress` | 单 chunk 进度（push_id + chunk_seq、status / checksum） |
+| `__sync_frozen_manifest` | 冻结的拓扑清单（push_id + chunk_seq + table + pk_hash、record_kind / topo_index / fingerprint） |
+
+> 另有 `__sync_context_meta` / `context_uuid` 兜底上下文标识。制品命名统一为 `origin__epoch__kind__seq__[peer-]uuid.payload`（见 `SyncDDL.h` 的 helper）。
+
+---
+
+### 15.10 同步错误码（`E_SYNC_*` / `W_SYNC_*`）
+
+定义在 `include/dbridge/Errors.h`，**两类分流上报**：① 受理前同步校验（空 selection、Builder 非法）经返回值 `*err` 同步返回，不占前台槽；② 受理后后台失败经 `errors()` / `result()` 上报，`state()=Failed`，并携带 `SyncError{code, severity, phase, nodeId, message}`。
+
+```mermaid
+graph LR
+    subgraph Init["初始化 / 模式"]
+        s1[E_SYNC_INIT]
+        s2[E_SYNC_SESSION_UNAVAILABLE]
+        s3[E_SYNC_UNSUPPORTED_SCHEMA]
+        s4[E_SYNC_COMPOSITE_PK_NOT_SUPPORTED]
+        s5[E_SYNC_NODE_UNKNOWN]
+    end
+    subgraph Apply["应用 / 一致性"]
+        a1[E_SYNC_SCHEMA_MISMATCH]
+        a2[E_SYNC_PAYLOAD_CORRUPT]
+        a3[E_SYNC_APPLY_FK]
+        a4[E_SYNC_APPLY_CONSTRAINT]
+        a5[E_SYNC_GAP]
+        a6[E_SYNC_REBASE_FAILED]
+        a7[E_SYNC_BASELINE_FAILED]
+    end
+    subgraph Push["上行选择推送"]
+        p1[E_SYNC_SELECTION_EMPTY]
+        p2[E_SYNC_SELECTION_TOO_LARGE]
+        p3[E_SYNC_FK_CLOSURE_MISSING]
+        p4[E_SYNC_FK_CYCLE_UNSUPPORTED]
+        p5[E_SYNC_PUSH_SCHEMA_MOVED]
+    end
+    subgraph Runtime["传输 / 运行期"]
+        r1[E_SYNC_TRANSPORT]
+        r2[E_SYNC_ACK_TIMEOUT]
+        r3[E_SYNC_PEER_DEAD]
+        r4[E_SYNC_WRITE_BLOCKED]
+        r5[E_BUSY]
+    end
+    subgraph Stage["场景 2 比对"]
+        g1[E_SYNC_STAGE_STALE]
+        g2[E_SYNC_STAGE_CONFLICT]
+    end
+    subgraph Warn["告警（非阻断）"]
+        w1[W_SYNC_CONFLICT_REPLACED]
+        w2[W_SYNC_BASELINE_LARGE]
+        w3[W_SYNC_PAYLOAD_LARGE]
+        w4[W_SYNC_UNTRACKED_CHANGE]
+        w5[W_SYNC_PEER_LAGGING]
+        w6[W_SYNC_PUSH_ROW_DRIFTED]
+        w7[W_SYNC_CONCURRENT_MANUAL_PUSH]
+    end
+```
+
+几个常见码的处置建议：
+
+| 错误码 | 触发 | 宿主应对 |
+|---|---|---|
+| `E_BUSY` | 前台已有活动操作（与 `IBatchTransfer` 共享门控） | 等当前操作结束再试 |
+| `E_SYNC_WRITE_BLOCKED` | 同步激活后 `importExcel` 直接写**同步表** | 改走 `IBatchTransfer` |
+| `E_SYNC_GAP` | changeset 缺口超 `gapTimeoutMs` | 触发/等待基线回退 |
+| `E_SYNC_ACK_TIMEOUT` | 上行全片 ACK 超时 | `sync()` 幂等可安全重跑 |
+| `E_SYNC_PEER_DEAD` | 对端三维硬阈值超限 | 对端需 re-baseline 重新入域 |
+| `W_SYNC_PEER_LAGGING` | 对端触软阈值 | 观察，必要时排查链路 |
+
+---
+
+### 15.11 与 Excel 子系统的关系
+
+| 维度 | 关系 |
+|---|---|
+| **打包** | 同步与 Excel **编进同一个 `libdbridge`**，不是独立库；但公开接口独立（`DataBridge.h` 不暴露 sync API） |
+| **复用（DRY）** | `UpsertExecutor` 从 `ImportService` 的 UPSERT 循环提取，**import / 场景 2 save / 上行推送三路共用**；`FkClosureBuilder` 复用 `SchemaIntrospector`/`TopoSorter`/`FkInjector`；`BatchTransfer` 复用 `DataBridge`（profiles/catalog）+ `ImportService`/`ExportService` |
+| **写边界** | 同步激活后（`setSyncActive(true, syncTables)`），主线程 `DataBridge::importExcel` 对**同步表**统一拒绝 `E_SYNC_WRITE_BLOCKED`、`db_` 对同步表降为只读；**非同步表不受限**。`db_` 与写线程 `wconn` 指向同一 `.db`，但同步模式下 `wconn` 是同步表唯一受控写者 |
+| **入口** | 三个工厂都接收 `DataBridge&`：`createSyncEngine(bridge)` / `createBatchTransfer(bridge)` / `createComparisonSession(config, &err)`；按库的**物理文件标识**共享同一 `SyncContext` |
+
+---
+
+### 15.12 构建、测试与实现状态
+
+**构建集成（`CMakeLists.txt`）**
+
+- `src/sync/**` 与 `src/batch/BatchTransfer.cpp` 直接编进**同一个 `dbridge` 库**，**无独立 target**。
+- 单独的静态库 `dbridge_sqlite3`（从 Qt 自带 `sqlite3.c` 编译，开启 `SQLITE_ENABLE_SESSION` + `SQLITE_ENABLE_PREUPDATE_HOOK`），`dbridge` PRIVATE 链接它，并自身也加这两个编译宏 —— **没有这两个宏，Session/rebaser 不可用，同步无法工作**。
+- sqlite3 源路径默认 `/opt/Qt5.12.12/.../sqlite3.c`，可经 cache 变量 `QT_SQLITE_SRC` / `QT_SQLITE_INC` 覆盖。
+
+**测试**
+
+同步子系统有 **19 套单元测试**（`tests/unit/tst_sync_*` 18 套 + `tst_write_txn`），随 `BUILD_TESTING` 经 CTest 运行（全库共 38 个 CTest 目标）。覆盖：applied_vector、changelog_store、conflict_arbiter、consistency_cache、dead_peer_evictor、foreground_gate、inbound_table_gate、inbox_ledger、outbound_ack、payload_codec、quarantine_store、routing_table、row_winner、schema_eligibility、schema_guard、staging_buffer、table_state、upsert_executor、write_txn。最近一次提交记录为 **209 个用例全绿**（数据驱动展开后）。每套同时提供 `.pro`（qmake）与 CMake 双构建。
+
+**实现状态**
+
+源码树已完整覆盖全部模块（含 baseline / peer / diff / conflict 等加固层）。经 **39 轮代码审查**，最新一轮 **0 Critical / 0 High / 0 Medium / 1 Low**（`ConsistencyCache::init()` 失败静默降级缺可观测告警，非阻断），构建通过。
+
+**阶段路线（设计 §里程碑）**
+
+| 阶段 | 内容 |
+|---|---|
+| **M0** | SQLite Session 构建 + 句柄穿透 + rebaser 硬验收（**不过不进、无降级**） |
+| **M1** | 两节点最小同步（M1a/M1b/M1c） |
+| **M2** | 星型 + 上行选择性推送 |
+| **M3** | 批量导入导出门面（`IBatchTransfer`） |
+| **M4** | 场景 2 可视化差异比对/合并 |
+| **M5** | 加固（死节点驱逐、基线坍缩、隔离重放等） |
+
+> **设计 vs 计划的若干修订（最新结论）**：锚点拆为 `OutboundAckStore`（发送端）+ `AppliedVectorStore`（接收端），弃用含糊的 `AnchorStore`；表级判等用 `schema_fingerprint + row_count + content_checksum` 三元组（`high_water_seq` 不参与）；长推送不引入 per-push staging 表、不跨片回滚，靠"FK 安全 + 半截不外泄 + re-baseline 收口"三道边界。
 
 ---
 

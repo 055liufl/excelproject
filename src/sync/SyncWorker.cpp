@@ -1071,11 +1071,17 @@ bool SyncWorker::processBaselineResponseArtifact(const DecodeResult& dec,
             const QSqlRecord rec = rowQ.record();
             while (rowQ.next()) {
                 const QString pk = rowQ.value(pkCol).toString();
+                // M-01 fix: use QVariantMap (sorted by key) to match
+                // FkClosureBuilder::rowFingerprint() which also iterates a QVariantMap, ensuring
+                // isConsistent() can always find a match.
+                QVariantMap rowMap;
+                for (int ci = 0; ci < rec.count(); ++ci)
+                    rowMap.insert(rec.fieldName(ci), rowQ.value(ci));
                 QByteArray buf;
-                for (int ci = 0; ci < rec.count(); ++ci) {
-                    buf += rec.fieldName(ci).toUtf8();
+                for (auto it = rowMap.constBegin(); it != rowMap.constEnd(); ++it) {
+                    buf += it.key().toUtf8();
                     buf += '\0';
-                    buf += rowQ.value(ci).toString().toUtf8();
+                    buf += it.value().toString().toUtf8();
                     buf += '\0';
                 }
                 const QByteArray fp = QCryptographicHash::hash(buf, QCryptographicHash::Sha1);
@@ -1986,21 +1992,10 @@ void SyncWorker::enqueueSelectionPush(const SyncSelection& selection,
         // the foreground sync() caller.
         pendingPushId_ = pushId;
 
-        // H-02 fix: persist FrozenManifest entries BEFORE writing outbox so that
-        // interrupted pushes can be resumed from the stored snapshot rather than
-        // re-reading the live database (which may have changed since the snapshot).
-        if (!pushId.isEmpty() && wconnPtr_) {
-            FrozenManifest fm;
-            for (const auto& chunk : chunks) {
-                QString fmErr;
-                fm.save(*wconnPtr_, chunk.pushId, chunk.chunkSeq, chunk.entries, &fmErr);
-                // Non-fatal: resume may re-read the DB, but functionality is not broken.
-                Q_UNUSED(fmErr)
-            }
-        }
-
         // M-05 / C-02: create push_progress(streaming) on the worker thread BEFORE writing chunks.
         // L-01 fix: ON CONFLICT DO UPDATE so re-sends refresh total_chunks/status/updated_ms.
+        // H-02 fix: push_progress must be inserted FIRST so FrozenManifest FK constraint is
+        // satisfied when foreign_keys=ON (push_progress.push_id is the referenced parent).
         if (!pushId.isEmpty() && wconnPtr_) {
             QSqlQuery ins(*wconnPtr_);
             ins.prepare(QStringLiteral(
@@ -2016,6 +2011,31 @@ void SyncWorker::enqueueSelectionPush(const SyncSelection& selection,
             ins.addBindValue(config_.schemaVersion());
             ins.addBindValue(QDateTime::currentMSecsSinceEpoch());
             ins.exec();
+        }
+
+        // H-02 fix: persist FrozenManifest entries AFTER push_progress (parent) is inserted
+        // so FK constraint is satisfied.  Errors are reported via errorOccurred; outbox is
+        // skipped on failure so the caller doesn't receive partial/unrecoverable artifacts.
+        if (!pushId.isEmpty() && wconnPtr_) {
+            FrozenManifest fm;
+            bool fmOk = true;
+            for (const auto& chunk : chunks) {
+                QString fmErr;
+                if (!fm.save(*wconnPtr_, chunk.pushId, chunk.chunkSeq, chunk.entries, &fmErr)) {
+                    emit errorOccurred({err::E_SYNC_TRANSPORT, Severity::Error,
+                                        QStringLiteral("syncSelected"), QString(),
+                                        QStringLiteral("FrozenManifest save failed for "
+                                                       "chunk %1: %2")
+                                            .arg(chunk.chunkSeq)
+                                            .arg(fmErr)});
+                    fmOk = false;
+                    break;
+                }
+            }
+            if (!fmOk) {
+                cancelAckWait();
+                return;  // abort outbox writes; push_progress row will time out/be cleaned
+            }
         }
 
         for (const ChunkStreamer::Chunk& chunk : chunks) {

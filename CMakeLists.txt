@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(dbridge LANGUAGES CXX)
+project(dbridge LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -27,13 +27,24 @@ set(QT_SQLITE_INC
     CACHE PATH "Directory containing sqlite3.h")
 
 add_library(dbridge_sqlite3 STATIC ${QT_SQLITE_SRC})
+# sqlite3.c is plain C; disable AUTOMOC/AUTOUIC/AUTORCC (set globally) for this
+# target so the C source is not silently dropped from the language-detection
+# step.
+set_target_properties(
+  dbridge_sqlite3
+  PROPERTIES AUTOMOC OFF
+             AUTOUIC OFF
+             AUTORCC OFF)
 target_compile_definitions(dbridge_sqlite3 PUBLIC SQLITE_ENABLE_SESSION
                                                   SQLITE_ENABLE_PREUPDATE_HOOK)
 target_include_directories(dbridge_sqlite3 PUBLIC ${QT_SQLITE_INC})
 set_target_properties(dbridge_sqlite3 PROPERTIES POSITION_INDEPENDENT_CODE ON)
 # Silence strict warnings from third-party code
-target_compile_options(dbridge_sqlite3
-                       PRIVATE $<$<CXX_COMPILER_ID:GNU,Clang>:-w>)
+target_compile_options(dbridge_sqlite3 PRIVATE $<$<C_COMPILER_ID:GNU,Clang>:-w>)
+# sqlite3 needs pthread + dl on Linux; expose as PUBLIC so any static-linking
+# consumer (examples, tests) automatically picks them up.
+find_package(Threads REQUIRED)
+target_link_libraries(dbridge_sqlite3 PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
 
 set(DBRIDGE_SOURCES
     src/DataBridge.cpp

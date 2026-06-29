@@ -5,7 +5,7 @@ CONFIG  += c++17 console
 CONFIG  -= app_bundle
 TARGET   = sync-demo
 
-QT = core gui sql
+QT = core gui sql network
 
 DEFINES += DBRIDGE_STATIC_DEFINE
 DEFINES += SQLITE_ENABLE_SESSION SQLITE_ENABLE_PREUPDATE_HOOK
@@ -34,4 +34,5 @@ QSQLITE_SESSION_LIB  = $$ROOT_BUILD/3rdparty/qsqlite_session/libqsqlite.so
 QSQLITE_SESSION_DEST = $$OUT_PWD/sqldrivers
 QMAKE_POST_LINK += mkdir -p $$QSQLITE_SESSION_DEST && cp $$QSQLITE_SESSION_LIB $$QSQLITE_SESSION_DEST/libqsqlite.so
 
-SOURCES = main.cpp
+SOURCES = main.cpp udp_transport.cpp
+HEADERS = udp_transport.h

@@ -31,6 +31,7 @@ class SyncEngine : public ISyncEngine {
     SyncResult result() const override;
 
     bool syncSelected(const SyncSelection& selection, QString* err = nullptr) override;
+    bool write(const QList<RowMutation>& mutations, QString* err = nullptr) override;
 
    private:
     // Helpers

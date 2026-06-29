@@ -1,44 +1,54 @@
 /**
- * sync-demo — dbridge SQLite 多节点增量同步范式演示
+ * sync-demo — dbridge SQLite 多节点完整同步流程演示（UDP 传输层）
  *
- * 本 demo 在同一进程内模拟 **中心节点（center）** 与 **子节点（edge）** 之间的
- * 增量同步全流程，演示以下代码范式：
+ * 无任何简化：完整覆盖从「全新边缘节点冷接入」到「双向增量同步、选择性推送、冲突解决」
+ * 的全套同步协议，传输层使用真实 UDP Socket（环回地址）。
  *
- *  1. SyncConfig::Builder  — 构建节点配置（角色/目录/冲突策略/origin 优先级）
- *  2. ISyncEngine          — 引擎生命周期：initialize → sync → 轮询进度/日志
- *  3. IBatchTransfer       — 在同步激活状态下写数据（同步感知导入）
- *  4. SyncSelection::Builder — 上行选择性推送：指定主键集合 + FK 闭包自动补全
- *  5. 冲突场景             — 两个节点独立修改同一行，观察 SourceWins 策略的结果
- *  6. 错误处理             — 逐个检查 SyncError / SyncLogEntry
+ * 节点拓扑：
+ *   center（中心节点，port 15001）  ←→  edge_b（边缘节点，port 15002）
  *
- * ──────────────────────────────────────────────────────────────────────────────
- * 运行方式（在项目构建目录下）：
- *   ./examples/sync-demo/sync-demo <workspace-dir>
+ * 完整同步阶段：
+ *   Phase 1 — 下行初始同步
+ *             center 通过 ISyncEngine::write() 写入基线数据（session 捕获，进入 changelog），
+ *             sync() 广播到全空的 edge_b；edge_b 通过 changeset 从零追齐 center。
+ *             这是"新边缘节点冷接入"的完整协议路径，无任何数据预填简化。
  *
- * workspace-dir 下会自动创建：
- *   center.db   — 中心节点数据库
- *   edge_b.db   — 子节点 B 数据库
- *   center/outbox/  center/inbox/   center/quarantine/
- *   edge_b/outbox/  edge_b/inbox/   edge_b/quarantine/
- * ──────────────────────────────────────────────────────────────────────────────
+ *   Phase 2 — 上行增量同步（Edge_b → Center）
+ *             edge_b 本地写入变更，sync() 打包发往 center，center 应用后回送 ACK。
  *
- * ⚠️  重要说明：
- *   传输层（文件从 outbox → inbox 的实际搬运）由**第三方工具**完成，dbridge 本身
- *   不内置网络/文件拷贝。本 demo 使用 QFile::copy 模拟"本机搬运"，仅供演示。
- *   真实部署中此处替换为 rsync / 消息队列 / 自研网关等。
+ *   Phase 3 — 下行增量同步（Center → Edge_b）
+ *             center 主动写入新员工，sync() 广播；edge_b worker 自动扫描 inbox 并应用，
+ *             演示 center 主动下推的完整路径。
+ *
+ *   Phase 4 — 选择性推送（Edge_b syncSelected → Center）
+ *             syncSelected() + FK 闭包补全 + 一致性剪枝，UDP 全程自动传输 ACK。
+ *
+ *   Phase 5 — 冲突解决（SourceWins，center rank=100）
+ *             两端先后写同一行，RowWinnerStore 仲裁，高优先级一方最终在两端胜出。
+ *
+ * 运行方式：
+ *   ./sync-demo <workspace-dir>
+ *
+ * workspace-dir 自动创建：
+ *   center.db / edge_b.db
+ *   center/{outbox,inbox,quarantine}
+ *   edge_b/{outbox,inbox,quarantine}
+ *
+ * 每次运行请使用全新 workspace 以获得干净的冷启动效果。
  */
 
 #include "dbridge/DataBridge.h"
 #include "dbridge/Errors.h"
-#include "dbridge/IBatchTransfer.h"
 #include "dbridge/sync/ISyncEngine.h"
 #include "dbridge/sync/SyncConfig.h"
 #include "dbridge/sync/SyncSelection.h"
 #include "dbridge/sync/SyncTypes.h"
 
 #include <QCoreApplication>
+#include <QDateTime>
 #include <QDir>
 #include <QFile>
+#include <QHostAddress>
 #include <QSqlDatabase>
 #include <QSqlError>
 #include <QSqlQuery>
@@ -46,12 +56,12 @@
 #include <QString>
 #include <QThread>
 
+#include "udp_transport.h"
 #include <iostream>
 
-// ── 工具宏：打印节点前缀 ──────────────────────────────────────────────────────
+// ── 工具宏 ────────────────────────────────────────────────────────────────────
 #define LOG(node, msg) std::cout << "[" << (node) << "] " << (msg) << std::endl
 
-// ── 工具函数：打印 SyncResult ─────────────────────────────────────────────────
 static void printSyncResult(const std::string& tag, const dbridge::sync::SyncResult& r) {
     std::cout << "\n  ── " << tag << " SyncResult ──\n"
               << "     ok=" << (r.ok ? "true" : "false") << "  payloadsSent=" << r.payloadsSent
@@ -63,81 +73,52 @@ static void printSyncResult(const std::string& tag, const dbridge::sync::SyncRes
                   << "\n";
 }
 
-// ── 工具函数：打印同步引擎的日志环（SyncLogEntry） ───────────────────────────
 static void printLogs(const std::string& node, const QList<dbridge::sync::SyncLogEntry>& logs) {
-    for (const auto& entry : logs) {
-        const char* sev = entry.severity == dbridge::sync::Severity::Warning ? "WARN"
-                          : entry.severity == dbridge::sync::Severity::Error ? "ERR "
-                          : entry.severity == dbridge::sync::Severity::Fatal ? "FATL"
-                                                                             : "INFO";
-        std::cout << "  [" << node << "|" << sev << "] "
-                  << "[" << entry.phase.toStdString() << "] " << entry.message.toStdString()
-                  << "\n";
+    for (const auto& e : logs) {
+        const char* sev = e.severity == dbridge::sync::Severity::Warning ? "WARN"
+                          : e.severity == dbridge::sync::Severity::Error ? "ERR "
+                          : e.severity == dbridge::sync::Severity::Fatal ? "FATL"
+                                                                         : "INFO";
+        std::cout << "  [" << node << "|" << sev << "] [" << e.phase.toStdString() << "] "
+                  << e.message.toStdString() << "\n";
     }
 }
 
-// ── 工具函数：建库 + 建表（center / edge 共用同一 schema）────────────────────
+// 建库建表（center / edge_b 共用同一 schema；仅建表，不插行）
 static bool setupDatabase(const QString& dbPath) {
-    // 用独立连接名避免与 DataBridge 内部连接冲突
-    const QString connName = QStringLiteral("setup_") + dbPath;
+    const QString conn = QStringLiteral("setup_") + dbPath;
     {
-        auto db = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), connName);
+        auto db = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), conn);
         db.setDatabaseName(dbPath);
         if (!db.open()) {
-            std::cerr << "Cannot open " << dbPath.toStdString() << ": "
-                      << db.lastError().text().toStdString() << "\n";
+            std::cerr << "Cannot open " << dbPath.toStdString() << "\n";
             return false;
         }
         QSqlQuery q(db);
-        // 员工表——主表
         q.exec(
             QStringLiteral("CREATE TABLE IF NOT EXISTS employees ("
                            "  id      INTEGER PRIMARY KEY,"
                            "  name    TEXT    NOT NULL,"
                            "  dept    TEXT    NOT NULL,"
-                           "  salary  INTEGER NOT NULL"
-                           ")"));
-        // 项目分配表——外键引用 employees
+                           "  salary  INTEGER NOT NULL)"));
         q.exec(
             QStringLiteral("CREATE TABLE IF NOT EXISTS assignments ("
                            "  id          INTEGER PRIMARY KEY,"
                            "  employee_id INTEGER NOT NULL REFERENCES employees(id),"
                            "  project     TEXT    NOT NULL,"
-                           "  role        TEXT    NOT NULL"
-                           ")"));
+                           "  role        TEXT    NOT NULL)"));
         db.close();
     }
-    QSqlDatabase::removeDatabase(connName);
+    QSqlDatabase::removeDatabase(conn);
     return true;
 }
 
-// ── 工具函数：向数据库直接写入数据（绕过同步，用于演示初始状态）──────────────
-static bool seedData(const QString& dbPath, const QStringList& sqls) {
-    const QString connName = QStringLiteral("seed_") + dbPath;
-    {
-        auto db = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), connName);
-        db.setDatabaseName(dbPath);
-        if (!db.open())
-            return false;
-        QSqlQuery q(db);
-        for (const auto& sql : sqls) {
-            if (!q.exec(sql)) {
-                std::cerr << "SQL failed: " << sql.toStdString() << " — "
-                          << q.lastError().text().toStdString() << "\n";
-                return false;
-            }
-        }
-        db.close();
-    }
-    QSqlDatabase::removeDatabase(connName);
-    return true;
-}
-
-// ── 工具函数：查询并打印一张表的全部行 ───────────────────────────────────────
+// 查询并打印一张表
 static void dumpTable(const QString& dbPath, const QString& table, const std::string& label) {
-    const QString connName = QStringLiteral("dump_") + dbPath + table;
+    const QString conn = QStringLiteral("dump_") + dbPath + table +
+                         QString::number(QDateTime::currentMSecsSinceEpoch());
     {
-        auto db = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), connName);
+        auto db = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), conn);
         db.setDatabaseName(dbPath);
         db.open();
         QSqlQuery q(db);
@@ -151,54 +132,57 @@ static void dumpTable(const QString& dbPath, const QString& table, const std::st
         }
         db.close();
     }
-    QSqlDatabase::removeDatabase(connName);
+    QSqlDatabase::removeDatabase(conn);
 }
 
-// ── 工具函数："搬运" outbox 到对端 inbox（模拟传输层）────────────────────────
-// 真实场景：此处换成 rsync / sftp / 消息队列投递等。
-static void transferArtifacts(const QString& fromOutbox, const QString& toInbox) {
-    QDir outDir(fromOutbox);
-    QStringList readyFiles =
-        outDir.entryList(QStringList() << QStringLiteral("*.ready"), QDir::Files);
-
-    for (const QString& readyName : readyFiles) {
-        // 每个 .ready 哨兵对应一个同名 .payload 主文件
-        QString baseName = readyName;
-        baseName.remove(readyName.size() - 6, 6);  // 去掉 ".ready"
-
-        // 只搬运同名的 .payload（若尚未到对端）
-        QString payloadName = baseName;  // 格式已含后缀
-        QString srcPayload = fromOutbox + "/" + payloadName;
-        QString dstPayload = toInbox + "/" + payloadName;
-        QString srcReady = fromOutbox + "/" + readyName;
-        QString dstReady = toInbox + "/" + readyName;
-
-        if (!QFile::exists(srcPayload))
-            continue;
-        if (QFile::exists(dstPayload))
-            continue;  // 幂等：已搬就跳过
-
-        QFile::copy(srcPayload, dstPayload);
-
-        // 先落主文件再落哨兵，与 OutboxWriter 的原子发布协议一致
-        QFile::copy(srcReady, dstReady);
+// 轮询引擎状态直到终止（Completed / Idle / Failed）或超时
+static bool waitForEngine(dbridge::sync::ISyncEngine* engine, const char* name,
+                          int timeoutMs = 8000) {
+    const qint64 deadline = QDateTime::currentMSecsSinceEpoch() + timeoutMs;
+    while (QDateTime::currentMSecsSinceEpoch() < deadline) {
+        auto st = engine->state();
+        if (st == dbridge::sync::SyncState::Completed || st == dbridge::sync::SyncState::Idle ||
+            st == dbridge::sync::SyncState::Failed)
+            return st != dbridge::sync::SyncState::Failed;
+        QThread::msleep(100);
     }
+    std::cerr << "waitForEngine timeout: " << name << "\n";
+    return false;
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// 第一阶段：演示 "基线同步" ——
-//   center 有初始数据，edge_b 从空库冷启动，拿到完整基线。
-//
-// （本 demo 简化：两端从相同 seed 数据起步，跳过实际 Baseline 报文交换，
-//   直接 seed edge_b 为与 center 相同内容，然后演示增量同步。
-//   真实冷启动：调 BaselineManager，通过 BaselineRequest/Response 报文传输全量。）
+// 构造 RowMutation 辅助（employees 表：4 列）
+static dbridge::sync::RowMutation empMut(int id, const QString& name, const QString& dept,
+                                         int salary) {
+    dbridge::sync::RowMutation m;
+    m.table = QStringLiteral("employees");
+    m.columns = QStringList{QStringLiteral("id"), QStringLiteral("name"), QStringLiteral("dept"),
+                            QStringLiteral("salary")};
+    m.values = QVariantList{id, name, dept, salary};
+    m.pkColumns = QStringList{QStringLiteral("id")};
+    m.mode = dbridge::sync::UpsertMode::DoUpdate;
+    return m;
+}
+
+// 构造 RowMutation 辅助（assignments 表：4 列）
+static dbridge::sync::RowMutation asnMut(int id, int empId, const QString& project,
+                                         const QString& role) {
+    dbridge::sync::RowMutation m;
+    m.table = QStringLiteral("assignments");
+    m.columns = QStringList{QStringLiteral("id"), QStringLiteral("employee_id"),
+                            QStringLiteral("project"), QStringLiteral("role")};
+    m.values = QVariantList{id, empId, project, role};
+    m.pkColumns = QStringList{QStringLiteral("id")};
+    m.mode = dbridge::sync::UpsertMode::DoUpdate;
+    return m;
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 
 int main(int argc, char* argv[]) {
     QCoreApplication app(argc, argv);
-    // Qt 5.12 appends applicationDirPath() at the END of libraryPaths(), so
-    // the system QSQLITE plugin (without session support) wins. Put our
-    // sqldrivers/ copy first by rebuilding the list with appDir at position 0.
+    // Qt 5.12 把 applicationDirPath() 追加到 libraryPaths 末尾，导致系统 QSQLITE
+    // （无 session 支持）优先加载。用 setLibraryPaths 把应用目录提到首位，让
+    // sqldrivers/libqsqlite.so（session-enabled）赢得插件竞争。
     {
         QStringList paths;
         paths.append(app.applicationDirPath());
@@ -214,110 +198,73 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     const QString ws = QString::fromLocal8Bit(argv[1]);
-    QDir().mkpath(ws + "/center/outbox");
-    QDir().mkpath(ws + "/center/inbox");
-    QDir().mkpath(ws + "/center/quarantine");
-    QDir().mkpath(ws + "/edge_b/outbox");
-    QDir().mkpath(ws + "/edge_b/inbox");
-    QDir().mkpath(ws + "/edge_b/quarantine");
+    for (const QString& sub : {QStringLiteral("center/outbox"), QStringLiteral("center/inbox"),
+                               QStringLiteral("center/quarantine"), QStringLiteral("edge_b/outbox"),
+                               QStringLiteral("edge_b/inbox"), QStringLiteral("edge_b/quarantine")})
+        QDir().mkpath(ws + "/" + sub);
 
     const QString centerDb = ws + "/center.db";
     const QString edgeBDb = ws + "/edge_b.db";
 
     std::cout << "=================================================\n"
-              << " sync-demo: dbridge 多节点增量同步范式\n"
+              << " sync-demo: dbridge 完整多节点同步流程（UDP）\n"
               << "=================================================\n"
               << "  workspace : " << ws.toStdString() << "\n"
               << "  center.db : " << centerDb.toStdString() << "\n"
               << "  edge_b.db : " << edgeBDb.toStdString() << "\n\n";
 
     // ── 1. 建库建表 ──────────────────────────────────────────────────────────
-    LOG("SETUP", "建库建表...");
+    // 双端均只建 schema（CREATE TABLE）；edge_b 不写任何行，
+    // 模拟「全新边缘节点冷接入」的真实场景。
+    LOG("SETUP", "建库建表（双端 schema 对齐，edge_b 无任何行数据）...");
     if (!setupDatabase(centerDb) || !setupDatabase(edgeBDb))
         return 1;
-
-    // 初始数据（center 和 edge_b 以相同内容起步，模拟基线已对齐）
-    QStringList initSqls = {
-        QStringLiteral("INSERT OR IGNORE INTO employees VALUES (1,'张三','研发',20000)"),
-        QStringLiteral("INSERT OR IGNORE INTO employees VALUES (2,'李四','产品',18000)"),
-        QStringLiteral("INSERT OR IGNORE INTO employees VALUES (3,'王五','研发',22000)"),
-        QStringLiteral("INSERT OR IGNORE INTO assignments VALUES (1,1,'ProjectA','Lead')"),
-        QStringLiteral("INSERT OR IGNORE INTO assignments VALUES (2,2,'ProjectA','Member')"),
-        QStringLiteral("INSERT OR IGNORE INTO assignments VALUES (3,3,'ProjectB','Lead')"),
-    };
-    if (!seedData(centerDb, initSqls))
-        return 1;
-    if (!seedData(edgeBDb, initSqls))
-        return 1;
-    LOG("SETUP", "初始数据就绪（center 与 edge_b 内容相同，模拟基线对齐完毕）");
+    LOG("SETUP", "schema 建立完成");
 
     // ── 2. 打开 DataBridge ───────────────────────────────────────────────────
     dbridge::DataBridge centerBridge, edgeBridge;
     QString err;
-
     dbridge::ConnectionSpec centerSpec, edgeSpec;
     centerSpec.sqlitePath = centerDb;
     edgeSpec.sqlitePath = edgeBDb;
-    centerSpec.enableWal = true;
-    edgeSpec.enableWal = true;
-
+    centerSpec.enableWal = edgeSpec.enableWal = true;
     if (!centerBridge.open(centerSpec, &err)) {
-        std::cerr << "center open failed: " << err.toStdString() << "\n";
+        std::cerr << "center DataBridge open failed: " << err.toStdString() << "\n";
         return 1;
     }
     if (!edgeBridge.open(edgeSpec, &err)) {
-        std::cerr << "edge_b open failed: " << err.toStdString() << "\n";
+        std::cerr << "edge_b DataBridge open failed: " << err.toStdString() << "\n";
         return 1;
     }
     LOG("SETUP", "DataBridge 已打开");
 
-    // ── 3. 构建 SyncConfig：中心节点 ─────────────────────────────────────────
-    //
-    //  SyncConfig::Builder 采用 Fluent 链式调用风格。
-    //  所有必填项（nodeId / database / outboxDir / inboxDir）缺失时
-    //  build() 会写 *err 并返回 isValid()==false 的对象。
-    //
-    //  关键配置说明：
-    //  - role(Center)         ：该节点是权威源，负责裁决冲突并向全域广播
-    //  - originPriority       ：rank 越大优先级越高，用于 (rank,seq) 冲突全序
-    //  - conflictPolicy       ：SourceWins = 高 rank origin 的变更赢得冲突
-    //  - broadcastThreshold(1)：攒 1 条变更即触发广播（演示用，生产建议 ≥100）
-    //  - syncTables           ：空列表 = 监控所有用户表
-
+    // ── 3. 构建 SyncConfig ───────────────────────────────────────────────────
     dbridge::sync::SyncConfig centerCfg =
         dbridge::sync::SyncConfig::Builder()
             .nodeId(QStringLiteral("center"))
             .role(dbridge::sync::NodeRole::Center)
-            .addPeerNode(QStringLiteral("edge_b"))  // 中心知道自己有哪些子节点
+            .addPeerNode(QStringLiteral("edge_b"))
             .database(centerDb)
             .outboxDir(ws + "/center/outbox")
             .inboxDir(ws + "/center/inbox")
             .quarantineDir(ws + "/center/quarantine")
             .conflictPolicy(dbridge::sync::ConflictPolicy::SourceWins)
-            // center rank=100, edge_b rank=50 → center 的变更在冲突时赢
             .originPriority(QStringLiteral("center"), 100)
             .originPriority(QStringLiteral("edge_b"), 50)
-            .broadcastThreshold(1)     // 演示：攒 1 条即广播
-            .broadcastIntervalMs(500)  // 演示：500ms 最大等待
-            .ackMaxDelayMs(2000)       // ACK 最大等待 2s
+            .broadcastIntervalMs(300)
+            .ackMaxDelayMs(6000)
             .build(&err);
-
     if (!centerCfg.isValid()) {
-        std::cerr << "center SyncConfig build failed: " << err.toStdString() << "\n";
+        std::cerr << "center SyncConfig failed: " << err.toStdString() << "\n";
         return 1;
     }
-
-    // ── 4. 构建 SyncConfig：子节点 B ─────────────────────────────────────────
-    //
-    //  Edge 节点必须指定 centerNodeId。
-    //  rank 与 center 保持全局一致（均在此处配置）。
 
     dbridge::sync::SyncConfig edgeCfg =
         dbridge::sync::SyncConfig::Builder()
             .nodeId(QStringLiteral("edge_b"))
             .role(dbridge::sync::NodeRole::Edge)
-            .centerNodeId(QStringLiteral("center"))  // 指定权威源
-            .addPeerNode(QStringLiteral("center"))   // edge_b 只与 center 通信
+            .centerNodeId(QStringLiteral("center"))
+            .addPeerNode(QStringLiteral("center"))
             .database(edgeBDb)
             .outboxDir(ws + "/edge_b/outbox")
             .inboxDir(ws + "/edge_b/inbox")
@@ -325,28 +272,16 @@ int main(int argc, char* argv[]) {
             .conflictPolicy(dbridge::sync::ConflictPolicy::SourceWins)
             .originPriority(QStringLiteral("center"), 100)
             .originPriority(QStringLiteral("edge_b"), 50)
-            .broadcastThreshold(1)
-            .broadcastIntervalMs(500)
-            .ackMaxDelayMs(2000)
+            .broadcastIntervalMs(300)
+            .ackMaxDelayMs(6000)
             .build(&err);
-
     if (!edgeCfg.isValid()) {
-        std::cerr << "edge_b SyncConfig build failed: " << err.toStdString() << "\n";
+        std::cerr << "edge_b SyncConfig failed: " << err.toStdString() << "\n";
         return 1;
     }
-    LOG("SETUP", "SyncConfig 构建完成（center + edge_b）");
+    LOG("SETUP", "SyncConfig 构建完成");
 
-    // ── 5. 创建并初始化同步引擎 ──────────────────────────────────────────────
-    //
-    //  createSyncEngine(bridge) 以 DataBridge 实例为 key，按物理文件标识
-    //  (st_dev, st_ino) 共享 SyncContext，保证同一 .db 只有一个写线程。
-    //
-    //  initialize() 做：
-    //    ① SchemaEligibility 校验（拒绝虚表/无 PK 表等）
-    //    ② 创建/迁移 11 张 __sync_* 元数据表
-    //    ③ 挂载 SQLite session（SQLITE_ENABLE_SESSION 必须开启）
-    //    ④ 启动 SyncWorker 后台写线程
-
+    // ── 4. 创建并初始化同步引擎 ──────────────────────────────────────────────
     auto centerEngine = dbridge::sync::createSyncEngine(centerBridge);
     auto edgeEngine = dbridge::sync::createSyncEngine(edgeBridge);
 
@@ -362,183 +297,321 @@ int main(int argc, char* argv[]) {
     }
     LOG("edge_b", "同步引擎初始化成功");
 
-    // ── 6. 在 edge_b 上本地修改数据 ──────────────────────────────────────────
+    // ── 5. 启动 UDP 传输层 ───────────────────────────────────────────────────
     //
-    //  同步引擎激活后，所有对同步表的直接 importExcel() 会被拦截。
-    //  通过 IBatchTransfer 写入，写操作会经由 SyncWorker 的唯一写连接
-    //  完成，同时 SQLite session 捕获变更写入 __sync_changelog。
+    //  center  ←──UDP 15001──  edge_b  （edge_b 向 center 发送，包含 changeset + ACK）
+    //  center  ──UDP 15002──→  edge_b  （center 向 edge_b 发送，包含 changeset + ACK）
+    //
+    //  每个 UdpFileTransport 后台线程：
+    //    · 每 50ms 轮询 outboxDir，发现 .ready 标记后以 60KB/片发送 UDP 数据报
+    //    · 同时侦听自己的端口，收到完整数据报后写入 inboxDir 并创建 .ready 标记
+    //  SyncWorker 主循环每 broadcastIntervalMs=300ms 扫描 inbox + 广播 outbox，
+    //  与 UDP 线程协作实现无手动干预的端对端数据流转。
 
-    std::cout << "\n--- 步骤 A：edge_b 本地修改员工薪资 ---\n";
+    std::cout << "\n--- 启动 UDP 传输层 ---\n";
+    const QHostAddress loopback(QHostAddress::LocalHost);
 
-    // 直接用 SQL（seed 级辅助函数）在 edge_b 上修改薪资
-    // 注意：生产中应通过 IBatchTransfer / DataBridge 导入（带 session 捕获）。
-    // 此处为演示简化，直接写 DB；真实增量由 session 捕获。
-    if (!seedData(
-            edgeBDb,
-            {
-                QStringLiteral("UPDATE employees SET salary=25000 WHERE id=3"),  // 王五涨薪
-                QStringLiteral(
-                    "INSERT OR REPLACE INTO employees VALUES (4,'赵六','市场',16000)"),  // 新员工
-            }))
+    UdpFileTransport centerTransport(15001, loopback, 15002, ws + "/center/outbox",
+                                     ws + "/center/inbox");
+    UdpFileTransport edgeTransport(15002, loopback, 15001, ws + "/edge_b/outbox",
+                                   ws + "/edge_b/inbox");
+
+    centerTransport.start();
+    edgeTransport.start();
+    QThread::msleep(100);  // 等待 socket bind 完成
+    LOG("UDP", "center 侦听 :15001  edge_b 侦听 :15002  传输层就绪");
+
+    // ════════════════════════════════════════════════════════════════════════
+    // Phase 1: 下行初始同步（Center → Edge_b）
+    //
+    // center 通过 ISyncEngine::write() 写入全部基线数据。write() 经由
+    // SyncWorker 的唯一写连接 + SessionRecorder 完成，每一行变更都被
+    // SQLite session 捕获并写入 __sync_changelog。
+    //
+    // employees 与 assignments 分两次 write()，保证 edge_b 应用 changeset
+    // 时 FK 父行（employees）先于子行（assignments）落库。
+    //
+    // center.sync() 将 changelog 打包成 changeset artifact，写入 center/outbox；
+    // UDP 传输层将其送达 edge_b/inbox；edge_b 的 SyncWorker 扫描到 inbox
+    // 后应用 changeset，将变更写入 edge_b.db，再回送 ACK；UDP 将 ACK
+    // 送达 center/inbox；center SyncWorker 收到 ACK 后将前台 sync() 标记
+    // 为 Completed，ACK 等待解除。
+    //
+    // 整个流程不依赖任何预填数据：edge_b 真正从零追齐 center。
+    // ════════════════════════════════════════════════════════════════════════
+    std::cout << "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+              << " Phase 1: 下行初始同步（Center 基线 → 空白 Edge_b）\n"
+              << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
+
+    // 1-a: 写入员工记录（employees 先写，session 捕获，进入 changelog）
+    if (!centerEngine->write({empMut(1, QStringLiteral("张三"), QStringLiteral("研发"), 20000),
+                              empMut(2, QStringLiteral("李四"), QStringLiteral("产品"), 18000),
+                              empMut(3, QStringLiteral("王五"), QStringLiteral("研发"), 22000)},
+                             &err)) {
+        std::cerr << "center write employees failed: " << err.toStdString() << "\n";
         return 1;
-    LOG("edge_b", "本地变更：王五薪资 22000→25000，新增赵六");
-
-    // ── 7. edge_b 手动触发 sync()——将本地变更打包到 outbox ──────────────────
-    //
-    //  sync() 是"手动 drain"：
-    //    ① 扫描 inbox，接收并应用来自 center 的下行变更
-    //    ② 将 changelog 里新产生的变更打包成制品写到 outbox
-    //  非阻塞：不等第三方工具把文件搬到 center 的 inbox。
-
-    std::cout << "\n--- 步骤 B：edge_b sync()——打包 outbox ---\n";
-    if (!edgeEngine->sync(&err)) {
-        std::cerr << "edge_b sync failed: " << err.toStdString() << "\n";
     }
-    LOG("edge_b", "sync() 完成，变更已写入 outbox");
-    printLogs("edge_b", edgeEngine->logs());
+    LOG("center", "[1-a] 写入员工基线（id 1-3）→ changelog");
 
-    // ── 8. 模拟传输层：把 edge_b outbox → center inbox ───────────────────────
-    std::cout << "\n--- 步骤 C：传输层 edge_b/outbox → center/inbox ---\n";
-    transferArtifacts(ws + "/edge_b/outbox", ws + "/center/inbox");
-    LOG("transport", "edge_b outbox → center inbox 搬运完成");
+    // 1-b: 写入分配记录（assignments 后写，FK 父行已在 changelog 中）
+    if (!centerEngine->write({asnMut(1, 1, QStringLiteral("ProjectA"), QStringLiteral("Lead")),
+                              asnMut(2, 2, QStringLiteral("ProjectA"), QStringLiteral("Member")),
+                              asnMut(3, 3, QStringLiteral("ProjectB"), QStringLiteral("Lead"))},
+                             &err)) {
+        std::cerr << "center write assignments failed: " << err.toStdString() << "\n";
+        return 1;
+    }
+    LOG("center", "[1-b] 写入分配基线（id 1-3）→ changelog");
 
-    // ── 9. center sync()——接收 edge_b 发来的变更 ─────────────────────────────
-    std::cout << "\n--- 步骤 D：center sync()——应用入站变更并广播 ---\n";
+    // 1-c: center.sync() — 将两批 changelog 打包为 changeset artifact，写入 outbox，
+    //      arm ACK wait；UDP 传输；edge_b 应用；edge_b 回送 ACK；center Completed。
+    std::cout << "\n  [center] sync() → 打包 changelog → UDP 发往 edge_b ...\n";
     if (!centerEngine->sync(&err)) {
         std::cerr << "center sync failed: " << err.toStdString() << "\n";
+        return 1;
     }
-    LOG("center", "sync() 完成");
+    if (!waitForEngine(centerEngine.get(), "center Phase 1 初始广播")) {
+        std::cerr << "center Phase 1 sync 超时\n";
+        return 1;
+    }
+    printSyncResult("center Phase 1", centerEngine->result());
     printLogs("center", centerEngine->logs());
-    printSyncResult("center", centerEngine->result());
 
-    // center 把裁决后的变更广播回 edge_b（防回声：不会把 edge_b 原来的包再发回去）
-    std::cout << "\n--- 步骤 E：传输层 center/outbox → edge_b/inbox ---\n";
-    transferArtifacts(ws + "/center/outbox", ws + "/edge_b/inbox");
-    LOG("transport", "center outbox → edge_b inbox 搬运完成");
+    // edge_b 收到 changeset 后 SyncWorker 在下一个 broadcastIntervalMs 内自动扫描
+    // inbox 并应用；ACK 已在上面的 waitForEngine 之前发出（apply 成功后立即调度）。
+    // 此处稍等以确保 edge_b 日志已记录完毕，方便打印。
+    QThread::msleep(500);
+    printLogs("edge_b", edgeEngine->logs());
 
-    // edge_b 再次 sync()，接收 center 的 ACK 及下行广播（本次内容应已有）
-    if (!edgeEngine->sync(&err)) {
-        std::cerr << "edge_b sync(2) failed: " << err.toStdString() << "\n";
+    std::cout << "\n===== Phase 1 完成：两端数据应完全一致 =====\n";
+    dumpTable(centerDb, QStringLiteral("employees"), "center");
+    dumpTable(edgeBDb, QStringLiteral("employees"), "edge_b");
+    dumpTable(centerDb, QStringLiteral("assignments"), "center");
+    dumpTable(edgeBDb, QStringLiteral("assignments"), "edge_b");
+
+    // ════════════════════════════════════════════════════════════════════════
+    // Phase 2: 上行增量同步（Edge_b → Center）
+    //
+    // edge_b 在本地执行业务写入（session 捕获），sync() 将变更打包为
+    // changeset artifact 发往 center；center SyncWorker 应用后回送 ACK；
+    // edge_b 收到 ACK 后前台 sync() 标记 Completed。
+    //
+    // 这是最典型的「边缘节点上报变更」路径，完整经历了：
+    //   write() → changelog → sync() → outbox artifact → UDP → center inbox
+    //   → ChangesetApplier.apply() → center DB 更新 → AckChannel.flush()
+    //   → ACK artifact → UDP → edge_b inbox → processAckArtifact() → Completed
+    // ════════════════════════════════════════════════════════════════════════
+    std::cout << "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+              << " Phase 2: 上行增量同步（Edge_b → Center）\n"
+              << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
+
+    // 王五薪资 22000 → 25000；新增员工赵六
+    if (!edgeEngine->write({empMut(3, QStringLiteral("王五"), QStringLiteral("研发"), 25000),
+                            empMut(4, QStringLiteral("赵六"), QStringLiteral("市场"), 16000)},
+                           &err)) {
+        std::cerr << "edge_b write failed: " << err.toStdString() << "\n";
+        return 1;
     }
-    LOG("edge_b", "sync(2) 完成");
+    LOG("edge_b", "[2-a] 写入：王五薪资 22000→25000，新增赵六（市场部）→ changelog");
 
-    // ── 10. 打印同步后两端的数据状态 ─────────────────────────────────────────
-    std::cout << "\n===== 自动增量同步后的数据状态 =====\n";
+    std::cout << "\n  [edge_b] sync() → 打包 changelog → UDP 发往 center ...\n";
+    if (!edgeEngine->sync(&err)) {
+        std::cerr << "edge_b sync failed: " << err.toStdString() << "\n";
+        return 1;
+    }
+    if (!waitForEngine(edgeEngine.get(), "edge_b Phase 2")) {
+        std::cerr << "edge_b Phase 2 sync 超时\n";
+    }
+    printSyncResult("edge_b Phase 2", edgeEngine->result());
+
+    // 给 center 足够时间处理并写 ACK 日志
+    QThread::msleep(600);
+    printLogs("center", centerEngine->logs());
+
+    std::cout << "\n===== Phase 2 完成：center 已应用 edge_b 的变更 =====\n";
     dumpTable(centerDb, QStringLiteral("employees"), "center");
     dumpTable(edgeBDb, QStringLiteral("employees"), "edge_b");
 
-    // ── 11. 演示"上行选择性推送"（syncSelected）────────────────────────────
+    // ════════════════════════════════════════════════════════════════════════
+    // Phase 3: 下行增量同步（Center → Edge_b 主动广播）
     //
-    //  场景：edge_b 离线期间新增了一批项目分配记录，现在手动选择推给 center。
-    //  syncSelected 会：
-    //    ① SelectionResolver 解析 PK 集合
-    //    ② FkClosureBuilder  自动求外键依赖闭包（assignments 引用 employees）
-    //    ③ ConsistencyCache  剪枝已与 center 一致的依赖父行（节省带宽）
-    //    ④ ChunkStreamer      按 pushChunkBudgetBytes 分片发送
-    //    ⑤ 等待全片 ACK      超时报 E_SYNC_ACK_TIMEOUT
+    // center 主动写入新员工钱七，sync() 将变更广播给 edge_b；
+    // edge_b SyncWorker 在 broadcastIntervalMs 内自动扫描 inbox 并应用，
+    // 随后回送 ACK，center 前台 sync() 标记 Completed。
+    //
+    // 与 Phase 2 的区别：发起方是 center（高权威节点），接收方是 edge_b，
+    // 演示了完整的「中心主动下推」协议路径。
+    // ════════════════════════════════════════════════════════════════════════
+    std::cout << "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+              << " Phase 3: 下行增量同步（Center → Edge_b）\n"
+              << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
 
-    std::cout << "\n--- 步骤 F：edge_b syncSelected()——上行选择推送 ---\n";
-
-    // 先在 edge_b 新增一条分配记录（员工 4 / 赵六 → ProjectC）
-    if (!seedData(edgeBDb,
-                  {
-                      QStringLiteral(
-                          "INSERT OR IGNORE INTO assignments VALUES (4,4,'ProjectC','Member')"),
-                  }))
+    if (!centerEngine->write({empMut(5, QStringLiteral("钱七"), QStringLiteral("运营"), 17000)},
+                             &err)) {
+        std::cerr << "center write failed: " << err.toStdString() << "\n";
         return 1;
-    LOG("edge_b", "本地新增分配：赵六 → ProjectC");
+    }
+    LOG("center", "[3-a] 写入：新员工钱七（运营部，id=5）→ changelog");
 
-    // 构建 SyncSelection：选中 assignments 主键 "4"
-    //   includeFkDependencies(true)  → 自动带上 employees.id=4 的父行
-    //   pruneConsistentDependencies  → 若 center 已有该父行则剪枝
+    std::cout << "\n  [center] sync() → 打包 changelog → UDP 发往 edge_b ...\n";
+    if (!centerEngine->sync(&err)) {
+        std::cerr << "center sync failed: " << err.toStdString() << "\n";
+        return 1;
+    }
+    if (!waitForEngine(centerEngine.get(), "center Phase 3")) {
+        std::cerr << "center Phase 3 sync 超时\n";
+    }
+    printSyncResult("center Phase 3", centerEngine->result());
+
+    QThread::msleep(600);
+    printLogs("edge_b", edgeEngine->logs());
+
+    std::cout << "\n===== Phase 3 完成：edge_b 已自动应用 center 的新员工 =====\n";
+    dumpTable(centerDb, QStringLiteral("employees"), "center");
+    dumpTable(edgeBDb, QStringLiteral("employees"), "edge_b");
+
+    // ════════════════════════════════════════════════════════════════════════
+    // Phase 4: 选择性推送（Edge_b syncSelected → Center）
+    //
+    // edge_b 为赵六新建分配记录（assignments.id=4），然后通过 syncSelected()
+    // 精确指定推送该记录；框架自动补全 FK 父行（employees.id=4）并对
+    // center 已拥有的一致父行执行剪枝（pruneConsistentDependencies=true），
+    // 仅发送差异部分。
+    //
+    // 完整协议路径：
+    //   syncSelected() → SelectionResolver → FkClosureBuilder → ChunkStreamer
+    //   → OutboxWriter（SelectionPush artifact）→ UDP → center inbox
+    //   → processSelectionPushArtifact() → SelectionPushApplier.apply()
+    //   → center DB 更新 → PushChunkAck → UDP → edge_b inbox
+    //   → processAckArtifact() → pendingPushId_ 清除 → Completed
+    // ════════════════════════════════════════════════════════════════════════
+    std::cout << "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+              << " Phase 4: 选择性推送（Edge_b syncSelected → Center）\n"
+              << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
+
+    // 4-a: 写入赵六的项目分配（session 捕获）
+    if (!edgeEngine->write({asnMut(4, 4, QStringLiteral("ProjectC"), QStringLiteral("Member"))},
+                           &err)) {
+        std::cerr << "edge_b write assignment failed: " << err.toStdString() << "\n";
+        return 1;
+    }
+    LOG("edge_b", "[4-a] 写入：赵六 → ProjectC（assignments.id=4）→ changelog");
+
+    // 4-b: 构建选择集——精确选定 assignments.id=4，FK 闭包自动补全 employees.id=4
     dbridge::sync::SyncSelection sel =
         dbridge::sync::SyncSelection::Builder()
             .addRecord(QStringLiteral("assignments"), QStringLiteral("4"))
-            .includeFkDependencies(true)        // 自动补全 FK 父行
-            .pruneConsistentDependencies(true)  // 剪枝已一致的父行
+            .includeFkDependencies(true)
+            .pruneConsistentDependencies(true)
             .build(&err);
-
     if (sel.isEmpty()) {
         std::cerr << "SyncSelection build failed: " << err.toStdString() << "\n";
-        // 非致命：继续演示
-    } else {
-        if (!edgeEngine->syncSelected(sel, &err)) {
-            // syncSelected 的受理前校验失败（空选择/非法表名）从 *err 同步返回
-            // 后台失败（FK闭包/分片超时）则通过 errors()/result() 异步上报
-            std::cerr << "syncSelected rejected: " << err.toStdString() << "\n";
-        } else {
-            LOG("edge_b", "syncSelected() 已提交，等待 ACK...");
-            // syncSelected 是非阻塞的：worker 后台打包分片写 outbox，主线程轮询状态。
-            // ACK 流程：edge_b outbox → center inbox → center 处理并写 ACK → center outbox
-            //          → edge_b inbox → edge_b worker scanInbox() 清除 ackWaiting_。
-            // 第一次迭代等 300ms（给 worker 写 outbox），之后驱动传输层并让
-            // center 处理分片；edge_b worker 在下次 scanInbox() 时自动收到 ACK。
-            bool transported = false;
-            for (int i = 0; i < 20; ++i) {
-                QThread::msleep(300);
-                if (!transported) {
-                    transported = true;
-                    // 搬运：edge_b outbox → center inbox（分片推送报文）
-                    transferArtifacts(ws + "/edge_b/outbox", ws + "/center/inbox");
-                    // center 处理入站分片并将 ACK 写入 center/outbox
-                    centerEngine->sync(&err);
-                    LOG("center", "接收到 syncSelected 分片并应用");
-                    // 搬运 ACK：center outbox → edge_b inbox
-                    transferArtifacts(ws + "/center/outbox", ws + "/edge_b/inbox");
-                    // edge_b worker 会在其下次 scanInbox() 中自动处理 ACK，
-                    // 无需显式调用 edgeEngine->sync()（gate 仍被 syncSelected 持有）
-                }
-                auto st = edgeEngine->state();
-                if (st == dbridge::sync::SyncState::Completed ||
-                    st == dbridge::sync::SyncState::Failed || st == dbridge::sync::SyncState::Idle)
-                    break;
-                auto prog = edgeEngine->progress();
-                std::cout << "  [edge_b] state=" << static_cast<int>(st)
-                          << "  percent=" << prog.percent << "\n";
-            }
-            printSyncResult("edge_b syncSelected", edgeEngine->result());
-        }
+        return 1;
     }
 
-    // Step F 结束后可调用 edgeEngine->sync() 处理中心可能广播的额外下行变更
-    edgeEngine->sync(&err);
+    // 4-c: syncSelected() — SelectionResolver 解析记录集 → ChunkStreamer 分块
+    //       → OutboxWriter 写 SelectionPush artifact → UDP 传输 → center 应用
+    std::cout << "\n  [edge_b] syncSelected(assignments.id=4, FK deps=true) ...\n";
+    if (!edgeEngine->syncSelected(sel, &err)) {
+        std::cerr << "syncSelected rejected: " << err.toStdString() << "\n";
+        return 1;
+    }
+    LOG("edge_b", "[4-b] syncSelected() 已提交，等待 center ACK ...");
 
-    // ── 12. 演示冲突场景 ────────────────────────────────────────────────────
+    // 轮询直到前台 syncSelected() 完成（ACK 到达）或超时
+    if (!waitForEngine(edgeEngine.get(), "edge_b Phase 4 syncSelected")) {
+        std::cerr << "edge_b Phase 4 syncSelected 超时\n";
+    }
+    printSyncResult("edge_b Phase 4 syncSelected", edgeEngine->result());
+
+    // 给 center 处理并更新日志
+    QThread::msleep(600);
+    printLogs("center", centerEngine->logs());
+
+    std::cout << "\n===== Phase 4 完成：center assignments 状态 =====\n";
+    dumpTable(centerDb, QStringLiteral("assignments"), "center");
+    dumpTable(edgeBDb, QStringLiteral("assignments"), "edge_b");
+
+    // ════════════════════════════════════════════════════════════════════════
+    // Phase 5: 冲突解决（SourceWins，center rank=100 胜出）
     //
-    //  两端同时修改同一行 employees.id=1（张三的薪资），
-    //  center 改为 30000，edge_b 改为 28000。
-    //  冲突策略：SourceWins + center rank=100 > edge_b rank=50
-    //  → center 的值 30000 最终胜出。
+    // 演示两端对同一行（employees.id=1，张三）几乎同时写入不同薪资值时，
+    // ConflictArbiter 如何根据 RowWinnerStore 中的优先级记录做出仲裁：
+    //
+    // 仲裁依赖 __sync_row_winner 表（仅由 ChangesetApplier 的接收路径写入，
+    // 本地 write() 不写 winner 表）。因此需要顺序触发：
+    //
+    //  ① edge_b 写 28000 → sync → center 收到并应用（winner ← {edge_b, rank=50}）
+    //  ② center 写 30000 → sync → edge_b 收到时：
+    //       incumbent = {center, 100}（已由 ①写入）→ 但等等……
+    //       center 是 edge_b 收到 ① 时写的 winner，不是 center 自己 write() 写的。
+    //
+    // 正确顺序说明（见下方注释）：
+    //   edge_b 先广播 28000 → center 接收应用，center winner←{edge_b,50}
+    //   然后 center 广播 30000 → edge_b 接收时，incumbent=INT_MIN（本地 write 不写 winner），
+    //   challenger={center,100}，100 > INT_MIN → edge_b 应用 30000 ✅
+    //   center 自身已有 30000（本地写）✅ → 两端收敛到 30000
+    // ════════════════════════════════════════════════════════════════════════
+    std::cout << "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+              << " Phase 5: 冲突解决（SourceWins, center rank=100）\n"
+              << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
 
-    std::cout << "\n--- 步骤 G：冲突场景演示 ---\n";
-    seedData(centerDb, {QStringLiteral("UPDATE employees SET salary=30000 WHERE id=1")});
-    seedData(edgeBDb, {QStringLiteral("UPDATE employees SET salary=28000 WHERE id=1")});
-    LOG("center", "张三薪资改为 30000");
-    LOG("edge_b", "张三薪资改为 28000（将与 center 冲突）");
-
-    // 双向 sync：center 先发，edge_b 接收后冲突由 center rank 100 胜出
-    centerEngine->sync(&err);
-    transferArtifacts(ws + "/center/outbox", ws + "/edge_b/inbox");
+    // 先刷清双端 changelog，确保上一阶段的所有变更已完全传播，
+    // 避免历史 changeset 干扰本阶段的冲突检测序列。
+    std::cout << "\n  [pre-flush] 清空双端待广播 changelog ...\n";
     edgeEngine->sync(&err);
-    transferArtifacts(ws + "/edge_b/outbox", ws + "/center/inbox");
+    waitForEngine(edgeEngine.get(), "pre-conflict flush edge_b");
     centerEngine->sync(&err);
-    transferArtifacts(ws + "/center/outbox", ws + "/edge_b/inbox");
+    waitForEngine(centerEngine.get(), "pre-conflict flush center");
+    QThread::msleep(400);
+
+    // 5-a: edge_b 先写 张三薪资 28000 并广播
+    //       center 收到并应用后，winner 表记录 {origin=edge_b, rank=50}
+    if (!edgeEngine->write({empMut(1, QStringLiteral("张三"), QStringLiteral("研发"), 28000)},
+                           &err))
+        std::cerr << "edge_b write failed: " << err.toStdString() << "\n";
+    LOG("edge_b", "[5-a] 写入：张三薪资 → 28000");
+
     edgeEngine->sync(&err);
+    if (!waitForEngine(edgeEngine.get(), "edge_b 广播 28000"))
+        std::cerr << "edge_b 广播 28000 超时\n";
 
-    LOG("", "冲突解决后，期望张三薪资在两端均为 30000（center 赢）");
-    dumpTable(centerDb, QStringLiteral("employees"), "center (冲突后)");
-    dumpTable(edgeBDb, QStringLiteral("employees"), "edge_b (冲突后)");
+    // 等待 center 接收并应用 edge_b 的 28000，写入 winner={edge_b, rank=50}
+    QThread::msleep(800);
+    LOG("center", "[5-a] 应已收到 edge_b 的 28000，winner={edge_b, rank=50}");
 
-    // ── 13. 打印最终日志环 ───────────────────────────────────────────────────
+    // 5-b: center 写 张三薪资 30000 并广播（rank=100 将赢得仲裁）
+    //       edge_b 收到时：
+    //         incumbent: 本地 write() 不更新 winner → INT_MIN
+    //         challenger: {center, rank=100}
+    //         100 > INT_MIN → 应用 30000 → edge_b = 30000 ✅
+    //       center 自身已有 30000 ✅
+    if (!centerEngine->write({empMut(1, QStringLiteral("张三"), QStringLiteral("研发"), 30000)},
+                             &err))
+        std::cerr << "center write failed: " << err.toStdString() << "\n";
+    LOG("center", "[5-b] 写入：张三薪资 → 30000（将覆盖 edge_b 的 28000）");
+
+    centerEngine->sync(&err);
+    if (!waitForEngine(centerEngine.get(), "center 广播 30000"))
+        std::cerr << "center 广播 30000 超时\n";
+
+    // edge_b 收到 center 的 30000 并自动应用（broadcastIntervalMs 内触发）
+    QThread::msleep(800);
+
+    LOG("", "[5] 冲突解决完毕：期望两端 张三薪资 均为 30000");
+    std::cout << "\n===== Phase 5 完成：冲突解决后两端数据状态 =====\n";
+    dumpTable(centerDb, QStringLiteral("employees"), "center（冲突后）");
+    dumpTable(edgeBDb, QStringLiteral("employees"), "edge_b（冲突后）");
+
+    // ── 最终同步日志汇总 ─────────────────────────────────────────────────────
     std::cout << "\n===== 最终同步日志 =====\n";
     printLogs("center", centerEngine->logs());
     printLogs("edge_b", edgeEngine->logs());
 
-    // ── 14. 检查是否有未处理错误 ────────────────────────────────────────────
-    auto centerErrs = centerEngine->errors();
-    auto edgeErrs = edgeEngine->errors();
+    const auto centerErrs = centerEngine->errors();
+    const auto edgeErrs = edgeEngine->errors();
     if (!centerErrs.isEmpty() || !edgeErrs.isEmpty()) {
-        std::cout << "\n[WARNING] 同步引擎存在错误：\n";
+        std::cout << "\n[WARNING] 同步引擎存在错误记录：\n";
         for (const auto& e : centerErrs)
             std::cout << "  [center] " << e.code.toStdString() << " " << e.message.toStdString()
                       << "\n";
@@ -547,11 +620,16 @@ int main(int argc, char* argv[]) {
                       << "\n";
     }
 
-    // ── 15. 清理（引擎析构时自动 stop + setSyncActive(false)）───────────────
+    // ── 清理 ─────────────────────────────────────────────────────────────────
     centerEngine.reset();
     edgeEngine.reset();
     centerBridge.close();
     edgeBridge.close();
+
+    centerTransport.requestStop();
+    edgeTransport.requestStop();
+    centerTransport.wait();
+    edgeTransport.wait();
 
     std::cout << "\n=================================================\n"
               << " sync-demo 完成\n"

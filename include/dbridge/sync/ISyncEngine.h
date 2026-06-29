@@ -42,6 +42,12 @@ class DBRIDGE_EXPORT ISyncEngine {
 
     // ⑨ Upstream selective push (FR-17)
     virtual bool syncSelected(const SyncSelection& selection, QString* err = nullptr) = 0;
+
+    // ⑩ Session-captured write: executes mutations through the session recorder so that
+    //    every row change is tracked by the SQLite changeset and will be packaged into the
+    //    outbox on the next sync() call.  Use this instead of direct SQL to ensure changes
+    //    are propagated to peers.
+    virtual bool write(const QList<RowMutation>& mutations, QString* err = nullptr) = 0;
 };
 
 DBRIDGE_EXPORT std::unique_ptr<ISyncEngine> createSyncEngine(DataBridge& bridge);

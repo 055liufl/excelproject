@@ -295,6 +295,19 @@ bool SyncEngine::syncSelected(const SyncSelection& selection, QString* err) {
     return true;
 }
 
+bool SyncEngine::write(const QList<RowMutation>& mutations, QString* err) {
+    if (!initialized_) {
+        if (err)
+            *err = QStringLiteral("Not initialized");
+        return false;
+    }
+    QString captureErr;
+    const bool ok = worker_ && worker_->submitCaptureWriteSync(mutations, {}, &captureErr);
+    if (!ok && err)
+        *err = captureErr;
+    return ok;
+}
+
 // --- Private helpers ---
 
 void SyncEngine::appendLog(Severity sev, const QString& phase, const QString& msg) {

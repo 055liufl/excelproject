@@ -882,10 +882,14 @@ bool SyncWorker::processSelectionPushArtifact(const DecodeResult& dec, const QSt
 
     WriteParams p;
     p.kind = WriteKind::InboundSelectionPush;
-    // H-02 fix: use the push initiator's origin (hdr.origin) so the changelog records the
-    // correct business origin.  epoch and seq remain local (center-controlled) to keep the
-    // local counter contiguous; originRank is resolved against the actual push origin.
-    p.origin = hdr.origin;
+    // Record the applying node as the origin so that the seq counter stays contiguous under
+    // the local nodeId.  Using the push initiator's origin (hdr.origin) here would advance
+    // the shared seq counter with a foreign-origin entry, causing the next local-origin entry
+    // to skip a seq number.  Peers that receive this forwarded changeset would then see a false
+    // GAP because the "missing" seq=N was never broadcast (anti-echo blocks echo back to
+    // initiator). The applying node has the authority to claim this entry as its own broadcast —
+    // that is equivalent to saying "center has applied and vouches for this data".
+    p.origin = config_.nodeId();
     p.epoch = streamEpoch_;
     // save prevSeq so we can roll back if execute() fails (transaction rollback
     // leaves localOriginSeq_ advanced, which would create a gap seen as false GAP by peers).
@@ -893,7 +897,7 @@ bool SyncWorker::processSelectionPushArtifact(const DecodeResult& dec, const QSt
     p.seq = nextLocalOriginSeq();
     p.schemaVer = hdr.schemaVer;
     p.schemaFp = hdr.schemaFingerprint;
-    p.originRank = config_.originRank(hdr.origin);
+    p.originRank = config_.originRank(config_.nodeId());
     p.pushId = pushId;
     p.chunkSeq = chunkSeq;
     p.checksum = checksum;

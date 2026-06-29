@@ -21,6 +21,7 @@ INCLUDEPATH += \
 LIBS += -L$$ROOT_BUILD/src           -ldbridge
 LIBS += -L$$ROOT_BUILD/3rdparty/QXlsx -lQXlsx
 LIBS += -L$$ROOT_BUILD/3rdparty/sqlite3 -ldbridge_sqlite3
+LIBS += -lpthread -ldl
 
 PRE_TARGETDEPS += \
     $$ROOT_BUILD/src/libdbridge.a \

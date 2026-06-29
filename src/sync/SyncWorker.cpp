@@ -500,6 +500,7 @@ void SyncWorker::run() {
     wconnPtr_ = nullptr;
     hPtr_ = nullptr;
     wconn.close();
+    wconn = QSqlDatabase();  // release reference so removeDatabase sees refcount=1, no warning
     QSqlDatabase::removeDatabase(connName);
 }
 
@@ -1906,83 +1907,85 @@ void SyncWorker::enqueueSelectionPush(const SyncSelection& selection,
             return;
         }
 
-        // Step 1: open a short-lived read-only connection for snapshot reads.
+        // Steps 1-3: open a short-lived read-only connection for snapshot reads.
+        // IMPORTANT: rconn must be fully destroyed BEFORE QSqlDatabase::removeDatabase() is
+        // called; otherwise Qt warns "connection still in use".  We achieve this by scoping
+        // rconn inside a block and deferring removeDatabase to after the block exits.
         const QString rConnName = config_.sqlitePath() + QStringLiteral("_sel_ro_") +
                                   QUuid::createUuid().toString(QUuid::WithoutBraces).left(8);
-        QSqlDatabase rconn = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), rConnName);
-        rconn.setDatabaseName(config_.sqlitePath());
-        auto cleanupRconn = [&] {
-            if (rconn.isOpen())
-                rconn.close();
-            QSqlDatabase::removeDatabase(rConnName);
-        };
-        if (!rconn.open()) {
-            cleanupRconn();
-            emit errorOccurred({err::E_SYNC_INIT, Severity::Error, QStringLiteral("syncSelected"),
-                                QString(), QStringLiteral("Cannot open read connection")});
+        struct SnapResult {
+            enum Kind { Ok, InitError, SelectionError, FkError } kind = Ok;
+            const char* code = nullptr;
+            QString msg;
+        } snap;
+        QList<FkClosureBuilder::Entry> manifest;
+        {
+            QSqlDatabase rconn = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), rConnName);
+            rconn.setDatabaseName(config_.sqlitePath());
+            do {
+                if (!rconn.open()) {
+                    snap = {SnapResult::InitError, err::E_SYNC_INIT,
+                            QStringLiteral("Cannot open read connection")};
+                    break;
+                }
+                // H-01 fix: explicit read transaction so resolvePk() and build() share one
+                // snapshot.
+                if (!rconn.transaction()) {
+                    snap = {SnapResult::InitError, err::E_SYNC_INIT,
+                            QStringLiteral("Cannot begin read snapshot transaction")};
+                    break;
+                }
+                // Step 2: resolve PK set.
+                SelectionResolver resolver;
+                QList<SelectionResolver::ResolveResult> resolved;
+                QString resolveErr;
+                if (!resolver.resolvePk(rconn, selection, &resolved, &resolveErr)) {
+                    rconn.rollback();
+                    snap = {SnapResult::SelectionError, err::E_SYNC_SELECTION_EMPTY, resolveErr};
+                    break;
+                }
+                if (resolved.isEmpty()) {
+                    rconn.rollback();
+                    snap = {SnapResult::SelectionError, err::E_SYNC_SELECTION_EMPTY,
+                            QStringLiteral("Selection resolved to zero rows")};
+                    break;
+                }
+                // Step 3: FK closure + topo sort.
+                // M-01 fix: use shared consistencyCache_ so pruneConsistentDependencies() works.
+                FkClosureBuilder builder;
+                QString buildErr;
+                // H-02 fix: pass SyncSelection flags so includeFkDeps and pruneConsistent are
+                // honoured.
+                if (!builder.build(rconn, resolved, catalog, consistencyCache_,
+                                   config_.maxSelectionSize(), &manifest, &buildErr,
+                                   selection.includeFkDeps(), selection.pruneConsistent())) {
+                    rconn.rollback();
+                    const char* code = buildErr.contains(QLatin1String("cycle"))
+                                           ? err::E_SYNC_FK_CYCLE_UNSUPPORTED
+                                       : buildErr.contains(QLatin1String("large"))
+                                           ? err::E_SYNC_SELECTION_TOO_LARGE
+                                           : err::E_SYNC_FK_CLOSURE_MISSING;
+                    snap = {SnapResult::FkError, code, buildErr};
+                    break;
+                }
+                rconn.commit();
+            } while (false);
+            rconn.close();
+        }  // rconn destroyed here — safe to removeDatabase
+        QSqlDatabase::removeDatabase(rConnName);  // release read snapshot promptly (§5.5/E-11)
+
+        if (snap.kind == SnapResult::InitError) {
+            emit errorOccurred(
+                {snap.code, Severity::Error, QStringLiteral("syncSelected"), QString(), snap.msg});
             return;
         }
-
-        // H-01 fix: open an explicit read transaction so that resolvePk() and
-        // FkClosureBuilder::build() share a single WAL snapshot.  Without a transaction,
-        // autocommit SELECTs in WAL mode can observe different database states (MVCC mismatch)
-        // if another writer commits between the two calls.
-        if (!rconn.transaction()) {
-            cleanupRconn();
-            emit errorOccurred({err::E_SYNC_INIT, Severity::Error, QStringLiteral("syncSelected"),
-                                QString(),
-                                QStringLiteral("Cannot begin read snapshot transaction")});
-            return;
-        }
-
-        // Step 2: resolve PK set.
-        SelectionResolver resolver;
-        QList<SelectionResolver::ResolveResult> resolved;
-        QString resolveErr;
-        if (!resolver.resolvePk(rconn, selection, &resolved, &resolveErr)) {
-            rconn.rollback();
-            cleanupRconn();
+        if (snap.kind == SnapResult::SelectionError || snap.kind == SnapResult::FkError) {
             // M-05 fix: cancel any pending ACK wait so the foreground caller is not left hanging.
             cancelAckWait();
-            emit errorOccurred({err::E_SYNC_SELECTION_EMPTY, Severity::Error,
-                                QStringLiteral("syncSelected"), QString(), resolveErr});
-            return;
-        }
-        if (resolved.isEmpty()) {
-            rconn.rollback();
-            cleanupRconn();
-            // M-05 fix: cancel any pending ACK wait.
-            cancelAckWait();
-            emit errorOccurred({err::E_SYNC_SELECTION_EMPTY, Severity::Error,
-                                QStringLiteral("syncSelected"), QString(),
-                                QStringLiteral("Selection resolved to zero rows")});
-            return;
-        }
-
-        // Step 3: FK closure + topo sort.
-        // M-01 fix: use the shared consistencyCache_ (initialized in run(), fed by baseline
-        // and authoritative applies) so pruneConsistentDependencies() actually works.
-        FkClosureBuilder builder;
-        QList<FkClosureBuilder::Entry> manifest;
-        QString buildErr;
-        // H-02 fix: pass SyncSelection flags so includeFkDeps and pruneConsistent are honoured.
-        if (!builder.build(rconn, resolved, catalog, consistencyCache_, config_.maxSelectionSize(),
-                           &manifest, &buildErr, selection.includeFkDeps(),
-                           selection.pruneConsistent())) {
-            rconn.rollback();
-            cleanupRconn();
-            // M-05 fix: cancel any pending ACK wait.
-            cancelAckWait();
-            const char* code =
-                buildErr.contains(QLatin1String("cycle"))   ? err::E_SYNC_FK_CYCLE_UNSUPPORTED
-                : buildErr.contains(QLatin1String("large")) ? err::E_SYNC_SELECTION_TOO_LARGE
-                                                            : err::E_SYNC_FK_CLOSURE_MISSING;
             emit errorOccurred(
-                {code, Severity::Error, QStringLiteral("syncSelected"), QString(), buildErr});
+                {snap.code, Severity::Error, QStringLiteral("syncSelected"), QString(), snap.msg});
             return;
         }
-        rconn.commit();
-        cleanupRconn();  // release read snapshot promptly (design §5.5/E-11)
 
         // Step 4: chunk into outbox artifacts.
         ChunkStreamer streamer;

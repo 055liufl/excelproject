@@ -468,9 +468,26 @@ int main(int argc, char* argv[]) {
             std::cerr << "syncSelected rejected: " << err.toStdString() << "\n";
         } else {
             LOG("edge_b", "syncSelected() 已提交，等待 ACK...");
-            // 轮询状态（真实 UI 中可用 QTimer 定期刷新）
+            // syncSelected 是非阻塞的：worker 后台打包分片写 outbox，主线程轮询状态。
+            // ACK 流程：edge_b outbox → center inbox → center 处理并写 ACK → center outbox
+            //          → edge_b inbox → edge_b worker scanInbox() 清除 ackWaiting_。
+            // 第一次迭代等 300ms（给 worker 写 outbox），之后驱动传输层并让
+            // center 处理分片；edge_b worker 在下次 scanInbox() 时自动收到 ACK。
+            bool transported = false;
             for (int i = 0; i < 20; ++i) {
                 QThread::msleep(300);
+                if (!transported) {
+                    transported = true;
+                    // 搬运：edge_b outbox → center inbox（分片推送报文）
+                    transferArtifacts(ws + "/edge_b/outbox", ws + "/center/inbox");
+                    // center 处理入站分片并将 ACK 写入 center/outbox
+                    centerEngine->sync(&err);
+                    LOG("center", "接收到 syncSelected 分片并应用");
+                    // 搬运 ACK：center outbox → edge_b inbox
+                    transferArtifacts(ws + "/center/outbox", ws + "/edge_b/inbox");
+                    // edge_b worker 会在其下次 scanInbox() 中自动处理 ACK，
+                    // 无需显式调用 edgeEngine->sync()（gate 仍被 syncSelected 持有）
+                }
                 auto st = edgeEngine->state();
                 if (st == dbridge::sync::SyncState::Completed ||
                     st == dbridge::sync::SyncState::Failed || st == dbridge::sync::SyncState::Idle)
@@ -483,11 +500,7 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // 搬运：edge_b outbox → center inbox（分片推送报文）
-    transferArtifacts(ws + "/edge_b/outbox", ws + "/center/inbox");
-    centerEngine->sync(&err);
-    LOG("center", "接收到 syncSelected 分片并应用");
-    transferArtifacts(ws + "/center/outbox", ws + "/edge_b/inbox");
+    // Step F 结束后可调用 edgeEngine->sync() 处理中心可能广播的额外下行变更
     edgeEngine->sync(&err);
 
     // ── 12. 演示冲突场景 ────────────────────────────────────────────────────

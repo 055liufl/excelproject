@@ -19,7 +19,11 @@ static FrozenEntry entryToFrozen(const FkClosureBuilder::Entry& e) {
     fe.pkHash = pkHash;
     fe.recordKind = e.isSelected ? QStringLiteral("selected") : QStringLiteral("dependency");
     fe.topoIndex = e.topoIndex;
-    fe.fingerprint = QByteArray();  // populated later if needed
+    // Compute row fingerprint (SHA-1 of compact JSON).  Must be non-null: the DDL column
+    // is BLOB NOT NULL, and binding a default-constructed QByteArray() produces SQL NULL.
+    const QByteArray rowJson =
+        QJsonDocument(QJsonObject::fromVariantMap(e.row)).toJson(QJsonDocument::Compact);
+    fe.fingerprint = QCryptographicHash::hash(rowJson, QCryptographicHash::Sha1);
     return fe;
 }
 

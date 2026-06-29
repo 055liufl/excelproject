@@ -18,28 +18,33 @@ CONFIG  += ordered
 SUBDIRS = \
     qxlsx \
     sqlite3 \
+    qsqlite_session \
     libdbridge \
     cli \
     syncdemo \
     diffdemo \
     tests
 
-qxlsx.file         = 3rdparty/QXlsx/QXlsx.pro
-sqlite3.file       = 3rdparty/sqlite3/dbridge_sqlite3.pro
-libdbridge.file    = src/libdbridge.pro
-cli.file           = examples/cli/dbridge-cli.pro
-syncdemo.file      = examples/sync-demo/sync-demo.pro
-diffdemo.file      = examples/diff-demo/diff-demo.pro
-tests.file         = tests/tests.pro
+qxlsx.file            = 3rdparty/QXlsx/QXlsx.pro
+sqlite3.file          = 3rdparty/sqlite3/dbridge_sqlite3.pro
+qsqlite_session.file  = 3rdparty/qsqlite_session/qsqlite_session.pro
+libdbridge.file       = src/libdbridge.pro
+cli.file              = examples/cli/dbridge-cli.pro
+syncdemo.file         = examples/sync-demo/sync-demo.pro
+diffdemo.file         = examples/diff-demo/diff-demo.pro
+tests.file            = tests/tests.pro
 
 # Dependency chain (qmake honours these when generating Makefile.tests etc.).
 # libdbridge only needs sqlite3's *header* (compile-time), but cli/tests *link*
 # libdbridge_sqlite3.a, so they must depend on the sqlite3 sub-project.
-libdbridge.depends = qxlsx
-cli.depends        = libdbridge sqlite3
-syncdemo.depends   = libdbridge sqlite3
-diffdemo.depends   = libdbridge sqlite3
-tests.depends      = libdbridge qxlsx sqlite3
+# Executables that use the sync subsystem also depend on qsqlite_session so the
+# custom QSQLITE plugin is built before the post-link copy step runs.
+libdbridge.depends       = qxlsx
+qsqlite_session.depends  = sqlite3
+cli.depends              = libdbridge sqlite3 qsqlite_session
+syncdemo.depends         = libdbridge sqlite3 qsqlite_session
+diffdemo.depends         = libdbridge sqlite3 qsqlite_session
+tests.depends            = libdbridge qxlsx sqlite3
 
 OTHER_FILES += \
     README.md \

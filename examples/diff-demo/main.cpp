@@ -293,6 +293,17 @@ static void dumpTable(const QString& dbPath, const QString& table, const std::st
 
 int main(int argc, char* argv[]) {
     QCoreApplication app(argc, argv);
+    // Qt 5.12 appends applicationDirPath() at the END of libraryPaths(), so
+    // the system QSQLITE plugin (without session support) wins. Put our
+    // sqldrivers/ copy first by rebuilding the list with appDir at position 0.
+    {
+        QStringList paths;
+        paths.append(app.applicationDirPath());
+        for (const QString& p : QCoreApplication::libraryPaths())
+            if (!paths.contains(p))
+                paths.append(p);
+        QCoreApplication::setLibraryPaths(paths);
+    }
 
     if (argc < 2) {
         std::cerr << "Usage: diff-demo <workspace-dir>\n";

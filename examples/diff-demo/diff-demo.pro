@@ -27,4 +27,9 @@ PRE_TARGETDEPS += \
     $$ROOT_BUILD/src/libdbridge.a \
     $$ROOT_BUILD/3rdparty/sqlite3/libdbridge_sqlite3.a
 
+# ── Deploy custom QSQLITE plugin (with SQLITE_ENABLE_SESSION) next to binary ─
+QSQLITE_SESSION_LIB  = $$ROOT_BUILD/3rdparty/qsqlite_session/libqsqlite.so
+QSQLITE_SESSION_DEST = $$OUT_PWD/sqldrivers
+QMAKE_POST_LINK += mkdir -p $$QSQLITE_SESSION_DEST && cp $$QSQLITE_SESSION_LIB $$QSQLITE_SESSION_DEST/libqsqlite.so
+
 SOURCES = main.cpp

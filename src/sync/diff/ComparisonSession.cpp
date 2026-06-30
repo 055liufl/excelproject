@@ -1,3 +1,24 @@
+// ============================================================================
+// ComparisonSession.cpp — 交互式比对会话实现（diff 链路：会话 + 暂存 + 门控）
+// ============================================================================
+//
+// 【本文件实现了什么】IComparisonSession 的完整落地（ComparisonSession 类），外加文件
+//   末尾的工厂 createComparisonSession()。一次会话把「算差异 → 交互合并 → 写回本地库」
+//   串成一条流水线，四个协作者各司其职（DiffEngine 算差异、StagingBuffer 暂存决策、
+//   InboundTableGate 门控 inbox、SyncContext 的 worker 写函数落库）。
+//
+// 【阅读顺序建议】先看 initialize（建立读快照/缓存/门控的所有前提），再看 save（收尾时
+//   stale 检测 + 落库 + 释放资源，是最综合的一段），最后看各 stage*/accept* 小方法。
+//
+// 【贯穿全文件的三个不直观机制（务必先建立直觉）】
+//   ① 读事务钉快照（H-7）：WAL 模式下「裸 SELECT」只在单条查询期间持有快照，跨多条查询
+//      会各看各的版本。本会话用 BEGIN DEFERRED 把一个一致快照钉在 rconn_ 上，保证整场
+//      比对（多次 rowDiffs/findLocalRow）看到的本地数据是同一时刻的，不被后台写入搅动。
+//   ② stale 检测：PRAGMA data_version 是 SQLite 维护的「本连接之外的写入计数」，库每被
+//      改一次它就变。initialize 记下钉住值，save 前再读一次，不等就判暂存过期、拒绝写回。
+//   ③ 门控开闭：initialize 开门控冻结被比对表的 inbox 应用，save/discard 释放并 rescan。
+// ============================================================================
+
 #include "ComparisonSession.h"
 
 #include "dbridge/Errors.h"
@@ -17,6 +38,9 @@ namespace dbridge::sync {
 
 // ---------------------------------------------------------------------------
 // Constructor
+// 构造函数：仅做依赖注入（成员初始化列表绑定各引用与值），不做任何 I/O。
+//   真正建立读快照/算差异/开门控全部推迟到 initialize()，使「构造」廉价且不可失败。
+//   注意 context 以 std::move 接管 shared_ptr 所有权（引用计数 +1，会话期内保活上下文）。
 // ---------------------------------------------------------------------------
 
 ComparisonSession::ComparisonSession(QSqlDatabase& rconn, QSqlDatabase& wconn, TableStateStore& ts,
@@ -35,22 +59,30 @@ ComparisonSession::ComparisonSession(QSqlDatabase& rconn, QSqlDatabase& wconn, T
 
 // ---------------------------------------------------------------------------
 // initialize
+// 初始化是整场会话的「立基」步骤：钉读快照 → 缓存对端数据 → 算表级差异 → 开门控。
+// 这里有两个重载：公共重载（吃对外快照类型，做类型转换）转调内部重载（干实事）。
 // ---------------------------------------------------------------------------
 
 // C-10 fix: public API overload — convert RemoteTableSnapshot to internal types.
+// C-10 修复：公共 API 重载——把对外的 RemoteTableSnapshot 拆成内部三件套后转调内部重载。
+//   为什么要这层转换：对外接口用 IComparisonSession.h 里的快照结构（schemaFingerprint/
+//   contentChecksum 等长名字段、rows 一体），而内部 DiffEngine 用更紧凑的 RemoteMeta +
+//   「表→行集」哈希。这层只做字段搬运，不含逻辑。
 bool ComparisonSession::initialize(const QList<RemoteTableSnapshot>& remoteSnapshots,
                                    QString* err) {
-    QStringList tables;
-    QHash<QString, DiffEngine::RemoteMeta> remoteMetas;
-    QHash<QString, QList<QVariantMap>> remoteRows;
+    QStringList tables;                                  // 参与比对的表名（保序）
+    QHash<QString, DiffEngine::RemoteMeta> remoteMetas;  // 表→对端表级三元组
+    QHash<QString, QList<QVariantMap>> remoteRows;  // 表→对端行集合（惰性表则缺席）
 
     for (const RemoteTableSnapshot& snap : remoteSnapshots) {
         tables.append(snap.table);
         DiffEngine::RemoteMeta meta;
-        meta.schemaFp = snap.meta.schemaFingerprint;
-        meta.checksum = snap.meta.contentChecksum;
-        meta.rowCount = snap.meta.rowCount;
+        meta.schemaFp = snap.meta.schemaFingerprint;  // 表结构指纹（字段改名搬运）
+        meta.checksum = snap.meta.contentChecksum;    // 内容校验和
+        meta.rowCount = snap.meta.rowCount;           // 行数
         remoteMetas.insert(snap.table, meta);
+        // 仅当快照真带了行才登记行集；空 rows 表示「惰性」——稍后由 fetchRemoteRows 拉取，
+        // 不在此处塞一个空列表（这样下游可用 contains() 区分「无此表」与「有表但行惰性」）。
         if (!snap.rows.isEmpty())
             remoteRows.insert(snap.table, snap.rows);
     }
@@ -58,6 +90,8 @@ bool ComparisonSession::initialize(const QList<RemoteTableSnapshot>& remoteSnaps
     return initialize(tables, remoteMetas, remoteRows, err);
 }
 
+// 内部重载：真正建立会话状态。注意各步骤顺序有意为之（先钉快照再算差异，保证差异基于
+// 被钉住的那一刻），任一前置步骤失败即提前返回 false（此时门控尚未开、无需清理）。
 bool ComparisonSession::initialize(const QStringList& tables,
                                    const QHash<QString, DiffEngine::RemoteMeta>& remoteMetas,
                                    const QHash<QString, QList<QVariantMap>>& remoteRows,
@@ -68,31 +102,51 @@ bool ComparisonSession::initialize(const QStringList& tables,
     // BEGIN DEFERRED pins the read snapshot for the life of the transaction on rconn_.
     // Note: rconn_ is a dedicated read-only connection, so BEGIN DEFERRED is safe here
     // and does not conflict with the write connection held by SyncWorker.
+    // ───────────────────────────────────────────────────────────────────────
+    // H-7 修复：用一个显式读事务「钉住一份真正的读快照」。
+    //   关键背景：自动提交（autocommit）模式下的裸 SELECT 不会跨多条查询持有快照——WAL
+    //   模式的 SQLite 只在「单条查询执行期间」锁定快照。于是若不开事务，本会话两次
+    //   rowDiffs/findLocalRow 之间，后台一旦写入，第二次就会看到新版本，画面前后不一致。
+    //   QSqlDatabase::transaction() 在此连接上发出 BEGIN（DEFERRED 语义：首条读语句执行时
+    //   才真正取得读快照，并把它钉到整个事务的生命周期），于是整场比对看到同一时刻的本地库。
+    //   安全性：rconn_ 是本会话专用的只读连接，在它上面 BEGIN 不会与 SyncWorker 持有的写
+    //   连接相互阻塞（读写各自独立的连接 + WAL 允许读写并发）。
     if (!rconn_.transaction()) {
         if (err)
             *err = QStringLiteral("ComparisonSession: cannot start read transaction: %1")
                        .arg(rconn_.lastError().text());
-        return false;
+        return false;  // 连读事务都开不起来 → 初始化失败（门控未开、无需回滚）
     }
-    readTxnActive_ = true;
+    readTxnActive_ = true;  // 标记读事务已打开，save/discard 收尾时据此回滚释放
+
+    // 记下「此刻」的 data_version 作为 stale 检测基准。<=0 表示读取失败（err 已被写入）。
+    // 失败时直接返回：注意此处虽已开了读事务，但留给上层 discard 时统一回滚（readTxnActive_
+    // 已置 true），本函数不在此中途回滚以保持单一收尾路径。
     pinnedDataVersion_ = readDataVersion(err);
     if (pinnedDataVersion_ <= 0)
         return false;
 
     // Build remoteData_ cache.
+    // 构建对端数据缓存 remoteData_：把每张表的 meta 与（可选的）行集合搬进会话私有缓存，
+    // 之后 rowDiffs/findRemoteRow/stageTable/fetchRemoteRows 都从这里读对端侧，比对期内只读。
     for (const QString& t : tables) {
         RemoteTableData rd;
         if (remoteMetas.contains(t))
             rd.meta = remoteMetas[t];
         if (remoteRows.contains(t))
-            rd.rows = remoteRows[t];
+            rd.rows = remoteRows[t];  // 惰性表此处 rows 留空，待 fetchRemoteRows 时已具备
         remoteData_.insert(t, rd);
     }
 
     // Compute table-level diffs.
+    // 算表级差异：把本地 TableStateStore（按 streamEpoch_ 定位的状态）与对端 remoteMetas
+    // 逐表比对三元组，得出每表 Identical/Different/OnlyLocal/OnlyRemote + 增删改计数。
+    // 结果缓存进 diffs_，tableDiffs() 之后只是直接返回它（不重算）。
     diffs_ = diff_.tableDiffs(rconn_, tables, streamEpoch_, ts_, remoteMetas);
 
     // Open the gate to defer inbound changes to these tables.
+    // 开门控：从此刻起冻结针对这些被比对表的 inbox 入站应用，防止比对期间底层数据被搅动
+    // （进而避免 save 时 stale、或用户基于过期画面决策）。释放在 save/discard 时进行。
     gate_.open(tables);
 
     return true;

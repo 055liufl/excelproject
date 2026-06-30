@@ -1,34 +1,43 @@
+// ============================================================================
+// SessionRecorder.cpp — 变更捕获器的实现（session 钩子的建立、封存与拆除）
+// 总览与时序要求见头文件 SessionRecorder.h。
+// ============================================================================
 #include "SessionRecorder.h"
 
 #include <QByteArray>
 
 namespace dbridge::sync {
 
+// ── begin：建立会话并附着所有同步表 ──────────────────────────────────────────
 bool SessionRecorder::begin(sqlite3* h, const QStringList& syncTables, QString* err) {
+    // 防御性检查 1：禁止在已有活动会话之上重复 begin（否则会泄漏前一个会话）。
     if (session_) {
         if (err)
             *err = QStringLiteral("SessionRecorder already active");
         return false;
     }
+    // 防御性检查 2：句柄必须有效。
     if (!h) {
         if (err)
             *err = QStringLiteral("null sqlite3 handle");
         return false;
     }
 
+    // 在 "main" 数据库上创建会话对象。从此刻起，针对已附表的写操作会被 preupdate 钩子记录。
     int rc = sqlite3session_create(h, "main", &session_);
     if (rc != SQLITE_OK) {
-        session_ = nullptr;
+        session_ = nullptr;  // create 失败时 session_ 状态未定义，显式清空以维持不变量
         if (err)
             *err = QStringLiteral("sqlite3session_create failed: %1").arg(sqlite3_errmsg(h));
         return false;
     }
 
-    // Attach each sync table to the session.
+    // 逐张把同步表附着到会话；只有被附着的表，其行变更才会进入 changeset。
     for (const QString& tbl : syncTables) {
-        const QByteArray tblUtf8 = tbl.toUtf8();
+        const QByteArray tblUtf8 = tbl.toUtf8();  // C API 需要 UTF-8 C 字符串
         rc = sqlite3session_attach(session_, tblUtf8.constData());
         if (rc != SQLITE_OK) {
+            // 任一表附着失败：删除已建会话并复位，整体视为 begin 失败（要么全附上、要么不开始）。
             sqlite3session_delete(session_);
             session_ = nullptr;
             if (err)

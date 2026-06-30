@@ -4,6 +4,18 @@
 
 #include "sql/SqlBuilder.h"
 
+// ============================================================================
+// UpsertExecutor.cpp — UPSERT 批量写入的实现
+// ============================================================================
+//
+// 【主循环结构】apply() 对每条 RowMutation 做四步：
+//   ① 防御：列为空 → 记一条逐行错误并跳过（无法构造合法 SQL）。
+//   ② 构造 + 取缓存：用整条 SQL 当键，命中则复用、否则 prepare 后入缓存。
+//   ③ 绑定本行的值（占位符 ? 与 m.values 一一对应）。
+//   ④ 执行；失败 → 记逐行错误并继续（非致命），成功 → 进入下一条。
+// buildUpsertSql() 则纯粹负责「把列名/主键/模式拼成一条安全的 UPSERT 文本」。
+// ============================================================================
+
 namespace dbridge::sync {
 
 // ---------------------------------------------------------------------------
@@ -12,6 +24,7 @@ namespace dbridge::sync {
 
 bool UpsertExecutor::apply(QSqlDatabase& db, const QList<RowMutation>& rows,
                            QList<dbridge::RowError>* errors, QString* err) {
+    // 前置硬条件：连接必须已打开。未打开属「致命」，立即返回 false（无法做任何写）。
     if (!db.isOpen()) {
         if (err)
             *err = QStringLiteral("database is not open");
@@ -19,10 +32,12 @@ bool UpsertExecutor::apply(QSqlDatabase& db, const QList<RowMutation>& rows,
     }
 
     for (const RowMutation& m : rows) {
+        // ① 空列防御：没有任何列就无法生成 "(col...) VALUES (?...)"。
+        //    归类为逐行约束错误（E_SYNC_APPLY_CONSTRAINT），收集后跳过该行，不影响其它行。
         if (m.columns.isEmpty()) {
             dbridge::RowError re;
-            re.sheet = m.table;
-            re.row = 0;
+            re.sheet = m.table;  // 复用 RowError.sheet 字段承载「表名」（同步无 Excel sheet 概念）
+            re.row = 0;  // 0 = 非「具体 Excel 行」的表级/行级错误
             re.code = QStringLiteral("E_SYNC_APPLY_CONSTRAINT");
             re.message = QStringLiteral("empty columns for table %1").arg(m.table);
             if (errors)
@@ -30,48 +45,54 @@ bool UpsertExecutor::apply(QSqlDatabase& db, const QList<RowMutation>& rows,
             continue;
         }
 
-        // M-04 fix: use the full SQL string as cache key so different column sets or PK sets
-        // for the same table always produce distinct cache entries and never share a wrong
-        // prepared statement. The old (table:mode) key required a fragile lastQuery() check.
+        // ② M-04 fix: 用「完整 SQL 字符串」做缓存键，使同一张表的不同列集 / 不同主键集
+        //    始终落到不同的缓存项，绝不会串用到一条参数语义不符的预编译语句。
+        //    旧实现以 (table:mode) 为键，必须再靠脆弱的 lastQuery() 比对来辨别，已废弃。
         const QString sql = buildUpsertSql(m.table, m.columns, m.pkColumns, m.mode);
-        const QString key = sql;
+        const QString key = sql;  // 键即 SQL 本身
 
         bool needPrepare = !cache_.contains(key);
         if (needPrepare) {
             QSqlQuery q(db);
             if (!q.prepare(sql)) {
-                // Prepare failure is fatal — the table likely doesn't exist.
+                // prepare 失败属「致命」：通常意味着目标表根本不存在（或 SQL 非法）。
+                // 此时无法继续，整批中止，返回 false 让上层回滚事务。
                 if (err)
                     *err = q.lastError().text();
                 return false;
             }
-            cache_.insert(key, q);
+            cache_.insert(key, q);  // 编译成功 → 入缓存供后续同形 SQL 复用
         }
 
-        QSqlQuery& q = cache_[key];
-        // Re-bind values for this row.
+        QSqlQuery& q = cache_[key];  // 取缓存里的语句引用（注意是引用，下面绑定会作用到它）
+        // ③ 为本行重新绑定值：m.values 与 SQL 里的 ? 占位符按顺序一一对应。
+        //    （上一行执行后，QSqlQuery 的绑定会被新一轮 addBindValue 覆盖。）
         for (const QVariant& v : m.values)
             q.addBindValue(v);
 
+        // ④ 执行本行。
         if (!q.exec()) {
+            // 逐行失败（约束冲突 / 外键违反等）：记一条错误，但「不」中断整批——
+            //   是否因这条失败而回滚，由更上层（CapturedWriteTemplate 的 C-09 守卫）决定。
             dbridge::RowError re;
             re.sheet = m.table;
             re.row = 0;
             re.code = QStringLiteral("E_SYNC_APPLY_CONSTRAINT");
             re.message = q.lastError().text();
-            // Populate rawValue from originMeta if present.
+            // 若该行携带了来源元数据，取出 rawValue 一并回报，便于诊断「是哪条原始数据出的错」。
             if (!m.originMeta.isEmpty())
                 re.rawValue = m.originMeta.value(QStringLiteral("rawValue")).toString();
             if (errors)
                 errors->append(re);
-            // Continue to next row — per-row failure is non-fatal.
+            // 继续处理下一行——逐行失败是非致命的。
             continue;
         }
     }
 
-    return true;
+    return true;  // 走到这里：没有致命错误（逐行错误已在 *errors 中，由上层裁决）
 }
 
+// 清空预编译语句缓存：连接重建或表结构迁移后，旧语句失效，必须丢弃避免误用。
 void UpsertExecutor::clearPreparedCache() {
     cache_.clear();
 }

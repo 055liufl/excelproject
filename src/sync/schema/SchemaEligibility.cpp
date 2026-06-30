@@ -1,6 +1,6 @@
 #include "SchemaEligibility.h"
 
-#include "dbridge/Errors.h"
+#include "dbridge/Errors.h"  // err::E_SYNC_COMPOSITE_PK_NOT_SUPPORTED 等错误码
 
 #include <QMap>
 #include <QSqlError>
@@ -13,12 +13,22 @@ namespace dbridge::sync {
 // public
 // ---------------------------------------------------------------------------
 
+// ── expandSyncTables —— 把「空列表」解释为「全部业务表」───────────────────────
+// 做什么：若调用方显式给了表名列表，原样返回；若给的是空列表，则查 sqlite_master
+//         取出所有用户表（排除 sqlite_ 内建表与 __sync_ 同步元数据表）。
+// 为什么：让上层有「不指定 = 同步全部业务表」的便捷语义，同时绝不把内建/元数据表
+//         卷入同步（那会造成无限自指与污染）。
+// 返回：规范化后的表名集（按名排序）；查询失败时返回空列表并写 *err。
 QStringList SchemaEligibility::expandSyncTables(QSqlDatabase& db, const QStringList& syncTables,
                                                 QString* err) {
     if (!syncTables.isEmpty())
-        return syncTables;
+        return syncTables;  // 调用方已显式指定，直接采用，不做展开
 
     // C-08 fix: empty = all user tables (exclude SQLite internals and sync meta tables).
+    // C-08 修复（译）：空 = 全部用户表。两个 NOT LIKE 过滤掉：
+    //   · sqlite_%   —— SQLite 内建对象（如 sqlite_sequence、自动索引）；
+    //   · __sync_%   —— 本同步子系统自己的元数据表（changelog/ledger/quarantine 等）。
+    // ORDER BY name 让结果稳定有序，便于日志比对与可复现。
     QSqlQuery q(db);
     if (!q.exec(QStringLiteral("SELECT name FROM sqlite_master WHERE type='table' "
                                "AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '__sync_%' "
@@ -33,6 +43,14 @@ QStringList SchemaEligibility::expandSyncTables(QSqlDatabase& db, const QStringL
     return tables;
 }
 
+// ── verify —— 逐表准入体检的主流程 ───────────────────────────────────────────
+// 做什么：对每张表先 introspect() 取结构事实，再按「拒绝清单」逐条判定，把不合格表
+//         连同原因追加进 rejected。
+// 控制流要点：
+//   · introspect 报错（localErr 非空）→ 视为「体检过程本身失败」，立即 return false 并写 err；
+//   · 表不合格 → 调用本地 lambda reject() 记一条原因、置 allOk=false，然后 continue
+//     （继续体检后续表，以便一次性把所有问题都列出来，而不是发现第一个就停）。
+// 返回：全合格 true；有不合格项 false；体检出错 false+err。
 bool SchemaEligibility::verify(QSqlDatabase& db, const QStringList& syncTables,
                                QStringList* rejected, QString* err) {
     bool allOk = true;
@@ -40,17 +58,22 @@ bool SchemaEligibility::verify(QSqlDatabase& db, const QStringList& syncTables,
         QString localErr;
         TableInfo info = introspect(db, tbl, &localErr);
         if (!localErr.isEmpty()) {
+            // 自省过程出错（如 PRAGMA 查询失败）——这是基础设施错误，非「表不合格」，
+            // 直接中止整个体检并把错误透传给调用方。
             if (err)
                 *err = localErr;
             return false;
         }
 
+        // 本地辅助：记录一条「不合格原因」并把整体结果标记为有失败项。
+        // 捕获 rejected/allOk/tbl 引用，调用方便。
         auto reject = [&](const QString& reason) {
             if (rejected)
                 rejected->append(QStringLiteral("%1: %2").arg(tbl, reason));
             allOk = false;
         };
 
+        // —— 按「拒绝清单」逐条判定；命中即记因 + continue（跳到下一张表）——
         if (!info.exists) {
             reject(QStringLiteral("table does not exist"));
             continue;

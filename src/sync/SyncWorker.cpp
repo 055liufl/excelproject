@@ -1,3 +1,32 @@
+// ============================================================================
+// SyncWorker.cpp — 同步引擎后台工作线程的实现（同步子系统的心脏）
+// ============================================================================
+//
+// 【本文件实现什么】
+//   SyncWorker 声明见同名头文件。这里实现它的全部行为：
+//     · 线程体 run()：创建写连接、建表/迁移、初始化所有 store、跑主事件循环。
+//     · 收（inbox）：scanInbox / processArtifact / process*Artifact 系列。
+//     · 发（outbox）：broadcast / broadcastTopeer。
+//     · ACK：processAckArtifact / startAckWait / cancelAckWait / ACK 窗口。
+//     · 同步入口：submitImportSync / submitCaptureWriteSync / enqueueDrain /
+//       enqueueSelectionPush（跨线程投递 + promise/future 等结果）。
+//     · 健康度：evaluatePeers / 各 peerLag* 辅助；基线回退 runBaselineFallbackFor。
+//
+// 【阅读建议（按数据流）】
+//   1) 先读 run()：理解线程从“拿连接”到“进主循环”的全过程，以及主循环如何在
+//      “任务 / 收 / 发 / ACK 超时”之间分配每一轮。
+//   2) 再读 processArtifact + 四个 process*Artifact：理解“收到一个工件后发生什么”。
+//   3) 然后读 broadcastTopeer：理解 anti-echo 路由、发送水位线、变基与 ACK 窗口记账。
+//   4) 最后读 submitImportSync / enqueueSelectionPush：理解本地写入如何被 session 捕获、
+//      选择性推送如何分片成 chunk 工件。
+//
+// 【贯穿全文件的不变量与术语】
+//   · localOriginSeq_ 必须连续：任何回滚事务的路径都要 rollbackOriginSeq() 退回，
+//     否则对端把空洞误判为 gap → 触发不必要的基线回退。
+//   · ledger 幂等：工件一旦 markConsumed 永不重处理；崩溃可重放且结果一致（“先持久 ACK
+//     再 markConsumed”的次序就是为此服务，见 processArtifact 的 H-01 修复注释）。
+//   · 所有 process*/broadcast*/scanInbox 都只在 worker 线程跑（wconnPtr_/hPtr_ 才有效）。
+// ============================================================================
 #include "sync/SyncWorker.h"
 
 #include "dbridge/Errors.h"
@@ -38,9 +67,18 @@
 namespace dbridge::sync {
 
 namespace {
+// payloadTables —— 算出一个解码后的工件“涉及哪些表”。
+// 【为什么需要】InboundTableGate（入站表门控）要据此判断：当前是否正处于某个比对
+//   暂存窗口、且这些表被门控冻结——若是，则该工件应被延迟（defer），稍后再处理。
+// 【两种工件的取表方式不同】
+//   · 选择性推送（SelectionPush）：表名已显式列在 frozenEntries[*].table 中，直接收集。
+//   · 普通 changeset：表名编码在二进制 changeset blob 里，需用 SQLite 的 changeset 迭代器
+//     逐行读出每行所属表名。
+// 【参数】dec：已解码工件。【返回】去重后的表名集合（失败/空则返回空集，调用方按“不延迟”处理）。
 QSet<QString> payloadTables(const DecodeResult& dec) {
     QSet<QString> tables;
     if (dec.kind == PayloadKind::SelectionPush) {
+        // 选择性推送：表名直接来自冻结清单条目。
         for (const FrozenEntry& entry : dec.selection.frozenEntries) {
             if (!entry.table.isEmpty())
                 tables.insert(entry.table);
@@ -48,27 +86,34 @@ QSet<QString> payloadTables(const DecodeResult& dec) {
         return tables;
     }
 
+    // 普通 changeset：开一个 SQLite changeset 迭代器遍历其中每一行变更。
+    // const_cast 是因为 sqlite3changeset_start 的 C 接口要 void*（非 const），
+    // 但我们只读不改 blob 内容，故该转换是安全的。
     sqlite3_changeset_iter* it = nullptr;
     if (sqlite3changeset_start(
             &it, dec.changeset.size(),
             const_cast<void*>(static_cast<const void*>(dec.changeset.constData()))) != SQLITE_OK)
-        return tables;
+        return tables;  // 无法解析（如空 blob）：返回空集，等价于“无需门控延迟”
 
+    // 逐行推进：每行通过 sqlite3changeset_op 取出该行所属表名（以及列数/操作/间接标志）。
     while (sqlite3changeset_next(it) == SQLITE_ROW) {
         const char* tableName = nullptr;
         int columns = 0;
-        int op = 0;
-        int indirect = 0;
+        int op = 0;        // SQLITE_INSERT/UPDATE/DELETE（此处不关心，只取表名）
+        int indirect = 0;  // 是否“间接变更”（由触发器等引起，此处亦不关心）
         if (sqlite3changeset_op(it, &tableName, &columns, &op, &indirect) == SQLITE_OK &&
             tableName) {
             tables.insert(QString::fromUtf8(tableName));
         }
     }
-    sqlite3changeset_finalize(it);
+    sqlite3changeset_finalize(it);  // 必须 finalize 释放迭代器
     return tables;
 }
 }  // namespace
 
+// 构造函数：仅“准备”所有协作组件，绝不触碰数据库。
+// 设计动机：写连接必须由 worker 线程自己创建并持有（见 run()），因此这里只能做
+//   “与连接无关”的对象构造与参数注入；真正的建表/初始化推迟到 run()。
 SyncWorker::SyncWorker(SyncConfig config, std::shared_ptr<InboundTableGate> inboundGate)
     : config_(std::move(config)), inboundGate_(std::move(inboundGate)) {
     av_ = std::make_unique<AppliedVectorStore>();
@@ -89,19 +134,25 @@ SyncWorker::SyncWorker(SyncConfig config, std::shared_ptr<InboundTableGate> inbo
     rebaser_ = std::make_unique<RebaseEngine>();
     quarantine_ = std::make_unique<QuarantineStore>();
     evictor_ = std::make_unique<DeadPeerEvictor>();
+    // 把三维滞后阈值（seq/字节/时长，各有软/硬两档）一次性灌给驱逐器。
+    // 软档 → 仅告警 W_SYNC_PEER_LAGGING；硬档 → 判定 Dead 并驱逐（要求重新基线）。
     evictor_->configure(config_.peerLagSoftSeq(), config_.peerLagHardSeq(),
                         config_.peerLagSoftBytes(), config_.peerLagHardBytes(),
                         config_.peerLagSoftMs(), config_.peerLagHardMs());
     if (!inboundGate_)
-        inboundGate_ = std::make_shared<InboundTableGate>();
-    // InboxWatcher is created in run() so it lives on the worker thread
+        inboundGate_ = std::make_shared<InboundTableGate>();  // 未注入则自建一个独立门控
+    // 注意：InboxWatcher 不在这里创建——它要在 run() 内创建，从而“活在 worker 线程上”。
 }
 
+// 析构：请求停止并等待线程退出（最多 5s）。
+// 设计动机：若线程未及时退出而对象先析构，run() 里使用的成员将悬空——故必须先 join。
 SyncWorker::~SyncWorker() {
-    requestStop();
-    wait(5000);
+    requestStop();  // 置停止标志并唤醒主循环
+    wait(5000);     // QThread::wait：阻塞等待 run() 返回（超时上限 5s）
 }
 
+// 入队一个写任务（线程安全）：加锁追加，并唤醒一个等待者（主循环）。
+// wakeOne 足矣——只有 run() 一条线程在 queueCond_ 上等待。
 void SyncWorker::enqueue(WriteTask task) {
     QMutexLocker lk(&queueMutex_);
     taskQueue_.append(std::move(task));

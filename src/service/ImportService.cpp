@@ -7,26 +7,55 @@
 #include <QSqlQuery>
 
 #include "ErrorCollector.h"
-#include "excel/ExcelReader.h"
-#include "mapping/BatchUniqueness.h"
-#include "mapping/FkInjector.h"
-#include "mapping/Mapper.h"
-#include "mapping/Router.h"
-#include "mapping/TopoSorter.h"
-#include "profile/ProfileValidator.h"
-#include "schema/SchemaCatalog.h"
-#include "sql/SqlBuilder.h"
-#include "validation/ForeignKeyPreflight.h"
+#include "excel/ExcelReader.h"  // 读 .xlsx：选 sheet、读表头、按表头名取单元格
+#include "mapping/BatchUniqueness.h"  // 批内唯一性检查（同一批数据里冲突键不得重复）
+#include "mapping/FkInjector.h"  // 外键注入：把父表查得的主键写进子表 binds
+#include "mapping/Mapper.h"      // 把一行 Excel 映射成多路由载荷 + 行级校验
+#include "mapping/Router.h"      // Mixed 模式：按判别列把行分派到某个 class
+#include "mapping/TopoSorter.h"  // 按外键依赖把各路由排成拓扑序（父先于子）
+#include "profile/ProfileValidator.h"  // 载入期校验 Profile 与表头/表结构是否自洽
+#include "schema/SchemaCatalog.h"      // 数据库表结构目录（列类型/约束）
+#include "sql/SqlBuilder.h"            // 生成 UPSERT/标识符转义等 SQL 文本
+#include "validation/ForeignKeyPreflight.h"  // 写库前的外键存在性预检
 #include <functional>
+
+// ============================================================================
+// ImportService.cpp — 导入编排层实现（Excel → SQLite 的完整 ETL 流水线）
+// ============================================================================
+//
+// 【全局流水线一图流（与 run() 中的 Phase 标注一一对应）】
+//   Phase A   ExcelReader 打开文件 → 选 sheet → 读表头
+//   Phase B   ProfileValidator 校验；Mapper 编译校验器；TopoSorter 拓扑排序路由
+//   Phase A.5 buildLookupCache：把所有“正向查找”按身份去重，批量 SELECT 建缓存
+//   Phase C   逐行：Router 分派(Mixed) → Mapper.map 生成载荷+校验 → applyLookups
+//             套用查找结果 → FkInjector.inject 外键注入 → BatchUniqueness 批内查重
+//             → 收齐后 ForeignKeyPreflight 做外键存在性预检
+//   Phase D   单事务内按拓扑序对各路由 UPSERT；dryRun 则跳过本阶段只回报载荷
+//
+// 【贯穿全文的“部分成功”模型（务必先理解，否则读不懂跳过逻辑）】
+//   一行 Excel = 一个 RowContext，内部含多个 RoutePayload（每个写一张表）。错误分两类：
+//     · 路由局部错误 —— 只影响某条路由：记入 ctx.failedRouteIndices。
+//       写阶段只跳过这条路由“及其子孙路由”（父没写成，子的外键就无从谈起），
+//       兄弟路由若数据完好仍照常写入。
+//     · 非路由错误（hasNonRouteError）—— 结构性/无法绑定，整行载荷已不可用：整行跳过。
+//   这套区分是 RowPayload.h 里 H-01/H-04/M-04 等修复的核心，下文多处呼应。
+//
+// 【命名空间】实现细节均在 dbridge::detail；文件内匿名 namespace 里放只供本文件用的 helper。
+// ============================================================================
 
 namespace dbridge::detail {
 
 namespace {
 
 // ---- Lookup helpers --------------------------------------------------------
+// 译：外键“正向查找”辅助函数（正向 = 用 Excel 里的业务键，查参照表 G 的代理主键等列）。
 
 // Build a stable identity key for a LookupSpec: (from, match-pairs, select-pairs).
 // Two lookups sharing the same identity key can reuse one prefetch result.
+// 译：为一个 LookupSpec 生成稳定的“身份键”，由三部分拼成：参照表名 + 匹配对(match) +
+//     选取对(select)。两个查找若身份键相同，说明它们“查同一张表、用同样的列匹配、取同样
+//     的列”，于是可以共享同一次预取结果（见 Phase A.5），避免重复 SELECT。
+//     形如：  G_table::gcol=hdr,gcol2=hdr2::gsel->dbcol
 QString buildIdentityKey(const LookupSpec& lk) {
     QStringList matchParts, selectParts;
     for (const auto& p : lk.match)

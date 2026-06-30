@@ -24,3 +24,34 @@ target_include_directories(
 
 target_link_libraries(sync-suite PRIVATE dbridge Qt5::Core Qt5::Gui
                                          Qt5::Widgets Qt5::Sql Qt5::Network)
+
+# ── 部署 session 版 QSQLITE 插件到可执行文件旁（等价于 sync-suite.pro 的 QMAKE_POST_LINK）──
+# dbridge 把 SQLite 编译为带 SESSION + PREUPDATE_HOOK，其 sqlite3 结构体布局与 Qt 自带的 QSQLITE
+# 插件不一致；若运行时加载系统插件，dbridge 代码访问 sqlite3* 句柄会读到错位字段 → SIGSEGV。因此必须把项目自建的 session
+# 版插件部署到可执行文件旁的 sqldrivers/（main() 已把 applicationDirPath() 置于 libraryPaths
+# 首位以优先加载它）。
+#
+# 该插件目前仅由 qmake 子项目 qsqlite_session 构建，默认从其构建产物部署； 也可用
+# -DDBRIDGE_QSQLITE_SESSION_PLUGIN=<路径> 覆盖。
+set(DBRIDGE_QSQLITE_SESSION_PLUGIN
+    "${CMAKE_SOURCE_DIR}/build_qmake_demos/3rdparty/qsqlite_session/libqsqlite.so"
+    CACHE FILEPATH "session 版 QSQLITE 插件路径（由 qmake qsqlite_session.pro 构建）")
+
+if(EXISTS "${DBRIDGE_QSQLITE_SESSION_PLUGIN}")
+  add_custom_command(
+    TARGET sync-suite
+    POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory
+            "$<TARGET_FILE_DIR:sync-suite>/sqldrivers"
+    COMMAND
+      ${CMAKE_COMMAND} -E copy_if_different "${DBRIDGE_QSQLITE_SESSION_PLUGIN}"
+      "$<TARGET_FILE_DIR:sync-suite>/sqldrivers/libqsqlite.so"
+    COMMENT "部署 session 版 QSQLITE 插件到 sync-suite 旁")
+else()
+  message(
+    WARNING "未找到 session 版 QSQLITE 插件：${DBRIDGE_QSQLITE_SESSION_PLUGIN}\n"
+            "  sync-suite 仍可编译，但运行时打开 SQLite 会 SIGSEGV。请先用 qmake 构建该插件\n"
+            "  （cd build_qmake_demos && qmake ../dbridge.pro &&\n"
+            "   make sub-3rdparty-qsqlite_session-qsqlite_session-pro），\n"
+            "  或用 -DDBRIDGE_QSQLITE_SESSION_PLUGIN=<路径> 指定。")
+endif()

@@ -1,6 +1,7 @@
 # ---- Qt / C++ build artifacts ----
 build/
 build-*/
+build_*/
 out/
 cmake-build-*/
 *.o

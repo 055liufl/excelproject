@@ -13,6 +13,22 @@
 
 #include "CompareDetailDialog.h"
 
+// ============================================================================
+// Scenario2Widget.cpp — 场景2 顶层界面实现（表对比清单 + 保存/取消/重置）
+// ============================================================================
+//
+// 本类是一层纯「视图 + 交互」：全部业务逻辑都委托给 Scenario2Model（model_），自身只负责
+//   ① 搭出控件树（说明文字 + 表对比清单 + 底部操作条）；
+//   ② 把模型的差异状态渲染成红/绿表格（refreshTable）；
+//   ③ 把按钮/双击事件转成对 model_ 的调用，并据结果弹框提示。
+// 线程：纯主线程 GUI；不直接碰数据库/同步引擎（那些都在 model_ 内部）。
+// ============================================================================
+
+// 构造 —— 搭建界面并初始化模型。
+// 步骤：建布局 → 说明 RichText → 三列「表对比清单」表格（B表名/A表名/差异属性）→ 操作条
+//   （重置/状态标签/取消/保存）→ 调 model_->setup() 真正建库与比对会话；setup 失败则弹错并把
+//   失败原因追加到说明区，但仍构造出界面（ready_=false 时各操作会被禁用/短路）。
+// 末尾 refreshTable() 首次渲染。
 Scenario2Widget::Scenario2Widget(const QString& ws, QWidget* parent)
     : QWidget(parent), ws_(ws), model_(std::make_unique<Scenario2Model>(ws)) {
     auto* root = new QVBoxLayout(this);
@@ -79,6 +95,10 @@ Scenario2Widget::Scenario2Widget(const QString& ws, QWidget* parent)
     refreshTable();
 }
 
+// refreshTable —— 依据 model_ 的最新差异重绘清单与按钮态（每次决策/保存/重置后都会调）。
+// 做什么：逐表填三列；差异属性列按 identical 着色——相同=绿底、不同=红底并附 ≠修改 ＋新增 －删除
+//   计数。底部状态标签显示「待保存行数」，并据 pendingCount 启停「保存/取消」按钮。
+// 注意 statusOf 是个就地小工具：把 tableStatuses() 列表查成「按表名取状态」，找不到则返回空状态。
 void Scenario2Widget::refreshTable() {
     const QStringList tables = model_->tables();
     tableList_->setRowCount(tables.size());
@@ -124,6 +144,9 @@ void Scenario2Widget::refreshTable() {
     btnCancel_->setEnabled(ready_ && pending > 0);
 }
 
+// onRowDoubleClicked —— 双击某表行 → 打开该表的字段级对比对话框（CompareDetailDialog）。
+// 把 model_ 指针与表名传给对话框；订阅它的 stagingChanged 信号以便用户在对话框里做决策时
+//   实时刷新主清单；exec() 模态阻塞，关闭后再 refreshTable 一次确保同步最终状态。
 void Scenario2Widget::onRowDoubleClicked(int row, int /*column*/) {
     if (!ready_)
         return;
@@ -138,6 +161,9 @@ void Scenario2Widget::onRowDoubleClicked(int row, int /*column*/) {
     refreshTable();
 }
 
+// onSave —— 「保存」按钮：把内存暂存的合并决策写回 B 库。
+// 先记下 pending 行数（save 成功后会清零，故须提前取以便提示）；失败弹错框、成功弹信息框，
+//   两种情况都 refreshTable（成功后差异通常大幅减少）。
 void Scenario2Widget::onSave() {
     if (!ready_)
         return;
@@ -156,6 +182,7 @@ void Scenario2Widget::onSave() {
     refreshTable();
 }
 
+// onCancel —— 「取消」按钮：放弃所有内存暂存（discard），回到全部保留本地，刷新界面。
 void Scenario2Widget::onCancel() {
     if (!ready_)
         return;
@@ -163,6 +190,8 @@ void Scenario2Widget::onCancel() {
     refreshTable();
 }
 
+// onReset —— 「重置演示数据」按钮：reseed 把 A/B 两库恢复到初始差异态，便于反复演示。
+// reseed 内部即整套 setup 重跑，成功后更新 ready_ 并刷新清单；失败弹错框。
 void Scenario2Widget::onReset() {
     QString err;
     ready_ = model_->reseed(&err);

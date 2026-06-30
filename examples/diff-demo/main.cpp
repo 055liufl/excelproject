@@ -82,7 +82,9 @@ const char* Bold = "\033[1m";
 const char* Grey = "\033[90m";
 }  // namespace Color
 
-// 把 RowDiffKind 转为符号（类 BeyondCompare 风格）
+// kindSymbol —— 把行差异种类 RowDiffKind 映射成一个 BeyondCompare 风格的状态符号。
+//   Added(+ 仅远端有) / Deleted(- 仅本地有) / Modified(~ 两端不同) / Same(空白)。
+//   末尾 "  ? " 是防御性兜底：理论上 switch 已覆盖全部枚举，万一出现未知值用 ? 标记。
 static const char* kindSymbol(RowDiffKind k) {
     switch (k) {
         case RowDiffKind::Added:
@@ -97,7 +99,8 @@ static const char* kindSymbol(RowDiffKind k) {
     return "  ? ";
 }
 
-// 把 RowDiffKind 转为 ANSI 颜色
+// kindColor —— 把行差异种类映射成 ANSI 颜色码（绿=新增、红=删除、黄=修改、相同=无色）。
+//   与 kindSymbol 配套，让终端输出在视觉上一眼区分四类差异。
 static const char* kindColor(RowDiffKind k) {
     switch (k) {
         case RowDiffKind::Added:
@@ -112,12 +115,16 @@ static const char* kindColor(RowDiffKind k) {
     return Color::Reset;
 }
 
-// 打印分隔线
+// printSep —— 打印一条由 '-' 组成的分隔线（默认 72 列宽），纯排版辅助。
 static void printSep(int width = 72) {
     std::cout << std::string(width, '-') << "\n";
 }
 
-// 打印表级摘要（仿 BeyondCompare 的 Folder Compare 视图）
+// printTableSummary —— 打印「表级摘要」表格，仿 BeyondCompare 的 Folder Compare 视图。
+// 做什么：表头一行（表名/状态/+行/-行/~行），随后逐表打印 TableDiff，并按
+//   TableDiffStatus 上色（相同=灰、不同=黄、仅本地=红、仅远端=绿）。
+// 参数：diffs —— session->tableDiffs() 的结果（每张表一条表级差异摘要）。
+// 副作用：向 stdout 输出；不修改任何数据。
 static void printTableSummary(const QList<TableDiff>& diffs) {
     std::cout << Color::Bold << std::left << std::setw(20) << "表名" << std::setw(14) << "状态"
               << std::setw(8) << "+行" << std::setw(8) << "-行" << std::setw(8) << "~行"
@@ -152,7 +159,15 @@ static void printTableSummary(const QList<TableDiff>& diffs) {
     printSep();
 }
 
-// 打印行级 diff（仿 BeyondCompare 的 Table Compare 双栏视图）
+// printRowDiffs —— 打印某张表的「行级差异」明细，仿 BeyondCompare 的 Table Compare 视图。
+// 做什么：
+//   1) 先扫一遍所有 RowDiff，收齐出现过的列名 cols（保持首次出现顺序，作为表头列）。
+//   2) 打印列表头（状态符 + PrimaryKey + 各列名，列名截断到 colW-1 列宽内）。
+//   3) 逐行打印：跳过 Same 行（减少噪音）；对每个单元格——若该列 changed，用
+//      "本地→远端" 的箭头格式突出变化，否则原样显示本地值；缺失该列的单元格留空。
+// 参数：table=表名（仅用于表头标题）；rows=该表的 RowDiff 列表（含逐列 CellDiff）。
+// 边界：rows 为空时直接打印「（无差异行）」并返回。值显示均做了 left(N) 截断以对齐列宽。
+// 副作用：向 stdout 输出；不修改数据。
 static void printRowDiffs(const QString& table, const QList<RowDiff>& rows) {
     if (rows.isEmpty()) {
         std::cout << Color::Grey << "  （无差异行）" << Color::Reset << "\n";
@@ -221,6 +236,13 @@ static void printRowDiffs(const QString& table, const QList<RowDiff>& rows) {
 // 数据库辅助
 // ══════════════════════════════════════════════════════════════════════════════
 
+// execSqls —— 在指定 SQLite 文件上顺序执行一批 SQL 语句（建库/建表/插种子数据用）。
+// 做什么：临时新建一个独立连接（连接名由 dbPath+tag 拼成以避免重名）→ 打开 → 逐条 exec；
+//   任一条失败即打印错误（含语句前 80 字符与 lastError 文本）、置 ok=false 并中止剩余语句。
+// 资源管理：用内层 {} 作用域把 QSqlDatabase 限定其内，作用域结束后句柄析构，再
+//   removeDatabase——这是 Qt 的正确释放顺序（先放句柄再移除连接，否则会警告连接占用）。
+// 参数：dbPath 数据库文件路径；sqls 待执行语句；tag 连接名后缀（区分不同批次）。
+// 返回：全部成功 true；任一失败 false。副作用：可能创建/修改该 .db 文件。
 static bool execSqls(const QString& dbPath, const QStringList& sqls, const std::string& tag = "") {
     const QString connName = QStringLiteral("exec_") + dbPath + tag.c_str();
     bool ok = true;
@@ -247,7 +269,12 @@ static bool execSqls(const QString& dbPath, const QStringList& sqls, const std::
     return ok;
 }
 
-// 把一张表的全部行读成 QList<QVariantMap>（模拟"从远端获取快照"）
+// fetchAllRows —— 把一张表的全部行读成 QList<QVariantMap>（每行一个「列名→值」映射）。
+// 用途：本 demo 用它模拟「从远端获取快照行数据」，以及合并后回读本地表做结果验证。
+// 做什么：临时连接打开库 → SELECT * FROM table → 用 QSqlRecord 拿到列名，逐行逐列填进
+//   QVariantMap。同样用作用域 + removeDatabase 规范释放连接。
+// 参数：dbPath 库路径；table 表名。返回：该表所有行（顺序即 SQLite 返回顺序）。
+// 注意：demo 简化未校验 SQL 注入/错误（table 来自硬编码常量，可控）。
 static QList<QVariantMap> fetchAllRows(const QString& dbPath, const QString& table) {
     QList<QVariantMap> result;
     const QString connName = QStringLiteral("fetch_") + dbPath + table;
@@ -269,7 +296,12 @@ static QList<QVariantMap> fetchAllRows(const QString& dbPath, const QString& tab
     return result;
 }
 
-// 计算简单的行内容指纹（demo 用：行哈希之和的十六进制）
+// computeChecksum —— 计算一批行的「内容校验和」（demo 简化版）。
+// 做什么：对每行把各列值字符串化、用 31 进制多项式滚动哈希成一个 quint64，再把所有行哈希
+//   按模 2^64 累加（quint64 溢出即天然取模），最后转十六进制字符串返回。
+// 为什么「累加」而非「拼接哈希」：累加满足交换律 → 顺序无关，与真实 TableStateStore 的
+//   「顺序无关模加 hash」(见 §15.7.9) 思路一致——这样两端即便行顺序不同也能算出相同校验和。
+// 与生产实现的差距：这里仅为演示，强度/列序处理都做了简化；真实实现见 TableStateStore。
 // 真实实现在 TableStateStore：顺序无关模加 hash（see §15.7.9）
 static QString computeChecksum(const QList<QVariantMap>& rows) {
     quint64 sum = 0;
@@ -282,7 +314,9 @@ static QString computeChecksum(const QList<QVariantMap>& rows) {
     return QString::number(sum, 16);
 }
 
-// 打印表内容（辅助确认合并结果）
+// dumpTable —— 把一张表的全部行以「| 列名=值 |」的形式平铺打印（辅助人工核对合并结果）。
+// 参数：dbPath 库路径；table 表名；label 打印时的标签（如 "local/products (合并后)"）。
+// 做什么：调 fetchAllRows 读全表，逐行逐列输出。纯诊断用途，无副作用（除 stdout）。
 static void dumpTable(const QString& dbPath, const QString& table, const std::string& label) {
     auto rows = fetchAllRows(dbPath, table);
     std::cout << "\n  [" << label << " / " << table.toStdString() << "]\n";
@@ -299,17 +333,28 @@ static void dumpTable(const QString& dbPath, const QString& table, const std::st
 // main
 // ══════════════════════════════════════════════════════════════════════════════
 
+// main —— diff-demo 的完整驱动：把文件头那张「工作流阶段图」从头跑到尾。
+// 流程（与下方各 ── N. xxx 分节一一对应）：建库建表/种子数据 → 构造远端快照 →
+//   打开 DataBridge、初始化同步引擎、建 ComparisonSession → initialize 触发双级 diff →
+//   可视化表级/行级差异 → 模拟用户做合并决策(stageCell/acceptLocal/acceptRemote/
+//   stageRow/unstage) → save 写库 → 回读验证 → 演示 discard → 清理。
+// 参数：argv[1] = workspace 目录（其下自动建 local.db 及 outbox/inbox/quarantine）。
+// 返回：0 成功；非 0 表示某一步失败（各失败点都打印原因后提前 return）。
 int main(int argc, char* argv[]) {
     QCoreApplication app(argc, argv);
     // Qt 5.12 appends applicationDirPath() at the END of libraryPaths(), so
     // the system QSQLITE plugin (without session support) wins. Put our
     // sqldrivers/ copy first by rebuilding the list with appDir at position 0.
+    // 【译】Qt 5.12 会把 applicationDirPath() 追加到 libraryPaths() 的【末尾】，导致系统自带的
+    //   QSQLITE 插件（不支持 SQLite session 扩展，无法捕获变更集）优先被加载。这里把程序目录
+    //   重排到列表【首位】，让我们随程序部署的 sqldrivers/ 下那份带 session 支持的插件胜出。
+    //   （此即 MEMORY 里记录的 setLibraryPaths vs addLibraryPath 陷阱：必须整列重排到 0 位。）
     {
         QStringList paths;
-        paths.append(app.applicationDirPath());
+        paths.append(app.applicationDirPath());  // 程序目录置于首位
         for (const QString& p : QCoreApplication::libraryPaths())
             if (!paths.contains(p))
-                paths.append(p);
+                paths.append(p);  // 其余原有路径去重后追加在后
         QCoreApplication::setLibraryPaths(paths);
     }
 

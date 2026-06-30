@@ -153,12 +153,23 @@ SyncWorker::~SyncWorker() {
 
 // 入队一个写任务（线程安全）：加锁追加，并唤醒一个等待者（主循环）。
 // wakeOne 足矣——只有 run() 一条线程在 queueCond_ 上等待。
+// enqueue —— 跨线程入口：把一个写任务压入队列并唤醒主循环（不等待执行）。
+// 做什么：加锁追加到 taskQueue_，wakeOne 唤醒在 queueCond_ 上等待的 run() 主循环。
+// 为什么 wakeOne 而非 wakeAll：只有一条 worker 线程在等，唤醒一个即可，省一次无谓唤醒。
+// 线程：任意调用方线程（queueMutex_ 保护队列）。副作用：入队。复杂度：O(1)。
 void SyncWorker::enqueue(WriteTask task) {
     QMutexLocker lk(&queueMutex_);
     taskQueue_.append(std::move(task));
     queueCond_.wakeOne();
 }
 
+// submitWriteSync —— 同步执行一个「需要写连接」的任务并等待其结果（最多阻塞 60s）。
+// 做什么：若当前已在 worker 线程则直接执行(避免自我死锁)；否则用 promise/future 把任务
+//   投递到队列、阻塞等回结果。任务签名 (QSqlDatabase&, QString*)->bool。
+// 为什么要判「是否已在 worker 线程」：若在 worker 线程里又投递并 future.wait，会等待自己
+//   执行队列——死锁。故同线程时直接调用。
+// 参数：task 待执行的写操作；err 失败原因回填。返回：task 的成败；超时返回 false。
+// 线程：任意调用方线程。错误模式：worker 未就绪 / 60s 超时 → false。
 bool SyncWorker::submitWriteSync(const std::function<bool(QSqlDatabase&, QString*)>& task,
                                  QString* err) {
     if (!isRunning() || !wconnPtr_) {
@@ -167,7 +178,7 @@ bool SyncWorker::submitWriteSync(const std::function<bool(QSqlDatabase&, QString
         return false;
     }
     if (QThread::currentThread() == this) {
-        return task(*wconnPtr_, err);
+        return task(*wconnPtr_, err);  // 已在 worker 线程：直接执行，避免投递给自己造成死锁
     }
 
     auto sharedPromise = std::make_shared<std::promise<QPair<bool, QString>>>();
@@ -193,26 +204,54 @@ bool SyncWorker::submitWriteSync(const std::function<bool(QSqlDatabase&, QString
     return result.first;
 }
 
+// requestRescan —— 请求立即重扫一次 inbox（把 scanInbox 当作任务入队）。
+// 做什么：worker 在运行时，入队一个调用 scanInbox 的闭包；未运行则直接返回。
+// 为什么走入队而非直接调：scanInbox 必须在 worker 线程、用其独占写连接执行；调用方
+//   线程不能直接碰 wconn。线程：任意调用方线程。复杂度：O(1)（仅入队）。
 void SyncWorker::requestRescan() {
     if (!isRunning())
         return;
     enqueue([this]() { scanInbox(); });
 }
 
+// requestStop —— 请求停止：置停止标志并唤醒主循环。
+// 做什么：加锁置 stopRequested_=true，wakeAll 唤醒主循环。主循环醒来后会先把队列里剩余
+//   任务排空、再退出（协作式停止，不强杀）。为什么 wakeAll：确保即使主循环正阻塞在
+//   queueCond_ 上也能立刻醒来响应停止。线程：任意调用方线程。复杂度：O(1)。
 void SyncWorker::requestStop() {
     QMutexLocker lk(&queueMutex_);
     stopRequested_ = true;
     queueCond_.wakeAll();
 }
 
+// waitForInit —— 阻塞等待 worker 初始化完成（成功 / 超时）。
+// 做什么：tryAcquire 信号量——run() 完成初始化(无论成败)后会 release 一次，本调用据此返回。
+// 为什么用信号量：跨线程「等待一次性事件」的标准做法；超时可控，避免无限等待卡死调用方。
+// 参数：timeoutMs 最长等待毫秒。返回：true=已初始化(信号量已 release)；false=超时。
+// 线程：调用 start() 的那条线程。复杂度：O(1)（带超时的获取）。
 bool SyncWorker::waitForInit(int timeoutMs) {
     return initSemaphore_.tryAcquire(1, timeoutMs);
 }
 
+// initError —— 返回初始化失败原因（成功时为空串）。线程：通常在 waitForInit 返回 false 后
+//   由调用方线程读取（此时 run() 已写完 initError_ 并 release 信号量，存在 happens-before）。
 QString SyncWorker::initError() const {
     return initError_;
 }
 
+// run —— QThread 线程体：整条 worker 线程的唯一执行体（贯穿其全生命周期）。
+// 做什么（三大阶段）：
+//   ① 起连接：在【本线程内】创建 SQLite 写连接 wconn(I-02：必须本线程创建以归属本线程)，
+//      开 WAL + foreign_keys，取底层 sqlite3* 句柄；任一步失败 → 写 initError_ + release
+//      信号量 + 清理后返回。
+//   ② 初始化：建/迁移全部 __sync_* 表、依次 init 各 store、从 changelog MAX 恢复
+//      localOriginSeq_、attach session 等；完成后(无论成败)把 wconnPtr_/hPtr_ 暴露给闭包
+//      并 release initSemaphore_，唤醒 waitForInit。
+//   ③ 主循环：在 queueCond_ 上「等任务/等停止/带超时」循环；每轮 processPendingTasks(执行
+//      写任务) → scanInbox(收) → broadcast(发) → 检查 ACK 超时。stopRequested_ 后排空队列退出。
+// 为什么写连接在此创建：SQLite session 捕获要求「连接 + 句柄」始终归属创建线程；放在 run()
+//   内即天然保证 worker 线程独占，永不跨线程使用 QSqlDatabase(C-03 不变量的根基)。
+// 线程：worker 线程自身(本函数即该线程)。复杂度：随生命周期运行，受任务量与轮询间隔支配。
 void SyncWorker::run() {
     // --- Create write connection on the worker thread (I-02 fix) ---
     QString connName =
@@ -555,17 +594,32 @@ void SyncWorker::run() {
     QSqlDatabase::removeDatabase(connName);
 }
 
+// processPendingTasks —— 取出并执行队列里当前的全部写任务。
+// 做什么：加锁把 taskQueue_ 整体 swap 到局部 tasks(锁内只做交换，锁外执行)，再逐个调用。
+// 为什么 swap 后在锁外执行：任务可能耗时(写库)，若持锁执行会阻塞 enqueue 投递新任务；
+//   swap 出来后立即放锁，把执行放到锁外，最大化并发投递吞吐。
+// 线程：worker(主循环每轮调用)。副作用：执行各任务的全部副作用。复杂度：O(任务数 × 各任务)。
 void SyncWorker::processPendingTasks() {
     QList<WriteTask> tasks;
     {
         QMutexLocker lk(&queueMutex_);
-        tasks.swap(taskQueue_);
+        tasks.swap(taskQueue_);  // 锁内只交换，立即放锁
     }
     for (auto& task : tasks) {
-        task();
+        task();  // 锁外执行，不阻塞其它线程投递
     }
 }
 
+// scanInbox —— 扫描 inbox：发现新工件并逐个处理，对超时未补齐的 gap 触发基线回退。
+// 做什么：① 用 watcher_->scan(同步扫描，I-10：不依赖事件循环)找出新 .ready 工件；
+//   ② 并入 ledger 里「已 seen 但尚未处理」的工件(防丢)；③ 逐个 processArtifact；
+//   ④ 取「超时仍未推进」的工件，仅对其中的 changeset 类(H-03：只有它代表严格 seq 空洞)
+//   发 E_SYNC_GAP 并 runBaselineFallbackFor 兜底，选择性推送 chunk/门控延迟工件各有自己的
+//   重试语义，不走 changeset gap 处理。
+// 为什么用同步 scan 而非信号：worker 主循环是 QWaitCondition::wait 而非事件循环，QTimer/
+//   QFileSystemWatcher 信号根本不会触发(I-10 修复)。
+// 线程：worker(主循环每轮调用)。前置：wconnPtr_ 有效。副作用：可能应用变更、发 gap 告警、
+//   发起基线请求。复杂度：O(目录条目数 + 待处理工件数)。
 void SyncWorker::scanInbox() {
     if (!wconnPtr_)
         return;
@@ -608,6 +662,15 @@ void SyncWorker::scanInbox() {
     }
 }
 
+// processArtifact —— 处理单个 inbox 工件：幂等判定 → 解码 → 按种类分派。
+// 做什么：① 查 ledger 幂等：已 consumed/corrupt 的直接跳过(不重复处理)；② 读文件、解码；
+//   ③ 按 dec.kind 分派到 process{Changeset,SelectionPush,BaselineRequest,BaselineResponse,
+//   Ack}Artifact；④ 处理成功后 markConsumed(配合「先持久 ACK 再 markConsumed」的次序，
+//   保证崩溃可重放且结果一致)。ACK 工件(.ack)也入 ledger，避免无限重处理(M-07)。
+// 为什么幂等是核心：传输层不保证 exactly-once，同一工件可能被多次发现；ledger 让「应用一次」
+//   成为不变量——这是整个收方向正确性的基石。
+// 参数：path 工件完整路径。返回：是否成功处理(并已 markConsumed)。
+// 线程：worker。副作用：应用变更/回 ACK/写 ledger。复杂度：O(工件大小 + 应用成本)。
 bool SyncWorker::processArtifact(const QString& path) {
     QFileInfo fi(path);
     QString name = fi.fileName();
@@ -717,6 +780,15 @@ bool SyncWorker::processArtifact(const QString& path) {
     return ok;
 }
 
+// processChangesetArtifact —— 应用一个普通 changeset 工件（收方向最常走的路径）。
+// 做什么：校验 schema 兼容(不兼容则进隔离区等升级)→ 经 InboundTableGate 判断是否需延迟
+//   (比对暂存期)→ 按外键拓扑序 + rank 冲突仲裁，用 CapturedWriteTemplate 的「入站分支」
+//   应用 changeset → 推进该 origin 的 AppliedVector 水位 → 调度回送 ACK 给发起方。
+// 关键次序(H-01)：先 schedule + flush ACK，再 markConsumed——若在「apply 提交」与
+//   「markConsumed」之间崩溃，工件停留在 'seen'，重启后会幂等重放 + 重发 ACK，而不会静默
+//   丢掉 ACK(否则发送方永远等不到确认)。
+// 参数：dec 已解码工件(name 形参未用)。返回：是否成功应用。
+// 线程：worker。错误模式：schema 不符 → 隔离；门控命中 → 延迟；应用失败 → 回滚 + 退 seq。
 bool SyncWorker::processChangesetArtifact(const DecodeResult& dec, const QString& /*name*/) {
     const PayloadHeader& hdr = dec.header;
 
@@ -801,6 +873,15 @@ bool SyncWorker::processChangesetArtifact(const DecodeResult& dec, const QString
     return true;
 }
 
+// processSelectionPushArtifact —— 应用一个「选择性推送」chunk 工件。
+// 做什么：校验本 chunk 属于期望的 push 且按序(前驱 chunk 已到)→ 用 CapturedWriteTemplate 的
+//   「选择推送分支」按冻结清单(拓扑序)套用行数据 → 更新 __sync_push_progress(记录该 push
+//   已收到/应用到第几片，全部 done 才放行该 push 的 changelog 广播)→ 回送 PushChunkAck
+//   (带 checksum，告知发送方此片是否完好应用，支撑断点续传与重传)。
+// 为什么单独成路径：选择性推送是「按需推一个数据子集 + 其外键闭包」，需分片传输与逐片确认，
+//   语义不同于全量 changeset(其按 origin_seq 连续；这里按 chunkSeq 连续)。
+// 参数：dec 解码工件；checksum 本片校验和(回 ACK 用)。返回：是否成功应用本片。
+// 线程：worker。错误模式：乱序/陌生 push → 延迟或忽略；应用失败 → 回 ok=false 的 ACK。
 bool SyncWorker::processSelectionPushArtifact(const DecodeResult& dec, const QString& /*name*/,
                                               const QString& checksum) {
     const PayloadHeader& hdr = dec.header;
@@ -989,9 +1070,17 @@ bool SyncWorker::processSelectionPushArtifact(const DecodeResult& dec, const QSt
     return true;
 }
 
+// processBaselineRequestArtifact —— 响应对端的「基线请求」：导出全量、回 BaselineResponse。
 // C-01 fix: implement baseline request handler.
 // When a peer asks for a baseline (because it has a gap it cannot self-heal), this node
 // serializes the requested tables and writes a BaselineResponse artifact to the outbox.
+// 【C-01 修复】实现基线请求处理：当某对端因「无法自愈的 gap」请求基线时，本节点把所请求
+//   的各表序列化成全量快照，写出一个 BaselineResponse 工件到 outbox 发回给它。
+// 做什么：解出请求方与所需表 → 经 BaselineManager 导出这些表的当前全量数据 → 编码为
+//   BaselineResponse 工件 → 写 outbox 路由回请求方。这是「另一端发起回退、本端配合提供
+//   全量基线」的服务端半边。
+// 参数：dec 请求工件(artifactName 形参未用)。返回：是否成功导出并写出回应。
+// 线程：worker。前置：wconnPtr_ 有效。副作用：写一个 BaselineResponse 工件。
 bool SyncWorker::processBaselineRequestArtifact(const DecodeResult& dec,
                                                 const QString& /*artifactName*/) {
     if (!wconnPtr_)
@@ -1076,9 +1165,19 @@ bool SyncWorker::processBaselineRequestArtifact(const DecodeResult& dec,
     return true;
 }
 
+// processBaselineResponseArtifact —— 收到「基线回应」：全量套用并重置跟踪状态、重扫 inbox。
 // C-01 fix: implement baseline response handler.
 // Applies the received baseline data, resets tracking stores, and triggers an inbox rescan
 // so any artifacts that were pending the baseline can now be processed.
+// 【C-01 修复】实现基线回应处理：套用收到的基线全量数据，重置各跟踪 store，并触发一次
+//   inbox 重扫，使那些「之前因等待基线而挂起」的工件现在得以被处理。
+// 做什么：经 BaselineManager 全量导入对端发来的快照(覆盖本地相关表)→ 重置 AppliedVector/
+//   RowWinner 等跟踪 store 到与基线一致的水位 → drainQuarantine 重放因此变得可应用的隔离包
+//   → requestRescan 重扫 inbox(此前卡在 gap 的增量工件现可继续)。
+// 为什么基线后要重置跟踪 store：基线是「跳过中间增量、直接对齐到某一致快照」，原有的逐 seq
+//   水位已不再连续可信，必须随基线一并重置，否则后续会把基线之后的正常增量误判为 gap。
+// 参数：dec 基线回应工件(artifactName 形参未用)。返回：是否成功套用。线程：worker。
+// 前置：wconnPtr_/hPtr_ 有效。副作用：覆盖本地数据、重置水位、重扫 inbox。
 bool SyncWorker::processBaselineResponseArtifact(const DecodeResult& dec,
                                                  const QString& /*artifactName*/) {
     if (!wconnPtr_ || !hPtr_)
@@ -1181,6 +1280,14 @@ bool SyncWorker::processBaselineResponseArtifact(const DecodeResult& dec,
     return true;
 }
 
+// processAckArtifact —— 处理收到的 ACK 工件（推进发送方向的确认水位、消费 ACK 窗口）。
+// 做什么：解出 ACK 类型——ChangesetAck 则推进 OutboundAckStore 中 (peer,origin,epoch) 的
+//   acked_seq(MAX 推进，只增不减)，并检查是否令某个 pendingAckWindow_ 条目达成(全部达成则
+//   前台 sync() 可切 Completed)；PushChunkAck 则推进对应 push 的 chunk 确认进度(忽略来自陈旧
+//   /无关 push 的 chunk ACK——靠 pendingPushId_ 过滤，C-04)。
+// 为什么 ACK 也要入 ledger(M-07)：ACK 工件同样可能被重复发现，入台账幂等去重，避免无限重处理。
+// 参数：path ACK 文件路径；name 文件名(查/写 ledger 用)。返回：是否成功处理。
+// 线程：worker。副作用：推进 acked_seq / push 进度，可能推动前台状态机走向完成。
 bool SyncWorker::processAckArtifact(const QString& path, const QString& name) {
     QFile f(path);
     if (!f.open(QIODevice::ReadOnly))
@@ -1322,11 +1429,20 @@ bool SyncWorker::processAckArtifact(const QString& path, const QString& name) {
     return false;
 }
 
+// broadcast —— 向「所有未被驱逐的对端」各发一轮 changelog，再统一 flush ACK 通道。
+// 做什么：遍历配置的 peerNodes，跳过已驱逐者，对其余每个调 broadcastTopeer；之后
+//   把积攒的 ACK 一次性写出(ackChan_->flush)，最后 evaluatePeers 评估健康度。
+// 为什么先逐 peer 发、再统一 flush ACK：ACK 通道是批量的——把多次应用产生的 ACK 攒起来
+//   一次写出，减少小文件 IO。这是「后台广播循环」用的版本，不需要 ACK 窗口记账
+//   （前台 sync() 走 enqueueDrain → 直接调 broadcastTopeer 并传 ackedEntries 收集窗口）。
+// 参数：outErr 可选，回填首个遇到的错误（只记第一个，不覆盖）。
+// 返回：true 表示本轮至少向某个对端写出了工件（有实际广播发生）。
+// 线程：worker。副作用：写 outbox 工件、flush ACK、可能驱逐对端。
 bool SyncWorker::broadcast(QString* outErr) {
     bool wroteAny = false;
     for (const QString& peer : config_.peerNodes()) {
         if (isPeerEvicted(peer))
-            continue;
+            continue;  // 已驱逐（失联/滞后）的对端本轮跳过
         QString peerErr;
         if (broadcastTopeer(peer, &peerErr))
             wroteAny = true;
@@ -1346,6 +1462,20 @@ bool SyncWorker::broadcast(QString* outErr) {
     return wroteAny;
 }
 
+// broadcastTopeer —— 向「单个对端」发一轮 changelog（广播的核心实现）。
+// 做什么（流程概览，细节见下方各 fix 注释）：
+//   ① 用 minUnackedLocalSeq 求读取下界(afterLocalSeq)——确保未被 ACK 的变更可被重发；
+//   ② 从 changelog 读这段范围的条目；
+//   ③ 逐条按 anti-echo 路由(shouldRoute)过滤：不发对端自己来源的、已被它确认的变更；
+//   ④ 跳过尚属「未完成的选择性推送」的条目（避免半成品被广播）；
+//   ⑤ 对要发的 changeset 先 rebase 到本地冲突处理结果之上，再编码成工件写 outbox；
+//   ⑥ 记账：把成功写出的 (peer,origin,epoch,maxOriginSeq) 收进 ackedEntries(若提供)，
+//      供 enqueueDrain 构建完整 ACK 窗口；并推进发送水位 updateLastSent。
+// 为什么读取下界用「未确认」而非「已发送」(C-02)：已发送但未确认的变更必须仍可被重读重发，
+//   否则一旦丢包就永久漏发；last_sent 仅用于诊断/推进，不作为重发剪枝依据。
+// 参数：peer 目标对端；outErr 可选错误回填；ackedEntries 可选，收集本轮 ACK 窗口条目。
+// 返回：true=本轮确实向该对端写出了至少一个工件。
+// 线程：worker。副作用：写 outbox 工件、推进 last_sent 水位、可能填充 ackedEntries。
 bool SyncWorker::broadcastTopeer(const QString& peer, QString* outErr,
                                  QList<PendingAckEntry>* ackedEntries) {
     // C-02 fix: use minUnackedLocalSeq as the read lower-bound so that un-ACKed changesets
@@ -1460,11 +1590,24 @@ bool SyncWorker::broadcastTopeer(const QString& peer, QString* outErr,
     return wroteAny;
 }
 
+// computePeerAckedSeq —— 查「某对端」对「本节点 origin」已确认到的 seq。
+// 做什么：从 OutboundAckStore 读 (peer, 本节点id, 当前纪元) 的 acked_seq。
+// 为什么按 peer 而非全局 MIN（I-15 fix）：判断「这个对端」是否已确认到某点时，必须用它
+//   自己的水位；若误用全体最小值，会被最慢的对端拖累而误判其它对端尚未确认。
+// 参数：peer 对端 id。返回：该对端已确认的本地 origin_seq（无记录则由底层返回 -1）。
+// 线程：worker。复杂度：O(1)（主键命中）。
 qint64 SyncWorker::computePeerAckedSeq(const QString& peer) {
     // I-15 fix: query the acked seq for this specific peer, not the global min.
+    // 【I-15 修复】查的是「该特定对端」的已确认 seq，而非全体最小值。
     return ackStore_->ackedSeq(*wconnPtr_, peer, config_.nodeId(), streamEpoch_);
 }
 
+// isPeerEvicted —— 该对端是否已被「驱逐」（标记为基线挂起 pending_baseline=1）。
+// 做什么：查 __sync_outbound_ack 中该 peer 任一行的 pending_baseline 是否为 1（取 MAX）。
+// 为什么：被判定失联/严重滞后的对端会被置 pending_baseline，广播循环据此跳过它，避免
+//   为一个不在线的对端反复打包发送、浪费 IO，也把它排除出 changelog 裁剪计算。
+// 参数：peer 对端。返回：true=已驱逐（应跳过）；连接无效/查询失败/无记录 → false（不跳过）。
+// 线程：worker。复杂度：O(该 peer 行数)。错误模式：查询失败按「未驱逐」保守处理。
 bool SyncWorker::isPeerEvicted(const QString& peer) {
     if (!wconnPtr_)
         return false;
@@ -1478,24 +1621,39 @@ bool SyncWorker::isPeerEvicted(const QString& peer) {
     return q.value(0).toInt() != 0;
 }
 
+// peerLastAckMs —— 该对端最近一次 ACK 的时间戳（毫秒）。
+// 做什么：取该 peer 名下所有「真实 origin 行」(排除 '__broadcast__' 哨兵行) 的
+//   last_ack_ms 最大值。为什么排除哨兵行：哨兵行记的是「发送」时间而非「确认」时间，
+//   把它算进来会高估对端的活跃度，导致失联判定失准。
+// 参数：peer 对端。返回：最近 ACK 的 ms 时间戳；无任何确认记录 → 0（视为「从未确认」）。
+// 用途：evaluatePeers 用「now - 此值」算对端静默时长，超阈值判为失联。
+// 线程：worker。复杂度：O(该 peer 行数)。
 qint64 SyncWorker::peerLastAckMs(const QString& peer) {
     QSqlQuery q(*wconnPtr_);
     q.prepare(
         QStringLiteral("SELECT COALESCE(MAX(last_ack_ms), 0) "
                        "FROM __sync_outbound_ack "
-                       "WHERE peer = ? AND origin != '__broadcast__'"));
+                       "WHERE peer = ? AND origin != '__broadcast__'"));  // 排除发送哨兵行
     q.addBindValue(peer);
     if (!q.exec() || !q.next())
         return 0;
     return q.value(0).toLongLong();
 }
 
+// peerLagBytes —— 该对端「落后」了多少字节（滞后评估的字节维度）。
+// 做什么：累加 __sync_changelog 中「不是该 peer 自己产生的(origin != peer)、且 local_seq
+//   大于 afterLocalSeq(它已发送/确认到的水位)」的所有变更的 byte_size。
+// 为什么 origin != peer：anti-echo——对端自己产生的变更本就不会发回给它，不应计入它的
+//   待收积压；只统计「它还欠收的、别处来的」变更字节量。
+// 参数：peer 对端；afterLocalSeq 它的发送/确认水位（此值之后的才算积压）。
+// 返回：积压字节数（0 表示已追平或查询失败）。用途：超过字节阈值即判定该对端滞后。
+// 线程：worker。复杂度：O(满足条件的 changelog 行数)。
 qint64 SyncWorker::peerLagBytes(const QString& peer, qint64 afterLocalSeq) {
     QSqlQuery q(*wconnPtr_);
     q.prepare(
         QStringLiteral("SELECT COALESCE(SUM(byte_size), 0) "
                        "FROM __sync_changelog "
-                       "WHERE origin != ? AND local_seq > ?"));
+                       "WHERE origin != ? AND local_seq > ?"));  // 排除对端自产 + 仅统计水位之后
     q.addBindValue(peer);
     q.addBindValue(afterLocalSeq);
     if (!q.exec() || !q.next())
@@ -1503,6 +1661,14 @@ qint64 SyncWorker::peerLagBytes(const QString& peer, qint64 afterLocalSeq) {
     return q.value(0).toLongLong();
 }
 
+// evaluatePeers —— 逐对端评估健康度（滞后/失联），必要时驱逐或告警。
+// 做什么：对每个对端，采集三维度指标——已发送水位与本地头之差(seq 滞后)、积压字节量
+//   (peerLagBytes)、距最近一次 ACK 的时长(now - peerLastAckMs)——交给 DeadPeerEvictor
+//   按软/硬阈值判定状态(健康/Lagging/Dead)，据此告警或把对端置 pending_baseline 驱逐。
+// 为什么三维度：单看一项易误判（短暂大批量写会让字节积压瞬时飙高但对端其实在线）；
+//   组合「序号滞后 + 字节积压 + 静默时长」才能稳健区分「暂时落后」与「真失联」。
+// 何时调用：每轮 broadcast 末尾。前置：wconnPtr_ 与 evictor_ 均有效。
+// 线程：worker。副作用：可能 emit 告警、可能驱逐对端(改 pending_baseline)。
 void SyncWorker::evaluatePeers() {
     if (!wconnPtr_ || !evictor_)
         return;
@@ -1538,6 +1704,14 @@ void SyncWorker::evaluatePeers() {
     }
 }
 
+// runBaselineFallbackFor —— 对「超时仍补不齐的 gap 工件」发起基线请求（兜底全量对齐）。
+// 做什么：读出这个迟迟无法应用(其前驱 seq 缺失)的工件、解码出它的 origin/epoch，向该 origin
+//   发一个 BaselineRequest，请求对方导出全量基线，从而跳过那段补不上的增量、重新对齐。
+// 为什么需要：增量同步靠连续 seq；一旦中间某段永久丢失(对方已裁剪/网络长期中断)，光等
+//   增量永远补不上。基线回退是「认输并重来」的安全网：用一次全量快照重置到一致状态。
+// 去抖：baselineRequestsInFlight_ 防止对同一工件反复发请求(同一 gap 只请求一次)。
+// 参数：artifactName gap 工件文件名。返回：是否成功发起了基线请求。
+// 线程：worker。前置：wconnPtr_/hPtr_ 有效。副作用：可能写出一个 BaselineRequest 工件。
 bool SyncWorker::runBaselineFallbackFor(const QString& artifactName) {
     if (!wconnPtr_ || !hPtr_)
         return false;
@@ -1622,9 +1796,20 @@ bool SyncWorker::runBaselineFallbackFor(const QString& artifactName) {
     return false;
 }
 
+// submitImportSync —— 在 worker 线程上跑一次 Excel 导入（session 捕获 + 同步等待）。
 // I-04: Submit import to run on the worker thread using wconn + session capture.
 // C-03 fix: accepts pre-snapshotted profile/catalog so the worker never touches
 // DataBridge::db_ or its mutable members from the wrong thread.
+// 【I-04】把导入提交到 worker 线程，用其写连接 wconn 配合 SQLite session 捕获变更。
+// 【C-03 修复】参数 profile/catalog 是「调用方线程预先拍好的快照」——worker 全程不触碰
+//   DataBridge::db_ 或其可变成员，杜绝跨线程使用同一连接/可变 catalog 的隐患。
+// 做什么：把导入操作打包成闭包投递到 worker 队列并阻塞等结果(最多 60s)；闭包内用 wconn
+//   执行导入，所有写改动被 session 捕获、封入 changelog，随后会被广播给各 peer。
+// 为什么必须在 worker 线程：session/changeset 捕获绑定写连接，而该连接归 worker 线程独占；
+//   且只有走 worker 才能让导入改动进入 changelog 被同步出去(区别于绕过捕获的直写)。
+// 参数：opts 导入选项；xlsxPath 源文件；profile/catalog 跨线程安全的规格快照。
+// 返回：ImportResult(含成功行数/错误)；超时则返回带 E_SYNC_INIT 错误的结果。
+// 线程：调用方线程投递+阻塞，实际执行在 worker 线程。
 ImportResult SyncWorker::submitImportSync(const ImportOptions& opts, const QString& xlsxPath,
                                           const detail::ProfileSpec& profile,
                                           const detail::SchemaCatalog& catalog) {
@@ -1774,16 +1959,34 @@ ImportResult SyncWorker::submitImportSync(const ImportOptions& opts, const QStri
     return future.get();
 }
 
+// nextLocalOriginSeq —— 预递增并返回下一个本地 origin_seq。
+// 做什么：前置自增 localOriginSeq_ 并返回新值（即「先 +1 再用」）。
+// 为什么前置自增：origin_seq 必须从 1 开始、连续不重复；每次写入预分配一个。
+// 关键不变量：返回后若事务最终回滚，【必须】调 rollbackOriginSeq() 退回，否则会留下空洞。
+// 线程：worker（仅在写线程串行调用，故无锁即安全）。复杂度：O(1)。
 qint64 SyncWorker::nextLocalOriginSeq() {
     return ++localOriginSeq_;
 }
 
+// rollbackOriginSeq —— 事务回滚后把 origin_seq 计数器退回。
 // H-01 fix: restore localOriginSeq_ to prevSeq after a transaction rollback so that
 // the next successful write receives a contiguous seq (no gap).
+// 【H-01 修复】事务回滚后把 localOriginSeq_ 复位到 prevSeq（即本次写入前的值），
+//   使下一次成功写入拿到连续的 seq、不留空洞。
+// 为什么必须手动退回：DB 事务回滚只撤销「表数据」改动，并不会回退这个内存里的计数器；
+//   若不退回，被预分配但未落库的 seq 就成了空洞，对端 AppliedVectorStore::check() 会把它
+//   误判为 gap，进而触发不必要的基线回退。参数：prevSeq 写入前应恢复到的值。线程：worker。
 void SyncWorker::rollbackOriginSeq(qint64 prevSeq) {
     localOriginSeq_ = prevSeq;
 }
 
+// drainQuarantine —— 重放隔离区中「现已可应用」的 payload（M-06 修复配套逻辑）。
+// 做什么：按当前 schema 版本从 QuarantineStore 取出已成熟的条目，逐个解码；若是 changeset
+//   就走正常应用路径 processChangesetArtifact，成功则 markReplayed 将其移出隔离区。
+// 为什么：之前因本地 schema 版本过低而被隔离的「来自未来」的变更，在本地 schema 升级或
+//   套用基线之后就变得可应用了——本函数把它们捞出来补放，避免这些变更永久滞留隔离区。
+// 何时调用：schema 升级 / 基线套用之后。前置：必须在 worker 线程且 wconnPtr_ 有效。
+// 线程：worker。副作用：可能应用若干变更并删除对应隔离行。复杂度：O(成熟条目数)。
 void SyncWorker::drainQuarantine() {
     if (!wconnPtr_ || !quarantine_ || !codec_)
         return;
@@ -1800,9 +2003,16 @@ void SyncWorker::drainQuarantine() {
     }
 }
 
+// submitCaptureWriteSync —— 把一批 RowMutation 经「捕获写模板」落库（比对会话保存用）。
 // C-05 fix: routes RowMutations through CapturedWriteTemplate (session capture + changelog seal)
 // instead of directly through UpsertExecutor. This ensures comparison-session saves produce
 // changelog entries that are broadcast to peers, matching the semantics of a normal local write.
+// 【C-05 修复】让这批改动走 CapturedWriteTemplate(session 捕获 + 封存 changelog)，而非直接
+//   走 UpsertExecutor。这样「比对会话的保存」与「普通本地写」语义完全一致——其改动同样
+//   进 changelog 并被广播给 peer，而不是绕过捕获、对端永远收不到。
+// 做什么：投递闭包到 worker 线程并同步等待(最多 60s)；空 mutations 直接成功返回。
+// 参数：mutations 待写的行变更；syncTables 涉及的同步表(供 session attach)；err 错误回填。
+// 返回：是否成功落库。线程：调用方线程投递+阻塞，执行在 worker 线程。
 bool SyncWorker::submitCaptureWriteSync(const QList<RowMutation>& mutations,
                                         const QStringList& syncTables, QString* err) {
     if (!isRunning() || !wconnPtr_) {
@@ -1857,13 +2067,25 @@ bool SyncWorker::submitCaptureWriteSync(const QList<RowMutation>& mutations,
     return result.first;
 }
 
+// startAckWait —— 武装「前台 sync() 正在等 ACK」的计时。
 // I-19: Signal worker that a foreground sync() is waiting for ACK.
+// 【I-19】告诉 worker：有一次前台 sync() 正在等待对端 ACK。
+// 做什么：置 ackWaiting_=true，并把超时绝对时刻设为「现在 + 配置的最大等待时长」。
+// 为什么用 atomic 而非加锁：本函数在「调用方线程」执行，worker 主循环在另一线程读这两个
+//   值；用 std::atomic 即可安全共享，省去一把锁。到点仍无 ACK，主循环发 E_SYNC_ACK_TIMEOUT。
+// 线程：调用方线程。副作用：改两个 atomic 标志。复杂度：O(1)。
 void SyncWorker::startAckWait() {
     ackWaiting_ = true;
     ackDeadlineMs_ = QDateTime::currentMSecsSinceEpoch() + config_.ackMaxDelayMs();
 }
 
+// cancelAckWait —— 撤销「等 ACK」状态（连同清空 ACK 窗口与在途 push 标记）。
 // C-1 fix: cancel a pending ACK wait that was armed before enqueueDrain but no payload was sent.
+// 【C-1 修复】撤销「已武装但实际没发出任何 payload」的 ACK 等待。
+// 为什么需要：sync() 会先 startAckWait 再 enqueueDrain；若这次 drain 其实没写出任何工件
+//   （无新变更可发），就没有对端会来 ACK，前台会永久挂起。此时主动取消，让 sync() 立即
+//   按「已完成、无需等待」收尾。同时清空 pendingPushId_ / pendingAckWindow_，避免残留状态
+//   污染下一次 sync。线程：worker（在 enqueueDrain 闭包内调用）。复杂度：O(1)。
 void SyncWorker::cancelAckWait() {
     ackWaiting_ = false;
     ackDeadlineMs_ = 0;
@@ -1871,7 +2093,17 @@ void SyncWorker::cancelAckWait() {
     pendingAckWindow_.clear();
 }
 
+// enqueueDrain —— 在 worker 线程上排入并执行一次「立即抽干」（扫 inbox + 广播），同步等结果。
 // C-02: Enqueue an immediate drain cycle on the worker thread.
+// 【C-02】在 worker 线程排入一次立即抽干循环。
+// 做什么：把一个闭包压入队列并阻塞等其结果；闭包内 ① scanInbox 先应用任何待处理入站变更，
+//   ② 对每个未驱逐对端直接调 broadcastTopeer(传 ackedEntries)，③ 用收集到的 (peer,origin,
+//   epoch,maxOriginSeq) 构建覆盖「所有被广播 origin」的完整 ACK 窗口 pendingAckWindow_。
+// 为什么前台 sync() 走这里而不走后台 broadcast()：sync() 需要把刚产生的本地变更尽快发出，
+//   并据此知道「要等哪些 ACK 才算完成」——只有直接调 broadcastTopeer 才能拿到 ackedEntries
+//   来构建精确的 ACK 窗口(C-01：必须覆盖转发的远端 origin，而不止本地 origin)。
+// 参数：err 可选错误回填。返回：本次是否真的写出了工件（false → 无可发，sync 可立即完成）。
+// 线程：调用方线程投递 + 阻塞等待，实际执行在 worker 线程。
 bool SyncWorker::enqueueDrain(QString* err) {
     if (!isRunning()) {
         if (err)
@@ -1951,8 +2183,18 @@ bool SyncWorker::enqueueDrain(QString* err) {
     return future.get();
 }
 
+// enqueueSelectionPush —— 在 worker 线程排入一次「选择性推送」（异步，进度经信号上报）。
 // C-01: Enqueue a selection push — SelectionResolver → FkClosureBuilder → ChunkStreamer
 //        → PayloadCodec → OutboxWriter (design §5.5 / §7.3).
+// 【C-01】选择性推送的完整流水：SelectionResolver(解析选中集) → FkClosureBuilder(补全外键
+//   依赖闭包，保证父行随子行一起推) → ChunkStreamer(切片) → PayloadCodec(编码) →
+//   OutboxWriter(写出工件)（对应设计文档 §5.5 / §7.3）。
+// 做什么：把整套流程打包成闭包入队，本方法立即返回(不阻塞)；闭包内开一个短命只读连接做
+//   快照读，逐表按拓扑序构建冻结清单与行数据、切成 chunk 工件发出。进度/错误通过
+//   progressUpdated/errorOccurred 信号异步上报。
+// 为什么用独立只读连接做快照：选择性推送要读「某一致时刻」的数据；用独立 rconn 读、并在
+//   removeDatabase 前确保其完全析构(否则 Qt 报 "connection still in use")。
+// catalog 是调用方线程预拍的快照(跨线程安全)。线程：调用方线程投递，执行在 worker 线程。
 void SyncWorker::enqueueSelectionPush(const SyncSelection& selection,
                                       const detail::SchemaCatalog& catalog) {
     enqueue([this, selection, catalog]() {

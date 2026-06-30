@@ -3,21 +3,62 @@
 #include <QMainWindow>
 #include <QString>
 
+// ============================================================================
+// MainWindow.h — sync-suite 示例程序的「外壳主窗口」声明
+// ============================================================================
+//
+// 【这个文件是什么】
+//   sync-suite 是《数据库同步设计2》的可视化演示程序（一个独立的 Qt GUI 例子，
+//   不是库的一部分）。MainWindow 是它最外层的窗口外壳：它本身几乎不含业务逻辑，
+//   只用一个 QTabWidget 把两个「场景部件」并排塞进两个标签页里，让用户在一个窗口内
+//   切换查看两类同步演示。所有真正的同步交互都在两个 Scenario*Widget 内部实现，
+//   本类只负责「装配 + 摆放」。
+//
+// 【为什么需要它（在示例程序中的位置）】
+//   main() 创建本窗口并 show()，本窗口再创建两个场景部件。把「窗口框架/标题/说明条/
+//   标签布局」与「各场景的具体交互」分离开，使每个场景部件可以独立开发、独立理解，
+//   MainWindow 只承担「把它们组合到一起」这一件事，职责单一、易读。
+//
+// 【两个场景各演示什么】
+//   · 场景1（Scenario1Widget）：多节点「指定库」同步——中心节点 A 与子节点 B/C/D
+//     通过真实 UDP 传输做多节点增量同步，「以指定数据为准」最终全域收敛。界面含
+//     节点拓扑图示、实时日志、以及反映收敛状态的网格。
+//   · 场景2（Scenario2Widget）：类 Beyond Compare 的「子节点 B ⇄ 中心节点 A」差异
+//     比对与「列级」同步 GUI——绿=相同 / 红=不同，双击进入字段级对比，可精确到某一列
+//     采用中心 A 的数据并写回 B 库。
+//
+// 【协作者】
+//   · main.cpp —— 构造本窗口、传入工作目录、show()。
+//   · Scenario1Widget / Scenario2Widget —— 两个场景的具体实现（此处仅前置声明，
+//     真正包含其头文件是在 .cpp，以减少头文件耦合）。
+//
+// 【线程模型】纯 GUI 主线程对象（QWidget 系均只能在 GUI 线程使用）。
+// ============================================================================
+
+// 前置声明：本头文件只持有这两个部件的指针，无需见到它们的完整定义，故仅前置声明
+// 即可（完整定义在 MainWindow.cpp 里 #include）。这能减少头文件间的编译依赖。
 class Scenario1Widget;
 class Scenario2Widget;
 
-// 主窗口：用 QTabWidget 承载两个场景的界面。
-//
-// 标签页1 —— 场景1（多节点指定库同步，含拓扑图示、实时日志、收敛网格）
-// 标签页2 —— 场景2（类 Beyond Compare 差异比对与列级同步 GUI）
+// ── MainWindow —— 承载两场景标签页的主窗口 ───────────────────────────────────
+// 【做什么】构造时搭好「顶部富文本说明条 + 下方双标签 QTabWidget」的整体布局，
+//   并实例化两个场景部件分别放进两个标签页。构造完即一个可直接 show 的完整窗口。
+// 【为什么独立成类】把「程序外壳」与「场景交互」解耦——见文件头说明。
+// 标签页1 —— 场景1（多节点指定库同步，含拓扑图示、实时日志、收敛网格）。
+// 标签页2 —— 场景2（类 Beyond Compare 差异比对与列级同步 GUI）。
 class MainWindow : public QMainWindow {
-    Q_OBJECT
-   public:
-    // ws：本程序的工作目录；两个场景分别在 ws/scenario1、ws/scenario2 下落地数据。
-    explicit MainWindow(const QString& ws, QWidget* parent = nullptr);
+    Q_OBJECT  // 启用 Qt 元对象系统（信号槽/属性等）；本类目前无自定义信号槽，但作为
+              // QObject 子类仍需此宏。
+        public :
+        // 构造：搭建窗口并装入两个场景部件。
+        // 【参数】ws —— 本程序的工作目录；两个场景分别在 ws/scenario1、ws/scenario2 子目录下
+        //   落地各自的数据库与同步工件，互不干扰。
+        //   parent —— Qt 父对象（顶层窗口通常为 nullptr，由 Qt 接管所有权与生命周期）。
+        // 【副作用】new 出若干子部件（由 Qt 父子机制自动释放，无需手动 delete）。
+        explicit MainWindow(const QString& ws, QWidget* parent = nullptr);
 
    private:
-    QString ws_;
-    Scenario1Widget* scenario1_ = nullptr;
-    Scenario2Widget* scenario2_ = nullptr;
+    QString ws_;                            // 工作目录根；派生出各场景的子目录
+    Scenario1Widget* scenario1_ = nullptr;  // 场景1 部件（生命周期由 Qt 父子机制管理）
+    Scenario2Widget* scenario2_ = nullptr;  // 场景2 部件（同上）
 };

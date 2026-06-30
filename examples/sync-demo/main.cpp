@@ -77,8 +77,13 @@ static constexpr quint16 PORT_EDGE_C = 15003;
 static constexpr quint16 PORT_EDGE_D = 15004;
 
 // ── 工具宏 / 函数 ─────────────────────────────────────────────────────────────
+// LOG 宏：统一的「[节点名] 消息」行打印。把节点名前缀化，便于在四节点交织的输出里辨认来源。
 #define LOG(node, msg) std::cout << "[" << (node) << "] " << (msg) << std::endl
 
+// printSyncResult —— 打印一次 sync()/syncSelected() 的结果摘要（SyncResult）。
+//   tag：人类可读的阶段标签（如 "center Phase 1"）；r：引擎返回的结果快照。
+//   打印 ok / 发送负载数 / 已应用负载数 / 已应用变更行数 / 冲突数，以及逐条错误。
+//   纯输出函数，无副作用（不触库、不改引擎状态）。
 static void printSyncResult(const std::string& tag, const dbridge::sync::SyncResult& r) {
     std::cout << "\n  ── " << tag << " SyncResult ──\n"
               << "     ok=" << (r.ok ? "true" : "false") << "  payloadsSent=" << r.payloadsSent
@@ -89,6 +94,9 @@ static void printSyncResult(const std::string& tag, const dbridge::sync::SyncRes
                   << "\n";
 }
 
+// printLogs —— 打印某节点累积的同步日志（SyncLogEntry 列表）。
+//   把 Severity 枚举翻成定宽 4 字符标签（INFO/WARN/ERR /FATL）便于对齐扫读，再带上
+//   阶段(phase)与消息。用于在每个 Phase 末尾观察各节点内部都经历了哪些步骤。纯输出。
 static void printLogs(const std::string& node, const QList<dbridge::sync::SyncLogEntry>& logs) {
     for (const auto& e : logs) {
         const char* sev = e.severity == dbridge::sync::Severity::Warning ? "WARN"
@@ -100,9 +108,15 @@ static void printLogs(const std::string& node, const QList<dbridge::sync::SyncLo
     }
 }
 
-// 建库建表（4 节点共用同一 schema；仅建表，不插行）
+// setupDatabase —— 为某个节点建库建表（仅业务 schema，不含 __sync_* 元数据表）。
+//   做什么：打开（或创建）dbPath，建两张演示业务表 employees / assignments（IF NOT EXISTS）。
+//   为什么不插行：四端都从「空白业务数据」出发，模拟全新节点冷接入；基线数据稍后由 center
+//     通过 ISyncEngine::write() 写入并经同步铺给各 edge（见 Phase 1）。
+//   为什么 __sync_* 表不在这里建：那些是同步元数据，由 ISyncEngine::initialize() 内部建立。
+//   连接管理：用一个「一次性」具名连接（conn）打开→建表→close，函数末尾 removeDatabase 释放，
+//     避免与后续真正的同步连接撞名或占用句柄。返回 false 表示打开失败。
 static bool setupDatabase(const QString& dbPath) {
-    const QString conn = QStringLiteral("setup_") + dbPath;
+    const QString conn = QStringLiteral("setup_") + dbPath;  // 以路径派生唯一连接名
     {
         auto db = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), conn);
         db.setDatabaseName(dbPath);
@@ -129,7 +143,10 @@ static bool setupDatabase(const QString& dbPath) {
     return true;
 }
 
-// 查询并打印一张表
+// dumpTable —— SELECT * 并以 | 分隔的文本表格打印某库某表的全部行（用于验证同步收敛）。
+//   连接名里掺入「表名 + 当前毫秒」以保证每次调用唯一——同一进程内会对四端反复 dump 多次，
+//   若连接名重复会触发 Qt 的 "duplicate connection" 告警/复用，故用时间戳令其互不相同。
+//   纯只读输出；不校验 open 成败（demo 容错，库此时必然已存在）。
 static void dumpTable(const QString& dbPath, const QString& table, const std::string& label) {
     const QString conn = QStringLiteral("dump_") + dbPath + table +
                          QString::number(QDateTime::currentMSecsSinceEpoch());
@@ -151,7 +168,8 @@ static void dumpTable(const QString& dbPath, const QString& table, const std::st
     QSqlDatabase::removeDatabase(conn);
 }
 
-// 打印四节点同一张表
+// dump4 —— 一次性打印「同一张表在四个节点」的内容，便于直观比对四端是否已收敛一致。
+//   每个 Phase 末尾调用，肉眼即可确认同步效果（四份输出应完全相同）。
 static void dump4(const QString& cDb, const QString& bDb, const QString& cCDb, const QString& dDb,
                   const QString& table) {
     dumpTable(cDb, table, "center");
@@ -160,7 +178,14 @@ static void dump4(const QString& cDb, const QString& bDb, const QString& cCDb, c
     dumpTable(dDb, table, "edge_d");
 }
 
-// 轮询引擎状态直到终止或超时
+// waitForEngine —— 轮询引擎状态，直到到达「终态」或超时。
+//   背景：sync()/syncSelected() 是异步的——前台发起广播后，引擎要等对端 ACK 收齐才切
+//     Completed（或超时/出错切 Failed）。demo 是控制台程序、没有事件循环驱动等待，故用
+//     「睡 100ms 再查」的轮询逼近完成。
+//   终态判定：Completed（成功收尾）/ Idle（无事可做即结束）/ Failed（失败）三者之一即返回；
+//     返回值 = 「不是 Failed」，即 Completed/Idle → true，Failed → false。
+//   超时：默认 12s。超时返回 false 并打印诊断（对端可能丢包或卡住）。
+//   参数：engine 待观察引擎；name 诊断用标签；timeoutMs 上限毫秒。
 static bool waitForEngine(dbridge::sync::ISyncEngine* engine, const char* name,
                           int timeoutMs = 12000) {
     const qint64 deadline = QDateTime::currentMSecsSinceEpoch() + timeoutMs;
@@ -168,14 +193,18 @@ static bool waitForEngine(dbridge::sync::ISyncEngine* engine, const char* name,
         auto st = engine->state();
         if (st == dbridge::sync::SyncState::Completed || st == dbridge::sync::SyncState::Idle ||
             st == dbridge::sync::SyncState::Failed)
-            return st != dbridge::sync::SyncState::Failed;
-        QThread::msleep(100);
+            return st != dbridge::sync::SyncState::Failed;  // 仅 Failed 视为失败
+        QThread::msleep(100);                               // 让出 CPU，避免忙等空转
     }
     std::cerr << "waitForEngine timeout: " << name << "\n";
     return false;
 }
 
-// RowMutation 辅助（employees 表）
+// empMut —— 便捷工厂：构造一条 employees 表的 RowMutation（行变更）。
+//   RowMutation 是 ISyncEngine::write() 的入参单元：描述「对哪张表、哪些列、什么值、按
+//   哪个主键、用什么 UPSERT 模式」做一次行写入。本函数把四个字段填成一条「整行 upsert」。
+//   mode=DoUpdate：主键已存在则更新（典型 UPSERT），用于演示「改已有行」（如改薪资）。
+//   pkColumns={"id"}：单列主键；同步要求单主键（复合主键不支持）。
 static dbridge::sync::RowMutation empMut(int id, const QString& name, const QString& dept,
                                          int salary) {
     dbridge::sync::RowMutation m;
@@ -188,7 +217,9 @@ static dbridge::sync::RowMutation empMut(int id, const QString& name, const QStr
     return m;
 }
 
-// RowMutation 辅助（assignments 表）
+// asnMut —— 便捷工厂：构造一条 assignments 表的 RowMutation。
+//   与 empMut 同理；assignments.employee_id 是指向 employees(id) 的外键，故选择性推送时
+//   会触发 FK 闭包补全（见 Phase 4：推 assignments.id=4 会自动带上 employees.id=4）。
 static dbridge::sync::RowMutation asnMut(int id, int empId, const QString& project,
                                          const QString& role) {
     dbridge::sync::RowMutation m;
@@ -201,7 +232,18 @@ static dbridge::sync::RowMutation asnMut(int id, int empId, const QString& proje
     return m;
 }
 
-// 构建节点 SyncConfig（所有节点共享同一套 rank 表）
+// buildConfig —— 用 Builder 模式装配一个节点的 SyncConfig（同步配置）。
+//   做什么：填 nodeId/role/库路径/三类工作目录(outbox/inbox/quarantine)/冲突策略/全局 rank 表/
+//     广播节奏/ACK 超时，可选地填中心节点 id 与对端列表，最后 build() 出配置。
+//   关键设计点：
+//     · 所有节点共享同一套 originPriority（rank 表）——冲突仲裁是「按 origin 的 rank 高者胜」，
+//       各端必须对同一 origin 给出相同 rank，否则不同节点会算出不同胜者、无法收敛。
+//     · 目录按 ws/<nodeId>/{outbox,inbox,quarantine} 分隔，使四端在同一工作目录下互不串台；
+//       传输层（UdpFileTransport）正是在这些目录间搬运工件文件。
+//     · conflictPolicy=SourceWins 配合 rank：来源 rank 高者覆盖（见 Phase 5 演示）。
+//     · broadcastIntervalMs(300)：后台自动广播周期；ackMaxDelayMs(10000)：等 ACK 的上限。
+//   参数：centerNodeId 为空表示「本节点就是中心 / 无中心」；peers 是要登记的对端 id 列表。
+//   返回：构造好的 SyncConfig；失败时 *err 被填（调用方随后用 isValid() 校验）。
 static dbridge::sync::SyncConfig buildConfig(const QString& nodeId, dbridge::sync::NodeRole role,
                                              const QString& centerNodeId, const QStringList& peers,
                                              const QString& dbPath, const QString& ws,
@@ -232,11 +274,17 @@ static dbridge::sync::SyncConfig buildConfig(const QString& nodeId, dbridge::syn
 
 // ──────────────────────────────────────────────────────────────────────────────
 
+// main —— 演示主流程：建库→开 DataBridge→配 SyncConfig→起引擎→起 UDP 传输→跑 5 个 Phase→清理。
+//   整体是一段「线性脚本」：每个 Phase 写数据 + sync() + waitForEngine() + dump 验证，逐步演示
+//   下行初始同步、上行增量+转发、下行广播、选择性推送+转发、冲突解决五类典型路径。
 int main(int argc, char* argv[]) {
     QCoreApplication app(argc, argv);
 
     // Qt 5.12：将 applicationDirPath() 提到 libraryPaths 首位，让 session-enabled
     // QSQLITE 插件（sqldrivers/libqsqlite.so）优先于系统预编译版本加载。
+    // 为何必须：本项目需要「带 session 扩展」的 SQLite 驱动来捕获行级 changeset；系统自带的
+    //   预编译 QSQLITE 没有该扩展。把程序自身目录置于插件搜索路径首位，确保加载到随程序部署的
+    //   定制驱动（见 MEMORY：setLibraryPaths vs addLibraryPath 的加载陷阱）。
     {
         QStringList paths;
         paths.append(app.applicationDirPath());

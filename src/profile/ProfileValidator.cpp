@@ -605,8 +605,15 @@ bool ProfileValidator::validate(const ProfileSpec& profile, const SchemaCatalog&
     }
 
     // add-export-column-order: validate columnOrder field.
+    // 【译】── 导出列顺序 columnOrder 校验（特性 add-export-column-order）──
+    //   columnOrder 指定导出 Excel 的列排列。这里校验三件事：①与原生 SQL 互斥；
+    //   ②每个列名都是「已知表头」；③不得重复。其中「已知表头集合」需考虑 lookup 的
+    //   反向查找会改变最终输出列（A 表头出现、H 列消失），故下面构造 knownHeaders 时
+    //   按 exportRoundtrip 做了增删，见各注释。
     if (!profile.exportSpec.columnOrder.isEmpty()) {
         // 3.4: mutually exclusive with explicitSql
+        // 【译】§3.4 columnOrder 与原生 SQL（explicitSql）互斥：用了原生 SQL 时，列顺序由
+        //   SQL 自己决定，不能再用 columnOrder 干预。
         if (!profile.exportSpec.explicitSql.isEmpty()) {
             errors->addTable(
                 profile.sheet, QString::fromLatin1(err::E_EXPORT_ORDER_WITH_RAW_SQL),
@@ -619,23 +626,31 @@ bool ProfileValidator::validate(const ProfileSpec& profile, const SchemaCatalog&
         // add-export-reverse-lookup 3.2: A headers (match[].Excel_header for roundtrip=true
         // lookups) are added; H dbColumn names for roundtrip=true are removed from accepted set;
         // H dbColumn names for roundtrip=false are added (they appear in Excel output as-is).
+        // 【译】§3.1 构建「已知表头集合」knownHeaders：先纳入所有路由 columns 的 source。
+        //   再按反向查找（reverse-lookup）规则调整，使集合反映「替换后真正出现在 Excel 的列」：
+        //     · roundtrip=true（要反查回业务键 A）：A 表头(match.second)出现 → 加入；
+        //       对应的 H 列(select.second，库里的代理列)不再直接出现 → 移除；
+        //     · roundtrip=false（不反查，H 列原样输出）：H 列(select.second)出现 → 加入。
         QSet<QString> knownHeaders;
         auto collectSources = [&](const QVector<RouteSpec>& routes) {
             for (const auto& route : routes) {
                 for (const auto& col : route.columns)
-                    knownHeaders.insert(col.source);
+                    knownHeaders.insert(col.source);  // 基础：每列的 Excel 表头来源
                 // Add/remove lookup-related headers to reflect post-substitution output set
+                // 【译】按 lookup 增删表头，反映「替换后」的实际输出列集合。
                 for (const auto& lk : route.lookups) {
                     if (lk.exportRoundtrip) {
                         // A headers appear in output; H dbColumns do not
+                        // 【译】反查启用：A 表头出现于输出、H 代理列不出现。
                         for (const auto& mp : lk.match)
-                            knownHeaders.insert(mp.second);  // A = match[].Excel_header
+                            knownHeaders.insert(mp.second);  // A = match[].Excel_header（加）
                         for (const auto& sp : lk.select)
-                            knownHeaders.remove(sp.second);  // H = select[].dbColumn
+                            knownHeaders.remove(sp.second);  // H = select[].dbColumn（删）
                     } else {
                         // H dbColumns appear in output verbatim
+                        // 【译】不反查：H 代理列原样出现于输出。
                         for (const auto& sp : lk.select)
-                            knownHeaders.insert(sp.second);  // H = select[].dbColumn
+                            knownHeaders.insert(sp.second);  // H = select[].dbColumn（加）
                     }
                 }
             }
@@ -644,6 +659,8 @@ bool ProfileValidator::validate(const ProfileSpec& profile, const SchemaCatalog&
             for (const auto& cls : profile.classes)
                 collectSources(cls.routes);
             // classColumn is a synthetic header — valid in columnOrder for Mixed mode
+            // 【译】混合模式下 classColumn 是「合成表头」（承载类别 id），在 columnOrder 里合法 →
+            // 纳入。
             if (!profile.exportSpec.classColumn.isEmpty())
                 knownHeaders.insert(profile.exportSpec.classColumn);
         } else {
@@ -651,6 +668,7 @@ bool ProfileValidator::validate(const ProfileSpec& profile, const SchemaCatalog&
         }
 
         // Hint: first up-to-5 known headers for error messages
+        // 【译】错误信息辅助：取已知表头的前 5 个拼成提示串，帮用户快速对照「应该写哪些列名」。
         auto knownHint = [&]() -> QString {
             QStringList sample = knownHeaders.values().mid(0, 5);
             return QStringLiteral(" (known headers: ") + sample.join(QStringLiteral(", ")) +
@@ -658,6 +676,7 @@ bool ProfileValidator::validate(const ProfileSpec& profile, const SchemaCatalog&
         };
 
         // 3.2 + 3.3: unknown header and duplicate checks
+        // 【译】§3.2+§3.3 逐项检查 columnOrder：先查重复（seen 集合），再查是否为已知表头。
         QSet<QString> seen;
         for (const QString& h : profile.exportSpec.columnOrder) {
             if (seen.contains(h)) {

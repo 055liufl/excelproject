@@ -101,12 +101,17 @@ void UpsertExecutor::clearPreparedCache() {
 // private
 // ---------------------------------------------------------------------------
 
+// buildUpsertSql —— 按 (表名, 列集, 主键集, 模式) 拼出一条参数化 UPSERT SQL（只拼串、不执行）。
+// 标识符全部经 quoteIdent 转义；占位符用 ?，由调用方按 cols 顺序 addBindValue 绑值。
 QString UpsertExecutor::buildUpsertSql(const QString& table, const QStringList& cols,
                                        const QStringList& pkCols, UpsertMode mode) {
     // M-05 fix: use SqlBuilder::quoteIdent so embedded double-quotes are properly escaped.
+    // 【M-05 修复】统一用 SqlBuilder::quoteIdent 给标识符加引号——它会把列名/表名里内嵌的
+    //   双引号正确转义成两个双引号，既防 SQL 注入，又兼容含特殊字符的列名。
     auto quote = [](const QString& s) { return detail::SqlBuilder::quoteIdent(s); };
 
     // Build column list: "c1","c2",...
+    // 拼带引号的列名清单："c1","c2",...（用于 INSERT 的 (列...) 部分）。
     QStringList quotedCols;
     quotedCols.reserve(cols.size());
     for (const QString& c : cols)
@@ -114,6 +119,7 @@ QString UpsertExecutor::buildUpsertSql(const QString& table, const QStringList& 
     const QString colList = quotedCols.join(QStringLiteral(", "));
 
     // Build placeholder list: ?,?,...
+    // 拼等长的占位符清单：?,?,...（与列一一对应，绑值时顺序匹配）。
     QStringList placeholders;
     placeholders.reserve(cols.size());
     for (int i = 0; i < cols.size(); ++i)
@@ -121,17 +127,21 @@ QString UpsertExecutor::buildUpsertSql(const QString& table, const QStringList& 
     const QString phList = placeholders.join(QStringLiteral(", "));
 
     if (mode == UpsertMode::DoNothing) {
+        // DoNothing：撞冲突键则什么都不做（保留本地旧值）→ INSERT OR IGNORE。
         return QStringLiteral("INSERT OR IGNORE INTO %1 (%2) VALUES (%3)")
             .arg(quote(table), colList, phList);
     }
 
     // DoUpdate: build conflict target and SET clauses (non-pk columns only).
+    // DoUpdate：撞冲突键则用新值覆盖。先拼「冲突目标」(主键列清单) 与 SET 子句(仅非主键列)。
     QStringList quotedPk;
     quotedPk.reserve(pkCols.size());
     for (const QString& pk : pkCols)
         quotedPk << quote(pk);
     const QString pkConflict = quotedPk.join(QStringLiteral(", "));
 
+    // SET 子句：每个非主键列写成 "col=excluded.col"，excluded 即本次试图插入的新值。
+    // 主键列不在 SET 里——它们是冲突判定依据，不应被改写。
     QStringList setClauses;
     for (const QString& c : cols) {
         if (!pkCols.contains(c))
@@ -140,10 +150,13 @@ QString UpsertExecutor::buildUpsertSql(const QString& table, const QStringList& 
 
     if (setClauses.isEmpty()) {
         // All columns are PK columns — fall back to DO NOTHING.
+        // 所有列都是主键列（没有可 UPDATE 的非主键列）→ DO UPDATE 的 SET 会是空的、无意义，
+        //   退化为 INSERT OR IGNORE（等价 DoNothing），避免拼出非法 SQL。
         return QStringLiteral("INSERT OR IGNORE INTO %1 (%2) VALUES (%3)")
             .arg(quote(table), colList, phList);
     }
 
+    // 正常 UPSERT：撞主键则原地更新非主键列。%4=冲突目标(主键列)，%5=SET 子句。
     return QStringLiteral(
                "INSERT INTO %1 (%2) VALUES (%3) "
                "ON CONFLICT (%4) DO UPDATE SET %5")

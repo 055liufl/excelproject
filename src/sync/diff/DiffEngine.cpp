@@ -177,76 +177,107 @@ QList<RowDiff> DiffEngine::rowDiffs(QSqlDatabase& rconn, const QString& table,
     return result;
 }
 
+// ── fetchLocalRows —— 从本地表读取一页行（每行一个 列名→值 的 QVariantMap）─────
+//   做什么：构造 `SELECT * FROM 表 [ORDER BY 主键] [LIMIT :lim OFFSET :off]` 取出该页行。
+//   为什么必须 ORDER BY 主键（H-01 fix）：基于 OFFSET 的分页要稳定，必须有确定的行序；
+//     否则 SQLite 返回行的顺序未定义，不同 offset 取到的页可能彼此重叠或漏掉某些行。
+//   参数：offset/limit 分页窗口；limit<0 表示「不分页、取到末尾」（此时不加 LIMIT 子句）。
+//   返回：该页行；任一步失败（无主键也照常取、SQL 失败）则返回已积累的（可能为空）行。
+//   复杂度：O(返回行数 × 列数)。线程：随持有 rconn 的调用线程。
 QList<QVariantMap> DiffEngine::fetchLocalRows(QSqlDatabase& rconn, const QString& table, int offset,
                                               int limit) {
     QList<QVariantMap> rows;
     // H-01 fix: always ORDER BY pk so offset-based paging is stable across INSERT/DELETE.
     // Without ORDER BY, rows arrive in undefined order and different offsets can overlap or skip.
-    const QString pkCol = getPkColumn(rconn, table);
+    // H-01 修复：始终按主键 ORDER BY，使基于 OFFSET 的分页在 INSERT/DELETE 后仍稳定；
+    //   若不排序，行序未定义，不同 offset 取到的页可能重叠或跳过（详见函数头）。
+    const QString pkCol = getPkColumn(rconn, table);  // 取主键列名（带缓存）；无主键则为空
     // M-08 fix: use double-quote quoting via the same pattern as getPkColumn's PRAGMA.
+    // M-08 修复：表名用双引号包裹并把内嵌的 " 转义成 ""（与 getPkColumn 里 PRAGMA 同一手法），
+    //   防止表名含特殊字符时破坏 SQL / 被注入。
     const QString quotedTable = QStringLiteral("\"") +
                                 QString(table).replace(QLatin1Char('"'), QLatin1String("\"\"")) +
                                 QStringLiteral("\"");
     QString sql = QStringLiteral("SELECT * FROM %1").arg(quotedTable);
     if (!pkCol.isEmpty()) {
+        // 有主键才追加 ORDER BY（主键列名同样做双引号转义）。无主键时不排序——分页可能不稳，
+        // 但这是「表设计缺主键」的退化情形，调用方一般不会对这类表做行级 diff。
         const QString quotedPk = QStringLiteral("\"") +
                                  QString(pkCol).replace(QLatin1Char('"'), QLatin1String("\"\"")) +
                                  QStringLiteral("\"");
         sql += QStringLiteral(" ORDER BY %1").arg(quotedPk);
     }
     if (limit >= 0)
-        sql += " LIMIT :lim OFFSET :off";
+        sql += " LIMIT :lim OFFSET :off";  // limit<0 → 不分页，整表取出
 
     QSqlQuery q(rconn);
     q.prepare(sql);
     if (limit >= 0) {
+        // 命名占位符绑定分页参数（参数化，避免把数字直接拼进 SQL）。
         q.bindValue(":lim", limit);
         q.bindValue(":off", offset);
     }
 
     if (!q.exec())
-        return rows;
+        return rows;  // SQL 失败：返回空表（diff 上层会按「本地无此页行」处理）
 
+    // 把结果集逐行转成「列名 → 值」的 map：用 record() 拿列名，按列下标取值。
     QSqlRecord rec = q.record();
     int colCount = rec.count();
     while (q.next()) {
         QVariantMap row;
         for (int i = 0; i < colCount; ++i)
-            row.insert(rec.fieldName(i), q.value(i));
+            row.insert(rec.fieldName(i), q.value(i));  // 以列名为键，便于按列名比对
         rows.append(row);
     }
     return rows;
 }
 
+// ── getPkColumn —— 取某表的主键列名（带 pkColCache_ 缓存）────────────────────
+//   做什么：先查缓存；未命中则 PRAGMA table_info(表) 扫各列，取「pk 序号最小且 >0」的列名。
+//   为什么取 pk 最小者：PRAGMA 的 pk 列对单列主键为 1；对复合主键各列为 1,2,3…。本引擎
+//     的行级比对以「单列主键字符串」作行身份，故复合主键时退而取 pk=1 那一列当代表
+//     （复合主键的完整支持不在此处；同步表的资格校验已限制为单列主键，见 SchemaEligibility）。
+//   返回：主键列名；无主键 / PRAGMA 失败返回空字符串（调用方据空串走「无主键」降级路径）。
+//   缓存：结果（含空串）写入 pkColCache_，同一会话内同表只查一次 PRAGMA。
 QString DiffEngine::getPkColumn(QSqlDatabase& rconn, const QString& table) {
     if (pkColCache_.contains(table))
-        return pkColCache_.value(table);
+        return pkColCache_.value(table);  // 命中缓存（空串也算有效缓存结果）
 
     QSqlQuery q(rconn);
     // H-4 fix: use quoteIdent for table name in PRAGMA.
+    // H-4 修复：PRAGMA 的表名用 quoteIdent 转义（防特殊字符/注入）。
     q.prepare(QStringLiteral("PRAGMA table_info(") + detail::SqlBuilder::quoteIdent(table) +
               QLatin1Char(')'));
     if (!q.exec())
-        return {};
+        return {};  // PRAGMA 失败：返回空串，但「不」写缓存（下次仍重试）
 
     QString pkCol;
-    int bestPk = INT_MAX;
+    int bestPk = INT_MAX;  // 记录当前见过的最小 pk 序号
     while (q.next()) {
-        int pk = q.value("pk").toInt();
-        if (pk > 0 && pk < bestPk) {
+        int pk = q.value("pk").toInt();  // 该列的主键序号：0=非主键，>0=主键中的第几列
+        if (pk > 0 && pk < bestPk) {  // 取 pk 最小（即复合主键的第一列 / 单列主键本身）
             bestPk = pk;
             pkCol = q.value("name").toString();
         }
     }
 
-    pkColCache_.insert(table, pkCol);
+    pkColCache_.insert(table, pkCol);  // 写缓存（含「无主键」的空串结果，避免重复查 PRAGMA）
     return pkCol;
 }
 
+// ── compareRows —— 逐列比较两行，产出 CellDiff 列表 ─────────────────────────
+//   做什么：取两行列名的并集，对每一列填 (列名, 本地值, 对端值, 是否不同) 一条 CellDiff。
+//   为什么取「并集」：两侧可能列不完全一致（如对端多/少一列）；取并集才不漏列。某侧缺该列
+//     时 value(col) 返回默认（无效）QVariant，与另一侧比较自然判为 changed。
+//   用途：被 rowDiffs() 调用——Added 传 (空, 对端行)、Deleted 传 (本地行, 空)、
+//     Modified/Same 传 (本地行, 对端行)；故本函数对「单边为空」的情形天然成立。
+//   返回：逐列差异列表（顺序为 QSet 遍历序，无业务含义）。复杂度：O(列数)。
 QList<CellDiff> DiffEngine::compareRows(const QVariantMap& local, const QVariantMap& remote) {
     QList<CellDiff> cells;
 
     // Union of all column names.
+    // 取两行所有列名的并集（保证任一侧独有的列也被纳入比较，不漏列）。
     QSet<QString> allCols;
     for (auto it = local.constBegin(); it != local.constEnd(); ++it)
         allCols.insert(it.key());
@@ -256,8 +287,9 @@ QList<CellDiff> DiffEngine::compareRows(const QVariantMap& local, const QVariant
     for (const QString& col : allCols) {
         CellDiff cd;
         cd.column = col;
-        cd.localValue = local.value(col);
-        cd.remoteValue = remote.value(col);
+        cd.localValue = local.value(col);    // 缺该列 → 无效 QVariant
+        cd.remoteValue = remote.value(col);  // 缺该列 → 无效 QVariant
+        // QVariant 的 != 同时比较类型与值；两侧不等（含一侧缺列）即判为 changed。
         cd.changed = (cd.localValue != cd.remoteValue);
         cells.append(cd);
     }

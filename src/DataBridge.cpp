@@ -530,9 +530,16 @@ bool DataBridge::snapshotCatalog(detail::SchemaCatalog* catalog, QString* err) {
     return true;
 }
 
+// exportExcel —— 【同步阻塞】按已载入 Profile 把数据库导出成一张 .xlsx。
+//   是 importExcel 的「反方向」公共门面。前置门禁顺序：① 库已打开 ② Profile 已载入
+//   ③ 刷新 catalog ④ 导出模式校验（H-03，提前暴露 columnOrder/rawSql/表列存在性错误），
+//   全部通过后把真正的搬运转交 d_->exportSvc_.run（ExportService），在门面自有连接 d_->db_ 上执行。
+//   返回 ExportResult（导出行数 + 逐行错误/警告）；任一门禁失败则把错误塞进 result.errors 返回。
+//   注意：导出方向无「同步直写门控」——读库不改库，不会绕过 session 捕获，故不像 importExcel 那样判
+//   syncActive_。
 ExportResult DataBridge::exportExcel(const QString& xlsxPath, const ExportOptions& options) {
     ExportResult result;
-    if (!d_->dbOpen_) {
+    if (!d_->dbOpen_) {  // ① 库未打开
         RowError e;
         e.code = QString::fromLatin1(err::E_OPEN_DB);
         e.message = QStringLiteral("Database not open");
@@ -541,7 +548,7 @@ ExportResult DataBridge::exportExcel(const QString& xlsxPath, const ExportOption
     }
 
     auto it = d_->profiles_.find(options.profileName);
-    if (it == d_->profiles_.end()) {
+    if (it == d_->profiles_.end()) {  // ② 指定的 Profile 未载入
         RowError e;
         e.code = QString::fromLatin1(err::E_PROFILE_PARSE);
         e.message = QStringLiteral("Profile not loaded: ") + options.profileName;
@@ -550,6 +557,7 @@ ExportResult DataBridge::exportExcel(const QString& xlsxPath, const ExportOption
     }
 
     // Refresh catalog before export
+    // 【译】③ 导出前刷新 catalog：保证 ExportService 对着「当前真实结构」做列映射/校验/取数。
     QString schErr;
     if (!d_->refreshCatalog(&schErr)) {
         RowError e;
@@ -561,6 +569,9 @@ ExportResult DataBridge::exportExcel(const QString& xlsxPath, const ExportOption
 
     // H-03 fix: run export-mode profile validation before export so columnOrder, rawSql,
     // and table/column existence errors surface early.
+    // 【译】H-03 修复：④ 导出前先跑「导出模式」Profile 校验，让 columnOrder、rawSql、以及
+    // 表/列是否存在等错误「提前暴露」（而非搬运到一半才失败）。校验不通过则直接返回一个
+    // 只含校验错误的 ExportResult（注意这里特意新建 valResult，使返回的错误集干净、只含校验项）。
     {
         detail::ErrorCollector valErrors;
         detail::ProfileValidator validator;
@@ -571,6 +582,7 @@ ExportResult DataBridge::exportExcel(const QString& xlsxPath, const ExportOption
         }
     }
 
+    // 全部门禁通过：把活转交 ExportService，在门面自有连接 d_->db_ 上执行 DB→Excel 搬运。
     return d_->exportSvc_.run(it.value(), d_->catalog_, xlsxPath, options, d_->db_);
 }
 

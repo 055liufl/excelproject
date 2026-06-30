@@ -14,16 +14,22 @@ using namespace dbridge;
 using namespace dbridge::sync;
 
 // ── 分隔符（行键/单元键编码用，普通数据不会包含 \x01 / \x02）──────────────────
+// 为什么选控制字符 0x01/0x02 作分隔：表名/主键/列名等业务字符串几乎不可能含这类不可见控制符，
+// 用它们拼成「行键 / 单元键」可避免与真实数据撞车，从而安全地作 QSet 的去重键。
 static const QChar kSep1 = QChar(0x01);
 static const QChar kSep2 = QChar(0x02);
 
+// rowKey —— 把 (表, 主键) 编码为一个唯一字符串，作为 stagedRows_ 这个 QSet 的成员键。
 QString Scenario2Model::rowKey(const QString& table, const QString& pk) {
     return table + kSep1 + pk;
 }
+// cellKey —— 把 (表, 主键, 列) 编码为单元格级唯一键，作为 stagedCells_ 的成员键。
 QString Scenario2Model::cellKey(const QString& table, const QString& pk, const QString& column) {
     return table + kSep1 + pk + kSep2 + column;
 }
 
+// 构造：只记录 workspace 路径、推导出 A/B 两库文件路径、固定参与比对的 4 张表名；
+// 不打开任何库、不建会话（重活留给 setup()，构造保持零成本不可失败）。
 Scenario2Model::Scenario2Model(const QString& ws)
     : ws_(ws),
       centerDb_(ws + QStringLiteral("/center_A.db")),
@@ -41,7 +47,14 @@ Scenario2Model::~Scenario2Model() {
 }
 
 // ── 公共连接工具：建库/读表/读列/读主键 ──────────────────────────────────────
+// 共性：这几个 static 工具都「用一次性的唯一连接打开任意库 → 查 → 关 → removeDatabase」，
+// 不依赖本对象状态，故可对 A 库或 B 库随意调用。每个都把 QSqlDatabase 句柄放在内层作用域里，
+// 确保它先析构、再 removeDatabase（Qt 要求移除连接前不得有活动副本，否则告警且移除不彻底）。
 
+// readRows —— 读取任意库某表的全部行，每行以「列名→值」的 QVariantMap 表示。
+// 做什么：按主键 ORDER BY 取全表（主键存在时），逐行把每列塞进 QVariantMap。
+// 为什么按主键排序：两栏对比视图要让 A、B 两侧行序稳定可对齐，否则左右行对不上。
+// 参数：dbPath 库文件；table 表名。返回：行列表（库打不开/查询失败则返回空列表，调用方容错）。
 QList<QVariantMap> Scenario2Model::readRows(const QString& dbPath, const QString& table) {
     QList<QVariantMap> rows;
     const QString conn =
@@ -71,6 +84,8 @@ QList<QVariantMap> Scenario2Model::readRows(const QString& dbPath, const QString
     return rows;
 }
 
+// readColumns —— 读任意库某表的列顺序（用 PRAGMA table_info，按建表时的列序返回）。
+// 用途：双栏视图按这个列序逐列展示；A、B 两库 schema 同构，故取任一即可（这里用 B）。
 QStringList Scenario2Model::readColumns(const QString& dbPath, const QString& table) {
     QStringList cols;
     const QString conn =
@@ -91,6 +106,8 @@ QStringList Scenario2Model::readColumns(const QString& dbPath, const QString& ta
     return cols;
 }
 
+// readPkColumn —— 读任意库某表的主键列名（PRAGMA table_info 里 pk>0 的第一列）。
+// 说明：本演示各表都是单列整型主键，故取第一个 pk>0 的列即可；找不到则返回空串。
 QString Scenario2Model::readPkColumn(const QString& dbPath, const QString& table) {
     QString pk;
     const QString conn =
@@ -115,6 +132,7 @@ QString Scenario2Model::readPkColumn(const QString& dbPath, const QString& table
     return pk;
 }
 
+// 下面四个是给 GUI 用的便捷包装：固定到 B 库（列序/主键，A 与之同构）或分别指向 A/B 库读行。
 QStringList Scenario2Model::columns(const QString& table) const {
     return readColumns(childDb_, table);
 }
@@ -122,10 +140,10 @@ QString Scenario2Model::pkColumn(const QString& table) const {
     return readPkColumn(childDb_, table);
 }
 QList<QVariantMap> Scenario2Model::centerRows(const QString& table) const {
-    return readRows(centerDb_, table);
+    return readRows(centerDb_, table);  // 中心A（远端，右栏）
 }
 QList<QVariantMap> Scenario2Model::childRows(const QString& table) const {
-    return readRows(childDb_, table);
+    return readRows(childDb_, table);  // 子节点B（本地，左栏）
 }
 
 // ── seed：建表 + 灌入"有意制造差异"的数据 ──────────────────────────────────────
@@ -135,6 +153,10 @@ QList<QVariantMap> Scenario2Model::childRows(const QString& table) const {
 //   department—— 相同(绿)
 //   project   —— 不同(红)：id=1、id=3 状态改
 //   region    —— 相同(绿)
+
+// execAll —— 在指定库上顺序执行一组 SQL（建表/灌数据用）；任一失败即带错误信息中止。
+// 为什么先 PRAGMA foreign_keys=OFF：seed 时插入顺序未必满足外键依赖，关掉外键约束以免无谓失败
+//   （本演示重点在数据差异而非引用完整性）。返回 true=全部成功。
 static bool execAll(const QString& dbPath, const QStringList& sqls, QString* err) {
     const QString conn =
         QStringLiteral("s2_seed_") + QUuid::createUuid().toString(QUuid::WithoutBraces);
@@ -164,6 +186,9 @@ static bool execAll(const QString& dbPath, const QStringList& sqls, QString* err
     return ok;
 }
 
+// seedDatabases —— 给 A、B 两库建表并灌入「有意制造差异」的初始数据。
+// 做什么：先在两库各建相同 schema，再分别灌入 childData / centerData（差异点见上方表格注释）。
+// 返回：任一库的建表或灌数据失败则 false（错误经 err 带出）。这是 setup/reseed 的数据基础。
 bool Scenario2Model::seedDatabases(QString* err) {
     // 两库共享的 schema。
     const QStringList schema = {
@@ -223,7 +248,10 @@ bool Scenario2Model::seedDatabases(QString* err) {
 
 // ── 远端快照构造（从 center_A 读全库）────────────────────────────────────────
 
-// 行内容指纹（顺序无关的简单累加 hash；与 diff-demo 同思路，仅用于 meta 填充）。
+// computeChecksum —— 为一张表的全部行算一个粗粒度内容指纹（顺序无关的累加 hash）。
+// 用途：填充 RemoteTableSnapshot.meta.contentChecksum，供比对会话的 checksum 快路径参考。
+// 为什么顺序无关（对每行 h 求和而非串接）：行序不应影响「整表内容是否相同」的判断。
+// 说明：仅演示用途的简单实现，非密码学 hash；真实差异仍以行级 diff 为准（见 tableStatuses 注释）。
 static QString computeChecksum(const QList<QVariantMap>& rows) {
     quint64 sum = 0;
     for (const auto& row : rows) {
@@ -235,6 +263,10 @@ static QString computeChecksum(const QList<QVariantMap>& rows) {
     return QString::number(sum, 16);
 }
 
+// buildRemoteSnapshots —— 从中心A 库读出全部参与表的快照，组装成 RemoteTableSnapshot 列表。
+// 做什么：逐表 readRows(centerDb_) 取全行，填好 schema 指纹/内容 checksum/行数等 meta。
+// 用途：作为 IComparisonSession::initialize 的入参——比对会话把「远端A 快照」与「本地B 库」逐表
+//   做 DiffEngine 比对。参数 err 当前未用（读 A 失败时该表退化为空快照，不致命）。
 QList<RemoteTableSnapshot> Scenario2Model::buildRemoteSnapshots(QString* /*err*/) const {
     QList<RemoteTableSnapshot> snaps;
     for (const QString& t : tables_) {
@@ -251,6 +283,11 @@ QList<RemoteTableSnapshot> Scenario2Model::buildRemoteSnapshots(QString* /*err*/
 
 // ── setup / reseed / rebuildSession ─────────────────────────────────────────
 
+// setup —— 从零把场景2 带到「可比对」状态（可重入，重入时先彻底拆除旧资源）。
+// 六步：拆旧 → 清 workspace → seed 两库 → 开 B 的 DataBridge → 建 B 的 SyncConfig
+//        → 初始化 B 的 ISyncEngine（建 SyncContext）→ rebuildSession 建首个比对会话。
+// 为什么引擎必须先初始化：createComparisonSession 依赖引擎建立的 SyncContext 与 __sync_* 元数据。
+// 返回：任一步失败即 false（err 带原因）；成功则 engineReady_=true 且已有可用会话。
 bool Scenario2Model::setup(QString* err) {
     // 0. 拆除既有会话/引擎/桥（重入 setup 时必须先释放 SyncContext 与连接）。
     session_.reset();
@@ -312,10 +349,16 @@ bool Scenario2Model::setup(QString* err) {
     return rebuildSession(err);
 }
 
+// reseed —— 「重置演示数据」：等价于整套 setup 重跑（把 A/B 两库恢复到初始差异态）。
 bool Scenario2Model::reseed(QString* err) {
     return setup(err);  // 重置 = 重新 seed 全流程
 }
 
+// rebuildSession —— 释放旧比对会话并新建一个：读 A 库快照 → createComparisonSession(B)
+//   → initialize（触发 DiffEngine 计算差异）。
+// 为什么频繁重建：每次 save/discard 后旧会话已被消费（其 read 事务释放），需要一个反映「最新库
+//   状态」的新会话来展示更新后的差异。同时清空内存暂存追踪（stagedRows_/stagedCells_）。
+// 返回：会话创建或 initialize 失败则 false 并释放半成品会话。
 bool Scenario2Model::rebuildSession(QString* err) {
     session_.reset();  // 释放旧会话（连同其 read 事务与 gate）
     stagedRows_.clear();
@@ -341,12 +384,19 @@ bool Scenario2Model::rebuildSession(QString* err) {
 
 // ── 状态查询 ────────────────────────────────────────────────────────────────
 
+// rowDiffs —— 取某表的全部行级差异（含逐列 CellDiff）。(0, -1) 表示「从第 0 行到末尾」全取。
+// 无会话时返回空列表（GUI 会显示为「无差异/未就绪」）。localValue=B 值、remoteValue=A 值。
 QList<RowDiff> Scenario2Model::rowDiffs(const QString& table) const {
     if (!session_)
         return {};
     return session_->rowDiffs(table, 0, -1);
 }
 
+// tableStatuses —— 逐表汇总差异计数（新增/删除/修改），并据此判定「相同(绿)/不同(红)」。
+// 为什么直接由行级 diff 推导而非读 __sync_table_state 的 checksum 快路径：行级 diff 始终准确，
+//   不受 checksum 哈希碰撞或元数据滞后影响——演示要的是「肉眼可信」的红绿结论。
+// 计数口径：Added=仅A有(B需新增)、Deleted=仅B有(A没有)、Modified=两端都有但字段不同、Same=不计。
+// identical = 三类计数全为 0。
 QList<Scenario2Model::TableStatus> Scenario2Model::tableStatuses() const {
     QList<TableStatus> out;
     for (const QString& t : tables_) {
@@ -375,7 +425,15 @@ QList<Scenario2Model::TableStatus> Scenario2Model::tableStatuses() const {
 }
 
 // ── 合并决策 ────────────────────────────────────────────────────────────────
+// 共性：这四个方法把「采用A / 保留B / 列级采用 / 撤销」的决策同时作用于两处——
+//   ① 真正的比对会话 StagingBuffer（session_->accept*/stageCell，决定最终写回什么）；
+//   ② 本类的内存追踪 stagedRows_/stagedCells_（仅供 GUI 高亮与 pendingCount 显示用）。
+// 两者必须保持一致，否则界面高亮会与实际待写决策脱节。
 
+// acceptRemoteRow —— 整行采用中心A：把该行交给会话 acceptRemote，并把它的所有差异列都标记为已采用。
+// 为什么还要遍历差异列逐个标 stagedCells_：界面是「精确到列」高亮的，整行采用等价于「该行每个
+//   变化列都采用A」，故把每个 changed 的列也记进单元格集合，使列级高亮与整行决策一致。
+// 返回：无会话或 acceptRemote 失败则 false。
 bool Scenario2Model::acceptRemoteRow(const QString& table, const QString& pk) {
     if (!session_)
         return false;
@@ -394,22 +452,29 @@ bool Scenario2Model::acceptRemoteRow(const QString& table, const QString& pk) {
     return true;
 }
 
+// acceptLocalRow —— 保留本地B（即撤销该行的所有「采用A」决策）：会话 acceptLocal +
+//   从内存追踪里移除该行键、并清掉该行下所有单元格键。
+// 实现细节：cellKey(table,pk,"") 构造出「该行所有单元键的公共前缀」，遍历 stagedCells_ 删掉所有
+//   以此前缀打头的项（即把这一行的列级标记一并清除）。
 bool Scenario2Model::acceptLocalRow(const QString& table, const QString& pk) {
     if (!session_)
         return false;
     if (!session_->acceptLocal(table, pk))
         return false;
     stagedRows_.remove(rowKey(table, pk));
-    const QString prefix = cellKey(table, pk, QString());
+    const QString prefix = cellKey(table, pk, QString());  // 该行所有单元键的公共前缀
     for (auto it = stagedCells_.begin(); it != stagedCells_.end();) {
         if (it->startsWith(prefix))
-            it = stagedCells_.erase(it);
+            it = stagedCells_.erase(it);  // erase 返回下一个迭代器，避免失效
         else
             ++it;
     }
     return true;
 }
 
+// stageCellValue —— 精确到列地采用中心A 的某一列值（可对同一行的多个列累积调用）。
+// 同时把该行键与该单元键都记进内存追踪：行键使 pendingCount 把它计为「一行待保存」，
+//   单元键驱动该列的高亮。返回：无会话或 stageCell 失败则 false。
 bool Scenario2Model::stageCellValue(const QString& table, const QString& pk, const QString& column,
                                     const QVariant& value) {
     if (!session_)
@@ -421,10 +486,12 @@ bool Scenario2Model::stageCellValue(const QString& table, const QString& pk, con
     return true;
 }
 
+// unstageRow —— 撤销该行暂存：语义上等同「回到保留本地」，故直接复用 acceptLocalRow。
 bool Scenario2Model::unstageRow(const QString& table, const QString& pk) {
     return acceptLocalRow(table, pk);  // 撤销 = 回到"保留本地"
 }
 
+// isRowStaged / isCellStaged —— 查询某行 / 某单元是否已被暂存（供界面决定是否高亮）。O(1) 查 QSet。
 bool Scenario2Model::isRowStaged(const QString& table, const QString& pk) const {
     return stagedRows_.contains(rowKey(table, pk));
 }
@@ -435,6 +502,10 @@ bool Scenario2Model::isCellStaged(const QString& table, const QString& pk,
 
 // ── save / discard ──────────────────────────────────────────────────────────
 
+// save —— 把内存暂存的合并决策经 SyncWorker 写回子节点B 数据库（A→B 同步），随后重建会话。
+// 为什么保存后要 rebuildSession：session_->save() 一旦提交，旧会话即被消费（read 事务释放），
+//   必须重建一个反映「写回后最新状态」的新会话，让界面刷新出新的差异（理想情况大幅减少）。
+// 返回：无会话 / save 失败 / 重建失败 → false（err 带原因）。
 bool Scenario2Model::save(QString* err) {
     if (!session_) {
         if (err)
@@ -447,6 +518,7 @@ bool Scenario2Model::save(QString* err) {
     return rebuildSession(err);
 }
 
+// discard —— 放弃所有内存暂存（不写库），并重建会话回到「全部保留本地」的初始决策态。
 void Scenario2Model::discard() {
     if (session_)
         session_->discard();
@@ -456,6 +528,14 @@ void Scenario2Model::discard() {
 
 // ── headless 自检 ────────────────────────────────────────────────────────────
 
+// runHeadlessSelfTest —— 无界面地走通场景2 的核心路径，供 --selftest「编译后运行验证」调用。
+// 它与 GUI 完全相同的代码路径，五步串成一个可断言的端到端用例：
+//   1) 校验初始差异符合预期（employee/project=不同，department/region=相同）；
+//   2) 列级采用：employee#1.salary 采用 A 的 30000；
+//   3) 整行采用：employee#5（A 独有 → B 应新增）；
+//   4) save 写回 B；
+//   5) 重新读 B 库校验：#1.salary 已变 30000 且 #5 已存在。
+// 返回：任一步不符预期即 false（err 带具体原因），全部通过返回 true（退出码 0 的依据）。
 bool Scenario2Model::runHeadlessSelfTest(QString* err) {
     // 1) 校验初始差异：employee/project 为"不同"，department/region 为"相同"。
     const auto statuses = tableStatuses();

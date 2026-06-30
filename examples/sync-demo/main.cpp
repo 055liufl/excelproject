@@ -22,7 +22,10 @@
  *   Phase 5 — 冲突解决：edge_d 写 28000，center 写 30000（rank=100 胜出），四端收敛
  *
  * 运行方式：
- *   ./sync-demo <workspace-dir>     （必须使用全新目录）
+ *   ./sync-demo <workspace-dir>
+ *
+ * workspace-dir 可重复使用——程序启动时自动清理旧 DB 和 inbox/outbox，
+ * 确保每次运行均从干净状态出发。
  */
 
 #include "dbridge/DataBridge.h"
@@ -231,12 +234,24 @@ int main(int argc, char* argv[]) {
         QCoreApplication::setLibraryPaths(paths);
     }
 
-    // ── 0. 解析工作目录 ──────────────────────────────────────────────────────
+    // ── 0. 解析工作目录并清理旧状态 ─────────────────────────────────────────
     if (argc < 2) {
-        std::cerr << "Usage: sync-demo <workspace-dir>   (必须使用全新目录)\n";
+        std::cerr << "Usage: sync-demo <workspace-dir>\n";
         return 1;
     }
     const QString ws = QString::fromLocal8Bit(argv[1]);
+    QDir().mkpath(ws);
+
+    // 删除旧 DB 和旧 sync 目录——确保每次运行都从干净状态出发，
+    // 避免旧 __sync_row_winner / __sync_outbound_ack 等元数据污染新一轮同步。
+    std::cout << "=================================================\n"
+              << " sync-demo: 清理旧 workspace 状态...\n";
+    for (const QString& db : {QStringLiteral("center.db"), QStringLiteral("edge_b.db"),
+                              QStringLiteral("edge_c.db"), QStringLiteral("edge_d.db")})
+        QFile::remove(ws + "/" + db);
+    for (const QString& node : {QStringLiteral("center"), QStringLiteral("edge_b"),
+                                QStringLiteral("edge_c"), QStringLiteral("edge_d")})
+        QDir(ws + "/" + node).removeRecursively();
 
     for (const QString& node : {QStringLiteral("center"), QStringLiteral("edge_b"),
                                 QStringLiteral("edge_c"), QStringLiteral("edge_d")}) {

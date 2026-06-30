@@ -10,6 +10,7 @@
 #   - examples/cli     : dbridge-cli example
 #   - examples/sync-demo : 多节点增量同步范式演示
 #   - examples/diff-demo : Beyond Compare 差异比对范式演示
+#   - examples/sync-suite: 《数据库同步设计2》两场景完整 GUI 演示
 #   - tests            : Qt Test suites (Excel + sync; CONFIG += testcase, `make check`)
 
 TEMPLATE = subdirs
@@ -23,6 +24,7 @@ SUBDIRS = \
     cli \
     syncdemo \
     diffdemo \
+    syncsuite \
     tests
 
 qxlsx.file            = 3rdparty/QXlsx/QXlsx.pro
@@ -32,6 +34,7 @@ libdbridge.file       = src/libdbridge.pro
 cli.file              = examples/cli/dbridge-cli.pro
 syncdemo.file         = examples/sync-demo/sync-demo.pro
 diffdemo.file         = examples/diff-demo/diff-demo.pro
+syncsuite.file        = examples/sync-suite/sync-suite.pro
 tests.file            = tests/tests.pro
 
 # Dependency chain (qmake honours these when generating Makefile.tests etc.).
@@ -44,6 +47,7 @@ qsqlite_session.depends  = sqlite3
 cli.depends              = libdbridge sqlite3 qsqlite_session
 syncdemo.depends         = libdbridge sqlite3 qsqlite_session
 diffdemo.depends         = libdbridge sqlite3 qsqlite_session
+syncsuite.depends        = libdbridge sqlite3 qsqlite_session
 tests.depends            = libdbridge qxlsx sqlite3
 
 OTHER_FILES += \

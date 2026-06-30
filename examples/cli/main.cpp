@@ -1,3 +1,23 @@
+/**
+ * dbridge-cli — DataBridge 命令行示例：按 Profile 对 SQLite 表做 Excel 批量导入/导出。
+ *
+ * ──────────────────────────────────────────────────────────────────────────────
+ * 运行方式
+ *   构建产物：build_qmake_demos/examples/cli/dbridge-cli
+ *
+ *   # 环境变量：本机 shell 的 LD_LIBRARY_PATH 指向 QtCreator 自带的 Qt 5.15.2，
+ *   # 与项目使用的 Qt 5.12.12 冲突，运行前需把 5.12.12 的库路径前置（否则 abort：
+ *   # "Cannot mix incompatible Qt library"）。本 demo 为控制台程序（QCoreApplication），
+ *   # 不加载平台插件，故无需设置 QT_QPA_PLATFORM。
+ *   export LD_LIBRARY_PATH=/opt/Qt5.12.12/5.12.12/gcc_64/lib:$LD_LIBRARY_PATH
+ *
+ *   cd build_qmake_demos/examples/cli
+ *   ./dbridge-cli <db_path> <profile_json> <xlsx_path> [import|export]
+ *   # 例（导入）：./dbridge-cli ./demo.db ./profile.json ./data.xlsx import
+ *   # 例（导出）：./dbridge-cli ./demo.db ./profile.json ./out.xlsx  export
+ * ──────────────────────────────────────────────────────────────────────────────
+ */
+
 #include "dbridge/DataBridge.h"
 #include "dbridge/Types.h"
 

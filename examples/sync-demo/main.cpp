@@ -21,8 +21,20 @@
  *   Phase 4 — 选择推送 + 转发：edge_c syncSelected() → center → center 转发给 edge_b/edge_d
  *   Phase 5 — 冲突解决：edge_d 写 28000，center 写 30000（rank=100 胜出），四端收敛
  *
- * 运行方式：
+ * ──────────────────────────────────────────────────────────────────────────────
+ * 运行方式
+ *   构建产物：build_qmake_demos/examples/sync-demo/sync-demo
+ *
+ *   # 环境变量：本机 shell 的 LD_LIBRARY_PATH 指向 QtCreator 自带的 Qt 5.15.2，
+ *   # 与项目使用的 Qt 5.12.12 冲突，运行前需把 5.12.12 的库路径前置（否则 abort：
+ *   # "Cannot mix incompatible Qt library"）。本 demo 为控制台程序（QCoreApplication），
+ *   # 不加载平台插件，故无需设置 QT_QPA_PLATFORM。
+ *   export LD_LIBRARY_PATH=/opt/Qt5.12.12/5.12.12/gcc_64/lib:$LD_LIBRARY_PATH
+ *
+ *   cd build_qmake_demos/examples/sync-demo
  *   ./sync-demo <workspace-dir>
+ *   # 例：./sync-demo /tmp/sync-demo-ws
+ * ──────────────────────────────────────────────────────────────────────────────
  *
  * workspace-dir 可重复使用——程序启动时自动清理旧 DB 和 inbox/outbox，
  * 确保每次运行均从干净状态出发。

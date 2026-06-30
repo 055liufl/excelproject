@@ -31,10 +31,18 @@
  *   └──────────────────────────────────────────────────────────────────┘
  *
  * ──────────────────────────────────────────────────────────────────────────────
- * 运行方式（在项目构建目录下）：
- *   ./examples/diff-demo/diff-demo <workspace-dir>
+ * 运行方式
+ *   构建产物：build_qmake_demos/examples/diff-demo/diff-demo
  *
- * workspace-dir 下会自动创建 local.db。
+ *   # 环境变量：本机 shell 的 LD_LIBRARY_PATH 指向 QtCreator 自带的 Qt 5.15.2，
+ *   # 与项目使用的 Qt 5.12.12 冲突，运行前需把 5.12.12 的库路径前置（否则 abort：
+ *   # "Cannot mix incompatible Qt library"）。本 demo 为控制台程序（QCoreApplication），
+ *   # 不加载平台插件，故无需设置 QT_QPA_PLATFORM。
+ *   export LD_LIBRARY_PATH=/opt/Qt5.12.12/5.12.12/gcc_64/lib:$LD_LIBRARY_PATH
+ *
+ *   cd build_qmake_demos/examples/diff-demo
+ *   ./diff-demo <workspace-dir>
+ *   # 例：./diff-demo /tmp/diff-demo-ws   （workspace-dir 下会自动创建 local.db）
  * ──────────────────────────────────────────────────────────────────────────────
  */
 

@@ -453,6 +453,11 @@ int main(int argc, char* argv[]) {
     UdpFileTransport edgeDTransport(PORT_EDGE_D, loopback, PORT_CENTER, ws + "/edge_d/outbox",
                                     ws + "/edge_d/inbox");
 
+    constexpr int kMaxUdpBytes = 800;
+    centerTransport.setMaxTransmitBytes(kMaxUdpBytes);
+    edgeBTransport.setMaxTransmitBytes(kMaxUdpBytes);
+    edgeCTransport.setMaxTransmitBytes(kMaxUdpBytes);
+    edgeDTransport.setMaxTransmitBytes(kMaxUdpBytes);
     centerTransport.start();
     edgeBTransport.start();
     edgeCTransport.start();

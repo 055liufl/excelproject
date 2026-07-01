@@ -1,162 +1,181 @@
 #pragma once
 
 #include <QAtomicInt>
+#include <QByteArray>
+#include <QElapsedTimer>
 #include <QHash>
 #include <QHostAddress>
+#include <QList>
 #include <QMap>
-#include <QSet>
 #include <QString>
 #include <QThread>
 
 class QUdpSocket;
 
 // ============================================================================
-// udp_transport.h — sync-demo 专用的「基于 UDP 的文件搬运传输层」
+// udp_transport.h — sync-demo 专用的「基于 UDP 的可靠文件搬运传输层（ARQ 版）」
 // ============================================================================
 //
-// 【这个文件是什么】
-//   一个仅供 demo 使用的、跑在后台线程里的「传输适配器」。dbridge 同步引擎本身不关心
-//   工件怎么过网络——它只把要发的工件写进 outbox 目录、从 inbox 目录读收到的工件。本类
-//   就充当二者之间的「搬运工」：监视本节点 outbox 里的新文件，按文件名判出目标 peer，
-//   分片经 UDP 发出去；同时监听本地端口，把收到的数据报重组还原成文件、落进 inbox。
+// 本版相比旧版的核心变更：
+//   · DATA 头新增 type 字节（18B 固定头）；ACK 包（9B）；线格式严格大端。
+//   · setMaxTransmitBytes(bytes)：设置单个 UDP 数据报总长上限，默认 60000，< 274 时拒绝。
+//   · fragmentMessage()：纯函数，文件 → N 个 ≤ maxBytes 的自描述 DATA 数据报。
+//   · FragmentReassembler：有状态机，负责入站校验 / 重组 / 去重 / 超时淘汰 / durable 解耦。
+//   · 全量重传 ARQ：发送端按 RTO 周期性重发未 ACK 消息，直到 ACK 或 maxRetries 放弃。
+//   · 交付以 durable 落盘为准：ACK 只在「写 inbox 主文件 + .ready 两步均成功」后发送。
+//   · 出站状态以磁盘后缀为唯一真源，删除内存 sentFiles_；原子认领 (.ready→.ready.sending)。
+//   · 归并键含发送端点 (senderKey, msgId)；msgId 改单调计数器 + 随机起点，消除碰撞。
 //
-// 【为什么需要它（在 demo 中的价值）】
-//   真实部署里传输层可能是消息队列 / HTTP / 共享盘等；demo 选 UDP loopback 是为了用最少
-//   代码演示「多节点真的在网络上互发工件」。它故意做得很朴素：仅 loopback、无重传、无拥塞
-//   控制——因为 demo 只需在本机几个端口间可靠到达即可，复杂度留给生产实现。
-//
-// 【两种工作模式（由构造函数区分）】
-//   · 单 peer 模式（edge 节点）：只有一个对端（center），outbox 里的文件无脑全发给它，
-//     无需解析文件名。用「两参 peerHost/peerPort」构造。
-//   · 多 peer 模式（center 节点）：一个线程覆盖多个 edge 方向，必须从每个工件的【文件名】
-//     里解析出目标 peer 再分别投递。用「QHash<nodeId, endpoint>」构造。
-//
-// 【工件文件名 → 目标 peer 的约定（与 SyncDDL.h 的命名契约一致）】
-//   changeset       : {origin}__{epoch}__changeset__{seq12}__{peer}-{uuid}.payload
-//   selectionpush   : ...selectionpush...__peer-{peer}-{uuid}.payload
-//   baselineresponse: {from}__{to}__{epoch}__...__baselineresponse.payload  → to
-//   blreq           : blreq__{from}__{to}__{ms}.payload                      → to
-//   ack             : ack__{from}__{to}__{ms}__{uuid}.ack                    → to
-//   （即：文件名自带路由信息，传输层仅凭文件名即可决定发往谁——见 extractTargetPeer。）
-//
-// 【数据报线格式（所有整数大端 big-endian）】
-//   [magic:4u][msg_id:4u][frag_idx:2u][frag_count:2u][total_size:4u]
-//   [fname_len:1u][fname:fname_len 字节][payload:剩余字节]
-//   一个文件可能超过单个 UDP 报文上限，故按 kFragSize 切片，每片带同一 msg_id 与
-//   (frag_idx/frag_count) 供接收端重组（见 .cpp handleDatagram/PendingMsg）。
-//
-// 【发送后的去重】发完一个文件的所有分片后，把 outbox 里的源文件改名为 "<name>.sent"，
-//   使下一轮轮询不再重发它（再叠加内存里的 sentFiles_ 双保险）。
-//
-// 【线程模型】本类是 QThread 子类：run() 在独立后台线程里跑「收发轮询」主循环。停止靠
-//   原子标志 stop_（requestStop 置位、run 循环检测），跨线程安全；调用方 requestStop() 后
-//   须再 wait() 等线程真正退出。socket 仅在 run() 所在线程内创建与使用。
+// 线格式（大端）：
+//   DATA (type=0x01): magic(4)|0x01|msg_id(4)|frag_idx(2)|frag_count(2)|total_size(4)|fname_len(1)
+//                     |fname[fname_len]|payload[M]    ← 总长 ≤ maxTransmitBytes
+//   ACK  (type=0x02): magic(4)|0x02|msg_id(4)         ← 精确 9 字节
 // ============================================================================
 
 // UdpPeerEndpoint —— 一个对端的 UDP 落点（主机地址 + 端口）。
-// Per-peer UDP endpoint (host + port).
 struct UdpPeerEndpoint {
-    QHostAddress host;  // 对端主机（demo 中恒为 loopback 127.0.0.1）
-    quint16 port = 0;   // 对端监听端口
+    QHostAddress host;
+    quint16 port = 0;
 };
 
-// UdpFileTransport —— 后台线程：基于 UDP 的文件搬运传输层（详见上方文件头）。
-// Background thread: file-transfer transport over UDP.
-//
-// Watches outboxDir for new files, determines the target peer from the artifact
-// filename, sends the file to the corresponding endpoint, and simultaneously
-// listens on localPort, reassembling incoming datagrams into inboxDir.
-// Designed for loopback use; no retransmission.
-// （监视 outboxDir 的新文件，从工件文件名判出目标 peer，发往对应落点；同时在 localPort 上
-//  监听，把收到的数据报重组写入 inboxDir。仅为 loopback 设计，无重传。）
-//
-// Multi-peer mode (center node): pass a QHash<nodeId, endpoint> map.
-//   The target peer is extracted from each artifact's filename:
-//     changeset  : {origin}__{epoch}__changeset__{seq12}__{peer}-{uuid}.payload
-//     selectionpush: ...selectionpush...__peer-{peer}-{uuid}.payload
-//     baselineresponse: {from}__{to}__{epoch}__...__baselineresponse.payload  → to
-//     blreq      : blreq__{from}__{to}__{ms}.payload  → to
-//     ack        : ack__{from}__{to}__{ms}__{uuid}.ack → to
-//
-// Single-peer mode (edge node): use the two-peerHost/peerPort constructor.
-//   All outbox files are sent to that single peer without filename parsing.
-//
-// Datagram wire format (all integers big-endian):
-//   [magic:4u][msg_id:4u][frag_idx:2u][frag_count:2u][total_size:4u]
-//   [fname_len:1u][fname:fname_len bytes][payload:remainder]
-//
-// After sending all fragments of a file, the outbox file is renamed to
-// "<name>.sent" so it is not re-sent on the next poll.
+// ── 拆包 ────────────────────────────────────────────────────────────────────
+
+struct FragmentResult {
+    QList<QByteArray> datagrams;
+    bool ok = false;
+    QString error;
+};
+
+// fragmentMessage —— 把一条消息切成若干 ≤ maxTransmitBytes 的 DATA 数据报（纯函数，无副作用）。
+// 空 data → 1 个空净荷片（ok）；文件名 UTF-8 > 255 / fragCount > 65535 / M < 1 → ok=false。
+FragmentResult fragmentMessage(quint32 msgId, const QString& filename, const QByteArray& data,
+                               int maxTransmitBytes);
+
+// ── 组包状态机 ───────────────────────────────────────────────────────────────
+
+struct RxEvent {
+    enum Kind { None, Completed, NeedAck } kind = None;
+    quint32 msgId = 0;
+    QString filename;  // Completed 时有效
+    QByteArray bytes;  // Completed 时有效
+};
+
+// FragmentReassembler —— 接收端重组状态机（可脱离 socket 单测）。
+// 承载 §4.4 全部入站校验、乱序存片、complete 检测、assemble + 总长校验、
+// 去重短表、pending 超时淘汰。
+// feed() 返回 Completed 时不写短表；外层 durable 落盘成功后调 markDelivered() 才入短表。
+class FragmentReassembler {
+   public:
+    explicit FragmentReassembler(int reassemblyTimeoutMs, int completedRetentionMs);
+
+    // 校验 + 存片；组齐 → Completed（不进短表）；已完成消息重收 → NeedAck。
+    RxEvent feed(const QString& senderKey, const QByteArray& datagram, qint64 nowMs);
+
+    // 外层 durable 落盘成功后调用 → 把 (senderKey,msgId) 记入已完成短表。
+    void markDelivered(const QString& senderKey, quint32 msgId, qint64 nowMs);
+
+    // 淘汰超时 pending + 过期短表项。
+    void evictStale(qint64 nowMs);
+
+    // 供测试断言「无泄漏」。
+    int pendingCount() const;
+
+   private:
+    struct PendingMsg {
+        QString filename;
+        quint32 totalSize = 0;
+        quint16 fragCount = 0;
+        quint8 fnLen = 0;
+        QMap<quint16, QByteArray> frags;
+        qint64 createdAt = 0;
+        qint64 lastProgressAt = 0;
+
+        bool complete() const {
+            return fragCount > 0 && frags.size() == static_cast<int>(fragCount);
+        }
+    };
+
+    struct CompletedEntry {
+        qint64 completedAt = 0;
+    };
+
+    using MsgKey = QPair<QString, quint32>;  // (senderKey, msgId)
+
+    QHash<MsgKey, PendingMsg> pending_;
+    QHash<MsgKey, CompletedEntry> completed_;
+    int reassemblyTimeoutMs_;
+    int completedRetentionMs_;
+};
+
+// ── 传输层 ───────────────────────────────────────────────────────────────────
+
 class UdpFileTransport : public QThread {
     Q_OBJECT
 
    public:
-    // 单 peer 构造（edge 节点：唯一对端 = center）。outbox 文件全发给该对端，不解析文件名。
-    // Single-peer constructor (edge nodes: one peer = center).
+    // 单 peer 构造（edge 节点）。
     UdpFileTransport(quint16 localPort, const QHostAddress& peerHost, quint16 peerPort,
                      const QString& outboxDir, const QString& inboxDir, QObject* parent = nullptr);
 
-    // 多 peer 构造（center 节点：向多个 edge 落点发送）。键=对端 nodeId（如 "edge_b"），
-    //   值=该对端 UDP 落点；发送时按文件名解析目标 peer 后查此表得落点。
-    // Multi-peer constructor (center node: sends to multiple edge endpoints).
-    // Key = peer nodeId (e.g. "edge_b"), Value = UDP endpoint.
+    // 多 peer 构造（center 节点）。
     UdpFileTransport(quint16 localPort, const QHash<QString, UdpPeerEndpoint>& peers,
                      const QString& outboxDir, const QString& inboxDir, QObject* parent = nullptr);
 
-    // 线程安全的停止请求：置原子标志后立即返回（不阻塞）。之后须调用 wait() 等线程退出。
-    // Thread-safe stop: sets flag and returns immediately. Call wait() afterwards.
+    // 设置单个 UDP 数据报总长上限。必须在 start() 之前调用。
+    // bytes < 274 时拒绝（返回 false）；否则设置并返回 true。默认 60000。
+    bool setMaxTransmitBytes(int bytes);
+
+    // 线程安全的停止请求（置原子标志，须再 wait()）。
     void requestStop();
 
    protected:
-    // QThread 线程入口：bind 本地端口后进入「收（重组入 inbox）+ 发（轮询 outbox）」主循环，
-    //   直到 stop_ 被置位。具体见 .cpp run()。
     void run() override;
 
    private:
-    static constexpr quint32 kMagic = 0xDB5ACED0u;  // 数据报魔数：收端据此快速甄别/丢弃异包
-    static constexpr int kFragSize =
-        60'000;  // fragment payload bytes（单分片净荷字节，留足 UDP 余量）
-    static constexpr int kPollMs = 50;  // outbox poll / receive-wait interval（轮询/收等间隔毫秒）
+    // 线格式常量
+    static constexpr quint32 kMagic = 0xDB5ACED0u;
+    static constexpr quint8 kTypeData = 0x01;
+    static constexpr quint8 kTypeAck = 0x02;
+    static constexpr int kFixedHeader =
+        18;  // magic(4)+type(1)+msg_id(4)+frag_idx(2)+frag_count(2)+total_size(4)+fname_len(1)
+    static constexpr int kAckSize = 9;        // magic(4)+type(1)+msg_id(4)
+    static constexpr int kMinMaxBytes = 274;  // 18头 + 255最长文件名 + 1净荷
 
-    // PendingMsg —— 接收端「半成品消息」：同一 msg_id 的各分片到齐前的暂存装配区。
-    //   收到一片就按 frag_idx 存进 frags；frags 凑满 fragCount 即可 assemble() 还原整文件。
-    struct PendingMsg {
-        QString filename;       // 该消息还原后的目标文件名（取自首片头部）
-        quint32 totalSize = 0;  // 整文件总字节（来自头部，用于 reserve 预分配）
-        quint16 fragCount = 0;  // 总分片数（==0 表示尚未收到任何片、刚创建）
-        QMap<quint16, QByteArray> frags;  // frag_idx → 该片净荷（用有序 map 便于按序拼接）
+    // ARQ 编译期常量（不提供 setReliabilityParams 公开接口）
+    static constexpr int kRtoMs = 500;
+    static constexpr int kMaxRetries = 5;
+    static constexpr int kReassemblyTimeoutMs = 8000;
+    static constexpr int kCompletedRetentionMs = 8000;
+    static constexpr int kPollMs = 50;
 
-        // 是否已收齐所有分片（已到片数 == 期望片数）。
-        bool complete() const {
-            return frags.size() == static_cast<int>(fragCount);
-        }
-        // 按 0..fragCount-1 顺序拼接各片净荷，还原出完整文件字节。
-        QByteArray assemble() const {
-            QByteArray data;
-            data.reserve(static_cast<int>(totalSize));  // 预留总长，避免逐片 append 反复扩容
-            for (quint16 i = 0; i < fragCount; ++i)
-                data += frags.value(i);  // 缺片则 value() 返回空（complete() 已保证不缺）
-            return data;
-        }
+    // 出站在途消息
+    struct Outbound {
+        QHostAddress destHost;
+        quint16 destPort = 0;
+        quint32 msgId = 0;
+        QList<QByteArray> datagrams;  // 所有分片（全量重传不再读盘）
+        QString artifactBase;         // 主文件路径（不含后缀，用于终态改名）
+        QString readySendingPath;     // .ready.sending 路径
+        qint64 lastSentAt = 0;
+        int retries = 0;
+        int fragCount = 0;  // 记录用于观测日志
     };
 
-    // 从工件文件名解析目标 peer 的 nodeId；无法判定时返回空串（多 peer 模式下据此跳过）。
-    // Extract the target peer nodeId from an artifact filename.
-    // Returns an empty string if the peer cannot be determined.
+    // 从工件文件名解析目标 peer 的 nodeId（多 peer 模式用）。
     static QString extractTargetPeer(const QString& filename);
 
-    // 轮询 outbox：对每个「就绪」工件判出目标落点并 sendFile，发完改名 .sent。详见 .cpp。
-    void pollOutbox(QUdpSocket& sock);
-    // 把单个文件切片为若干 UDP 数据报发往 destHost:destPort。详见 .cpp。
-    void sendFile(QUdpSocket& sock, const QString& filePath, const QString& filename,
-                  const QHostAddress& destHost, quint16 destPort);
-    // 处理一个收到的数据报：解析头部、归入对应 PendingMsg；集齐后写 inbox 并建 .ready 哨兵。
-    void handleDatagram(const QByteArray& dg, QMap<quint32, PendingMsg>& pending);
+    // outbox 轮询：原子认领 → 读取 → 拆包 → 发送 → 入 outbound。
+    void pollOutbox(QUdpSocket& sock, QHash<quint32, Outbound>& outbound,
+                    FragmentReassembler& reasm, qint64 nowMs);
 
-    quint16 localPort_;                      // 本节点 UDP 监听端口
-    QHash<QString, UdpPeerEndpoint> peers_;  // nodeId → endpoint（仅 1 项 = 单 peer 模式）
-    QString outboxDir_;  // 出站目录：同步引擎把待发工件写在这里
-    QString inboxDir_;   // 入站目录：本类把收齐的工件还原到这里供引擎读取
-    QAtomicInt stop_;  // 停止标志（原子，跨线程；requestStop 置位、run 循环检测）
-    QSet<QString> sentFiles_;  // basenames sent this session（本次会话已发过的文件名，防重发）
+    // 发送 ACK 到指定端点。
+    void sendAck(QUdpSocket& sock, quint32 msgId, const QHostAddress& dest, quint16 destPort);
+
+    quint16 localPort_;
+    QHash<QString, UdpPeerEndpoint> peers_;
+    QString outboxDir_;
+    QString inboxDir_;
+    QAtomicInt stop_;
+    int maxTransmitBytes_ = 60000;
+    quint32 msgSeq_ = 0;  // 单调计数器，随机起点，构造时初始化
 };

@@ -373,6 +373,11 @@ void Scenario1Runner::run() {
                                     ws_ + "/edge_c/inbox");
     UdpFileTransport edgeDTransport(PORT_EDGE_D, loopback, PORT_CENTER, ws_ + "/edge_d/outbox",
                                     ws_ + "/edge_d/inbox");
+    constexpr int kMaxUdpBytes = 800;
+    centerTransport.setMaxTransmitBytes(kMaxUdpBytes);
+    edgeBTransport.setMaxTransmitBytes(kMaxUdpBytes);
+    edgeCTransport.setMaxTransmitBytes(kMaxUdpBytes);
+    edgeDTransport.setMaxTransmitBytes(kMaxUdpBytes);
     centerTransport.start();
     edgeBTransport.start();
     edgeCTransport.start();

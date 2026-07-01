@@ -435,6 +435,9 @@ bool Scenario2Model::startSnapshotChannel(QString* err) {
     childTransport_ = std::make_unique<UdpFileTransport>(PORT_CHILD_B, loopback, PORT_CENTER_A,
                                                          snapChildOutbox(ws_), snapChildInbox(ws_));
 
+    constexpr int kMaxUdpBytes = 800;
+    centerTransport_->setMaxTransmitBytes(kMaxUdpBytes);
+    childTransport_->setMaxTransmitBytes(kMaxUdpBytes);
     responder_->start();
     centerTransport_->start();
     childTransport_->start();

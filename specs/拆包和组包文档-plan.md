@@ -15,7 +15,7 @@
 
 | 步 | 内容 | landable（本步完成后「什么是working的」） |
 |----|------|------|
-| 0 | 基线确认 | 两 demo 在默认 60000 下 qmake+cmake 均构建+跑通（回归对照锚点） |
+| 0 | 基线确认 | 默认 60000 下：qmake 两 demo 均跑通；cmake sync-suite 跑通、sync-demo 验编译（回归对照锚点） |
 | 1 | `udp_framing`：`fragmentMessage` + 拆包单测 | 新文件编译进两 demo；拆包单测绿；**两 demo 行为不变**（未接入） |
 | 2 | `udp_framing`：`FragmentReassembler` + 组包单测 | **接收端**组包健壮性(校验/淘汰/去重/重组/durable 解耦)单测绿；**两 demo 行为不变**（发送端 RTO/giveUp 属 run()，见 Step 4/5） |
 | 3 | 接口 `setMaxTransmitBytes` + 常量/成员（未接入 run） | 编译通过；接口存在但 run() 仍旧路径 |
@@ -29,9 +29,9 @@
 
 先记录「改造前」两 demo 都能构建+跑通，作为每步回归对照。
 
-- qmake：`cd build_qmake_demos && qmake ../dbridge.pro`，构建 `sync-demo`、`sync-suite`，各跑一次（命令见 §7）。
-- cmake：`cmake -S . -B build && cmake --build build --target sync-demo sync-suite`，各跑一次。
-- 记录：sync-suite `--selftest` 退出码 0；sync-demo 输出末尾「完成」且无 `[WARNING] … 存在错误记录`、收敛字段一致。
+- qmake：`cd build_qmake_demos && qmake ../dbridge.pro`，构建 `sync-demo`、`sync-suite`，**各跑一次**（命令见 §7；qmake 两 demo 旁均有 session 插件）。
+- cmake：`cmake -S . -B build && cmake --build build --target sync-demo sync-suite`；**跑 sync-suite**；**sync-demo 仅确认编译**（cmake 未部署插件，见 §5.11，运行以 qmake 为准）。
+- 记录基线：sync-suite `--selftest` 退出码 0；sync-demo（qmake）输出末尾「完成」、`! grep 存在错误记录`、收敛字段一致。
 
 **landable**：无改动，仅确立锚点。**回滚**：无。
 
@@ -103,9 +103,9 @@
   - `examples/sync-suite/Scenario2Model.cpp`：`centerTransport_/childTransport_`（`make_unique` 后、`->start()` 前 `->setMaxTransmitBytes(800)`）。
   - 建议各 demo 用一个常量（如 `constexpr int kMaxUdpBytes = 800;`）集中，避免散落魔数。
 - **构建/验证（核心，此处才真正证明多分片路径）**：两 demo **在 800B** 下：
-  - sync-suite `--selftest` 退出码 0；场景2 的 1702B 快照被切成 **3 片**并正确重组、比对结论不变；
-  - sync-demo 收敛、无 error；
-  - **由观测日志断言**（非 `ls`）：存在 `fragCount>1` 的消息、每 datagram ≤ 800、终态 `.sent`、`pendingCount()` 有界。
+  - **sync-suite `--selftest`（多分片必证点）**：退出码 0；**观测日志确认场景2 的 1702B 快照 = 3 片**（`fragCount>1`）、每 datagram ≤ 800、正确重组、比对结论不变、终态 `.sent`、`pendingCount()` 有界。
+  - **sync-demo**：收敛、无 error 记录、**所有 datagram ≤ 800**；**不强求 `fragCount>1`**（其同步工件偏小，可能仍单片——这是正常的，多分片证明已由 sync-suite 承担）。
+  - sync-demo 的**运行**用 qmake 产物（.pro 已部署 session 插件）；cmake 侧见 §5.11。
 - **landable**：800B 端到端跑通——**需求达成**。**回滚**：把 10 处改回默认（或删该行）。
 
 ### Step 6 · 双构建 + 全量验证 + 观测
@@ -156,9 +156,9 @@
 |---|---|---|
 | 单测 | `QT_QPA_PLATFORM=offscreen ./tst_udp_reassembly` | 全绿（重点 `retransmit_recovery/durable_delivery/eviction/collision/reject_*`） |
 | sync-suite · 60000（Step 4 commit） | `--selftest` | 退出码 0；由观测日志确认走新 ARQ 路径、终态 `.sent`、无 `.sending` 残留 |
-| sync-suite · 800（Step 5 commit） | `--selftest` | 退出码 0；日志见 `fragCount>1`（1702B 快照=3 片）且每 datagram≤800；比对结论不变 |
-| sync-demo · 60000 / 800（各自 commit） | 跑主流程（**恒返回 0**，须机器核对 stdout） | 收敛：末尾四端探测字段一致；正确性：`! grep -qE '存在错误记录\|\[ERR\]'` 于 stdout；800 档另由观测日志见多分片 |
-| 双构建 | qmake（`build_qmake_demos`）+ cmake（`build`） | 两套均编译通过、上述运行判据均满足 |
+| sync-suite · 800（Step 5 commit）**← 多分片必证点** | `--selftest` | 退出码 0；**观测日志见 `fragCount>1`（场景2 的 1702B 快照必然=3 片）且每 datagram≤800**；比对结论不变 |
+| sync-demo · 60000 / 800（各自 commit） | 跑主流程（**恒返回 0**，机器核对 stdout） | 收敛：末尾四端探测字段一致；正确性：`! grep -qE '存在错误记录\|\[ERR\]'`；800 档：**所有 datagram≤800**（**不强求 `fragCount>1`**——sync-demo 同步工件多为小工件（约 ≤355B），未必触发多分片；多分片必证交给 sync-suite 场景2） |
+| 双构建 | qmake（`build_qmake_demos`）+ cmake（`build`） | 两套均**编译**通过；**运行**：qmake 侧两 demo 均可跑（.pro 已部署 session 插件）；**cmake 侧 sync-suite 可跑、sync-demo 默认仅验编译**（其 CMakeLists 未部署 session 插件——见风险 §5.11；如需 cmake 也跑 sync-demo，附带镜像 sync-suite 的插件部署） |
 | 内存有界 | 单测 `eviction` + 长跑观察 `pendingCount()` | 不单调增长 |
 | 观测激活 | 每消息 `{msgId/artifact/fragCount/最大datagram/retries}` 日志或计数 | 无损：分片>1(800)、重传=0；（可选）单测注入丢包：重传>0 且最终成功 |
 
@@ -177,7 +177,8 @@
 7. **单调时钟**：所有超时用 `QElapsedTimer::elapsed()`，勿用系统时间。
 8. **单测时间可控**：`FragmentReassembler::feed/evictStale` 的 `nowMs` 由测试传入 → 淘汰/短表用例**无需真实 sleep**，注入递增时间戳即可，测试快且确定。
 9. **cmake AUTOMOC / 多源 test**：`tst_udp_reassembly` 编译纯 `udp_framing.cpp`（无 Q_OBJECT）→ 无 moc 负担；只需确认 `add_dbridge_test` 能接多源（否则本地扩展）。
-10. **Qt 运行环境**：跑 demo/GUI 单测需前置 `LD_LIBRARY_PATH=/opt/Qt5.12.12/5.12.12/gcc_64/lib` 与 `QT_QPA_PLATFORM_PLUGIN_PATH`；sync-demo/sync-suite 依赖旁置 `sqldrivers/libqsqlite.so`（其 `.pro`/CMake 已部署）。`tst_udp_reassembly` 不碰 DB，`offscreen` 即可。
+10. **Qt 运行环境**：跑 demo 需前置 `LD_LIBRARY_PATH=/opt/Qt5.12.12/5.12.12/gcc_64/lib` 与 `QT_QPA_PLATFORM_PLUGIN_PATH`。`tst_udp_reassembly` 不碰 DB，`offscreen` 即可、无需 QSQLITE 插件。
+11. **⚠️ sync-demo 的 CMake 未部署 session QSQLITE 插件（现状缺陷，非本改造引入）**：`examples/sync-demo/CMakeLists.txt` **没有**像 `sync-suite/CMakeLists.txt` 那样把 `sqldrivers/libqsqlite.so` 部署到 exe 旁；而 sync-demo `main()` 把 `applicationDirPath()` 置于插件搜索首位——cmake 产物旁无自定义插件时，运行会加载系统 QSQLITE（无 SESSION）→ dbridge 访问 session 句柄可能 SIGSEGV。**对策**：sync-demo 的**运行**验证以 **qmake 产物**为准（其 `.pro` 的 `QMAKE_POST_LINK` 已部署插件）；cmake 侧 sync-demo **默认仅验编译**。若要 cmake 也运行 sync-demo，附带一步：把 sync-suite 的 `DBRIDGE_QSQLITE_SESSION_PLUGIN` POST_BUILD 部署逻辑**镜像**进 `sync-demo/CMakeLists.txt`（宜抽成共用 CMake helper）。sync-suite 的 CMake 已部署，可正常运行。
 
 ---
 
@@ -189,8 +190,8 @@
 - [ ] `tst_udp_reassembly` 用例全绿（含 `retransmit_recovery/durable_delivery/eviction/collision/reject_*`）。
 - [ ] **10** 构造点设 800B（`start()` 前）。
 - [ ] **60000 在 Step 4 的 commit 验、800 在 Step 5/6 的 commit 验**（同一最终二进制硬编码 800、不能再跑 60000）：各自 sync-suite `--selftest` 退出码 0；sync-demo 输出收敛且 `! grep 存在错误记录`。
-- [ ] qmake 与 cmake 双路径均编译+运行通过。
-- [ ] **日志断言**：800B 下存在 `fragCount>1` 的消息、每 datagram ≤ 800、终态 `.sent`、`pendingCount()` 有界（**不靠 `ls` 判分片**）。
+- [ ] 双构建：qmake+cmake 均**编译**通过；**运行**——qmake 两 demo、cmake sync-suite 均通过；cmake sync-demo 仅编译（§5.11）。
+- [ ] **日志断言（多分片必证于 sync-suite 场景2）**：800B 下 1702B 快照 `fragCount>1`（=3 片）、每 datagram ≤ 800、终态 `.sent`、`pendingCount()` 有界（**不靠 `ls` 判分片**）；sync-demo 800 只要求 datagram≤800、不强求多分片。
 - [ ] 分阶段提交（每步一 commit，信息含 Co-Authored-By；注意 pre-commit clang-format 首次会重排 → 重新 `git add` 再提交）。
 
 ---
@@ -222,6 +223,8 @@ cmake -S . -B build
 cmake --build build --target tst_udp_reassembly sync-demo sync-suite -j$(nproc)
 QT_QPA_PLATFORM=offscreen build/tests/tst_udp_reassembly
 QT_QPA_PLATFORM=offscreen build/examples/sync-suite/sync-suite --selftest --ws /tmp/ss-cm
+# 注意: cmake 的 sync-demo 旁未部署 session QSQLITE 插件(见 §5.11) → 默认只验「编译通过」,
+#       运行验证走上面 qmake 的 sync-demo; 若要 cmake 也跑, 先镜像 sync-suite 的插件部署再运行。
 
 # ── 多分片/终态（Step 5 验证）──
 # 注意: 文件系统看不到 wire 层 fragCount。多分片由【传输层观测日志】证明, 不是 ls。

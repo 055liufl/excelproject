@@ -25,7 +25,7 @@
 | 目标 | 判据 |
 |------|------|
 | **T1 行覆盖率 ≥ 90%** | `lcov --list` 报告 `udp_transport.cpp` **Lines ≥ 90.0%**（§8 豁免不可达分支后） |
-| **T2 组件①②近乎全覆盖** | `fragmentMessage` + `FragmentReassembler` 全部 §4.4 校验分支、状态机分支、淘汰/短表分支被独立断言 |
+| **T2 组件①②近乎全覆盖** | `fragmentMessage` + `FragmentReassembler` 的 §4.4 各校验分支（**除设计 §4.4 要求但实现未做的「文件名 UTF-8 有效性」子项——见 §3 的偏差说明**）、状态机分支、淘汰/短表分支被独立断言 |
 | **T3 ARQ 三缺口修复被实证** | 丢包恢复（重传/giveUp）、pending 淘汰、msgId 碰撞隔离，各有专用用例断言 |
 | **T4 durable 交付语义被实证** | `Completed→不入短表` 与 `markDelivered→入短表` 解耦；落盘失败不误判已交付 |
 | **T5 确定性、可重复** | 全部用例不依赖真实网络抖动：组件测试注入 `nowMs` + 扣留分片；集成测试用固定 loopback + 明确终态文件断言（`QTRY_*` 轮询，非固定 sleep） |
@@ -67,7 +67,7 @@ export LD_LIBRARY_PATH=/opt/Qt5.12.12/5.12.12/gcc_64/lib
 
 BUILD=build_qmake_demos/tests/unit          # 测试 .o/.gcno/.gcda 所在
 lcov --directory "$BUILD" --zerocounters
-QT_QPA_PLATFORM=offscreen tests/unit/tst_udp_reassembly     # 跑全部用例(组件+集成)
+QT_QPA_PLATFORM=offscreen "$BUILD/tst_udp_reassembly"       # 跑全部用例(组件+集成；路径以 $BUILD 为准)
 lcov --directory "$BUILD" --capture --output-file /tmp/cov_all.info
 lcov --extract /tmp/cov_all.info '*/examples/sync-demo/udp_transport.cpp' \
      --output-file /tmp/cov_udp.info
@@ -90,7 +90,8 @@ genhtml /tmp/cov_udp.info --output-directory /tmp/cov_html   # 可选:逐行红/
 ### 组件② `FragmentReassembler`（类，头文件可见）+ 文件内 `static isFilenameSafe` → 全 A
 - `feed()` §4.4 六校验（长度<18 / magic / type / fragCount==0 / fragIdx≥fragCount / 文件名长度越界 / 文件名不安全）、短表命中→NeedAck、新建 pending、元数据不一致→丢弃、重复片不刷新进度、未 complete、总长校验失败→损坏、成功→Completed → **A**
 - `markDelivered` / `evictStale`（pending 淘汰 + 短表过期）/ `pendingCount` / `PendingMsg::complete()` → **A**
-- `isFilenameSafe` 每个 `return false`（空 / `/` / `\` / 绝对路径 / `..`）：**只能经 `feed()` 间接测**（文件内 `static`，外部不可直接取用）→ **A（间接）**
+- `isFilenameSafe` 的 `return false`：空 / `/` / `\` / `..` 四支**只能经 `feed()` 间接测**（文件内 `static`，外部不可直接取用）→ **A（间接）**；`QDir::isAbsolutePath` 行经 `feed()` **不可达**（绝对路径必先被 `/`/`\` 拦截）→ **X**（§8 豁免）
+- **⚠️ 设计 §4.4 与实现的偏差（如实标注，最小可落地不改生产）**：设计 §4.4 校验 4 要求文件名「**UTF-8 有效**」，但实现的 `isFilenameSafe` 仅查「空 / `/` / `\` / 绝对路径 / `..`」，且 `feed()` 用 `QString::fromUtf8(...)` 做**有损转换**（非法字节 → U+FFFD 替换，**不拒绝**）。故「UTF-8 有效」这一设计子项**实现并未实现**、本计划**不声称覆盖它**（§1 T2 已收敛措辞）；遵最小可落地**不为此改生产代码**。若未来要对齐设计，须在 `isFilenameSafe` 显式校验 UTF-8 并补 `reasm_reject_invalid_utf8` 用例——**当前不列入达标基线**。
 
 ### 组件③ `UdpFileTransport`
 - `setMaxTransmitBytes`（<274 拒 / =274 / 中间 / >65507 夹取）→ **A**（`friend` 白盒读 `maxTransmitBytes_`，见 §4.3）
@@ -177,12 +178,13 @@ class UdpFileTransport : public QThread {
 | **RTO 重传 + giveUp → `.failed`** | 只起发送端，**对端端口无接收者（黑洞）**或起一个「只收不回 ACK 的哑 `QUdpSocket`」；发送端首发后每 `RTO=500ms` 重发，`maxRetries=5` 后 giveUp → 断言 outbox 出 `.failed`；哑 socket 计 DATA 到达数 == **1+5=6**（实证重传次数） |
 | **durable 落盘失败 → 不 ACK → 持续重传** | 令接收端 `inboxDir_` **本身是一个已存在的普通文件**（非目录）：`mkpath` 失败、目标路径父级非目录 → `QFile::open(WriteOnly)` 失败。**不用**「inbox 目录下预放同名文件」（会被 `WriteOnly` 截断并**成功**）；`chmod 0500` 只读目录仅作备选。断言接收端 inbox 侧**无 `.ready` 产出**、发送端最终 `.failed`（B5） |
 | **不可路由 → `.failed`** | 多 peer 发送端；放一个文件名不符合任何命名契约（`extractTargetPeer` 返回空）或 peer 未登记的工件；断言直接 `.failed`（不发送）（B6） |
-| **拆包失败 → `.failed`** | **可落地手法**：主文件名 UTF-8 **249 字节**（使 sidecar `{name}.ready` = 249+6 = **255** 正好 `NAME_MAX`，能建出）+ `setMaxTransmitBytes(274)`（→ `M=274-18-249=7`）+ 数据 **458746B**（`>65535×7`）→ `fragCount>65535` → `ok=false`。**不用**「文件名 255 字节」（`.ready` 会达 261 > `NAME_MAX`，sidecar 建不出、`pollOutbox` 扫不到）。断言 `.failed`、无 DATA 发出（B7） |
+| **拆包失败 → `.failed`** | **可落地手法（须单 peer 发送端**，使 `extractTargetPeer` 不介入、避免先走「不可路由」分支截获**）**：主文件名 UTF-8 **249 字节**（使 sidecar `{name}.ready` = 249+6 = **255** 正好 `NAME_MAX`，能建出）+ `setMaxTransmitBytes(274)`（→ `M=274-18-249=7`）+ 数据 **458746B**（`>65535×7`）→ `fragCount>65535` → `ok=false`。**不用**「文件名 255 字节」（`.ready` 会达 261 > `NAME_MAX`，sidecar 建不出、`pollOutbox` 扫不到）。断言 `.failed`、无 DATA 发出（B7） |
 | **bind 失败 → 线程即退** | 先用独立 `QUdpSocket` 预占端口 P（`LocalHost:P`），再 `start()` 一个 bind 到同址的 transport；断言其 `wait(1500)` 返回 true。**平台假设**：Linux/当前 CI 默认 bind 模式（跨平台不保证，见 §11.12）（B8） |
 | **坏包丢弃不崩溃** | 向接收端端口手工发：①`<5B` 短包 ②错 magic ③`type=0x03` 未知 ④`type=0x02` 但长度≠9 的坏 ACK；断言接收端存活、inbox 无产出、后续正常工件仍能送达（B9） |
 | **ACK msgId 不在 outbound** | 向发送端发一个 magic/type 正确、9B、但 `msgId` 不匹配任何在途消息的 ACK；断言被忽略、在途工件不受影响（B10） |
 | **ACK 端点校验（可选）** | **哑 socket 抓发送端首个 DATA 包并解析 `msgId`**，再从**错误端点**发该 `msgId` 的合法 ACK；断言工件**不**变 `.sent`。**不写**「friend 读 outbound」——`outbound` 是 `run()` **局部变量**，friend 亦访问不到（B11） |
-| **pollOutbox 边界（可选）** | ① outbox 目录不存在 → `!dir.exists()` return；② `*.ready` 存在但主文件缺失 → `!QFile::exists` continue（B12） |
+| **pollOutbox 边界** | ① outbox 目录不存在 → `!dir.exists()` return；② `*.ready` 存在但主文件缺失 → `!QFile::exists` continue（B12） |
+| **认领 / 主文件 rename 失败 → 跳过 / `.failed`** | 借 `QFile::rename` **拒绝覆盖已存在目标** 的语义在单线程内确定性触发（无需并发）：① 预建 `{name}.payload.ready.sending` → 认领 `rename(.ready→.ready.sending)` 失败 → `continue`（不认领、不发送、无 `.failed`）；② 预建 `{name}.payload.sending` → 认领成功但主文件 `rename(→.sending)` 失败 → 告警 + `.ready.sending`→`.ready.failed`、不发送（B13） |
 | **NeedAck 端到端（可选）** | 组件层已由 `reasm_dup_after_complete`（A18）覆盖 `NeedAck` 逻辑；`run()` 内 `NeedAck→sendAck` 一行端到端触发需重放同 msgId 分片，成本高收益低 → **可选**（覆盖率差临门一脚再补） |
 
 > **时间成本诚实说明**：`RTO/maxRetries` 是**编译期常量**（设计明确不提供 `setReliabilityParams`），集成层无法调快。故每个 **giveUp 类用例 ≈ 5×500ms + 1×RTO ≈ 3.0–3.5s**。含 giveUp 的用例（giveUp、durable-fail）合计约 **6–8s**；happy/多分片/坏包等亚秒级。全套集成 **≈ 10–12s**，可接受但须在 CI 标注。若未来允许「测试构建经宏 override RTO」，可将其压到毫秒级——**本计划不改生产常量**。
@@ -251,14 +253,15 @@ class UdpFileTransport : public QThread {
 | B4 | `e2e_giveup_no_ack` | 只起发送端；对端为「只收不回 ACK 的哑 `QUdpSocket`」。**工件必须是单片小文件**（如 100B，默认 60000B 上限下 fragCount=1） | `QTRY(≈4s)`：outbox 出 `.failed`；哑 socket 累计收到 **6** 个 DATA（首发1+重传5）。**注**：断言 `6` 仅对单片成立——多片时每轮重发所有分片，总数=`fragCount×6`，故本用例锁定单片 | run(): RTO 重传(9.2) + giveUp(9.3) |
 | B5 | `e2e_durable_write_fail` | 让接收端 `inboxDir_` **本身是一个已存在的普通文件**（非目录）：则 `mkpath` 失败、`QDir(inboxDir_).filePath(fn)` 的父路径不是目录 → `QFile::open(WriteOnly)` 失败。**不用**「inbox 目录下预放同名文件」（那会被 `WriteOnly` 截断并**成功**，触发不了失败）；`chmod 0500` 只读目录作**备选**（受 root/FS 影响不稳） | 接收端**无 `.ready`** 产出；发送端最终 `.failed`（不 ACK→重传→giveUp） | run(): 落盘 `writeOk=false`→不 ACK(6.3) |
 | B6 | `e2e_unroutable_failed` | 多 peer；工件名不可解析或 peer 未登记 | `QTRY`：直接 `.failed`；对端无任何 DATA 到达 | pollOutbox 不可路由→`.failed`(7.3) |
-| B7 | `e2e_fragment_fail_failed` | **可落地触发拆包失败**：主文件名 UTF-8 **249 字节**（则 sidecar `{name}.ready` = 249+6 = **255** = `NAME_MAX`，可创建；主文件本身 249B 亦 ≤ 255）+ 发送端 `setMaxTransmitBytes(274)`（→ `M=274-18-249=7`）+ 工件数据 **458746B**（`>65535×7=458745`）→ `fragCount=65536>65535` → `fragmentMessage` `ok=false`。**不用**「文件名 255 字节」——`{name}.ready` 会达 **261 字节 > `NAME_MAX`**，sidecar 根本建不出、`pollOutbox` 的 `*.ready` 扫不到，触发不了 | `QTRY`：`.failed`；对端无 DATA | pollOutbox 拆包失败→`.failed`(8.2) |
+| B7 | `e2e_fragment_fail_failed` | **须用单 peer 发送端**（`peers_.size()==1`，跳过 `extractTargetPeer`，避免先走「不可路由→`.failed`」而覆盖不到拆包失败）。**可落地触发拆包失败**：主文件名 UTF-8 **249 字节**（则 sidecar `{name}.ready` = 249+6 = **255** = `NAME_MAX`，可创建；主文件本身 249B 亦 ≤ 255）+ 发送端 `setMaxTransmitBytes(274)`（→ `M=274-18-249=7`）+ 工件数据 **458746B**（`>65535×7=458745`）→ `fragCount=65536>65535` → `fragmentMessage` `ok=false`。**不用**「文件名 255 字节」——`{name}.ready` 会达 **261 字节 > `NAME_MAX`**，sidecar 根本建不出、`pollOutbox` 的 `*.ready` 扫不到，触发不了 | `QTRY`：`.failed`；对端无 DATA | pollOutbox 拆包失败→`.failed`(8.2) |
 | B8 | `e2e_bind_fail_thread_exits` | 预占端口 P（独立 `QUdpSocket` bind `LocalHost:P`），再起 bind 到同 `LocalHost:P` 的 transport。**平台假设**：Linux/当前 CI 下默认 bind 模式，同址同端口二次 bind 必失败（跨平台不保证，文档限定本环境） | 其 `wait(1500)`==true（线程速退）；放入的工件不被发出 | run(): bind 失败→return(1.2) |
 | B9 | `e2e_garbage_datagrams` | 向接收端发 4 类坏包（短/错 magic/未知 type/坏长 ACK），随后发 1 个正常工件 | 接收端存活；坏包无 inbox 产出；正常工件仍 `.sent`+inbox（证丢弃分支不影响后续） | run(): dg<5 / magic / 未知 type / ACK 长度≠9 丢弃(4.1/5.1/7.7/7.2) |
 | B10 | `e2e_ack_msgid_not_in_outbound` | 向**发送端**发一个格式合法但 `msgId` 不在其 outbound 的 ACK（9B，magic/type 正确） | 发送端存活、忽略该 ACK（`!outbound.contains` 分支）；在途工件不受影响 | run(): ACK `msgId` 不在 outbound→continue |
 | B11 | `e2e_ack_endpoint_mismatch`（可选） | **哑 socket 抓发送端首个 DATA 包、解析出 `msgId`**，再从**错误端点**（另一 socket/端口）发一个该 `msgId` 的合法 ACK | 工件**不**变 `.sent`（端点不匹配丢弃）；随后从正确端点发 ACK 才 `.sent`。**不写**「friend 读 outbound」——`outbound` 是 `run()` 局部变量，friend 也访问不到 | run(): ACK 端点校验(7.6) |
-| B12 | `e2e_poll_edge_cases`（可选） | ① outbox 目录不存在的 transport；② outbox 里只放 `*.ready` 但**缺主文件** | ① `pollOutbox` 开头 `!dir.exists()` 直接 return（线程存活、无发送）；② `!QFile::exists(artifactPath)` → `continue`（不认领、不发送、无 `.failed`） | pollOutbox: outbox 不存在 return / 主文件缺失 continue |
+| B12 | `e2e_poll_edge_cases` | ① outbox 目录不存在的 transport；② outbox 里只放 `*.ready` 但**缺主文件** | ① `pollOutbox` 开头 `!dir.exists()` 直接 return（线程存活、无发送）；② `!QFile::exists(artifactPath)` → `continue`（不认领、不发送、无 `.failed`） | pollOutbox: outbox 不存在 return / 主文件缺失 continue |
+| B13 | `e2e_rename_fail_deterministic` | **单 peer 发送端**；借 `QFile::rename` **拒绝覆盖已存在目标** 单线程确定性触发：① 认领前预建 `{name}.payload.ready.sending`；② 另一工件预建 `{name}.payload.sending`（认领 `.ready→.ready.sending` 仍成功） | ① 短等/`QTRY`：`.ready` 仍在（未认领）、无 DATA、无 `.failed`；② 出现 `.ready.failed`、主 `.payload` 未变 `.sending`（rename 失败）、无 DATA | pollOutbox: 认领 rename 失败→continue / 主文件 rename 失败→`.ready.failed`(§5.2 状态机②) |
 
-> **B1–B10 + B12 为达标基线**（含 B10「ACK msgId 不在 outbound」、B12「pollOutbox 边界」——均手法简单、§7.5 覆盖论证已计入，必须实现）；**B11「ACK 端点校验」+ NeedAck 为可选补充**：仅为把 `run()` 内个别分支的**那一行**也染绿，达 90% 不强依赖；若覆盖率报告显示仍差临门一脚再补。
+> **B1–B10 + B12 + B13 为达标基线**（B10「ACK msgId 不在 outbound」、B12「pollOutbox 边界」、B13「认领/主文件 rename 失败」——均手法简单、**单线程确定性**触发、§7.5 覆盖论证已计入，必须实现）；**B11「ACK 端点校验」+ NeedAck 为可选补充**：仅为把 `run()` 内个别分支的**那一行**也染绿，达 90% 不强依赖；若覆盖率报告显示仍差临门一脚再补。
 
 ---
 
@@ -278,7 +281,7 @@ class UdpFileTransport : public QThread {
 - `run` bind 成/败：B1/B8；收 DATA→Completed→落盘成功→markDelivered→sendAck：B1/B2；落盘失败→不 ACK：B5；收 ACK→端点匹配→`.sent`：B1；ACK `msgId` 不在 outbound→continue：B10；端点不匹配丢弃：B11(可选)；坏包/未知类型/坏 ACK 长度丢弃：B9；`NeedAck→sendAck`：可选(见 §5.2)；RTO 重传：B4；giveUp→`.failed`：B4；`evictStale`（在 run 内周期调用）：B1（每轮都走）。
 - `pollOutbox` 认领→改名→读取→路由→拆包→发送→入 outbound：B1/B2/B3；outbox 不存在 return / 主文件缺失 continue：B12；不可路由→`.failed`：B6；拆包失败→`.failed`：B7。
 - `sendAck`：B1（每次交付都发）。
-- **难确定性触发的 FS 竞态**（认领 rename 失败、主文件改名失败、读取 open 成功但 readAll 出错）→ §8 豁免或 chmod 手法尽力覆盖。
+- **认领 rename 失败 / 主文件改名失败**：由 **B13** 确定性触发（预建目标文件使 `QFile::rename` 拒绝覆盖），**不再豁免**；**读取 open 成功但 `readAll` 出错**（读中损坏）→ §8 豁免（无确定性手法）；**open 失败**可 `chmod 000`（非 root）尽力覆盖（能覆则不豁免）。
 
 ### 7.5 达成测算（先验估计，实测以 lcov 为准）
 
@@ -301,7 +304,7 @@ class UdpFileTransport : public QThread {
 **实测校准流程（达标以此为准）**：
 1. 先只编译+跑 **Part A** → `lcov --list` 记基线（预期 `udp_transport.cpp` 约 **45–50%**，因 socket 部分全红）；
 2. 再加 **Part B** 复测 → 应跃升至 **≥ 90%**；
-3. 若差临门一脚：用 §7.4「难触发 FS 竞态」+ HTML 报告定位具体红行 → **优先补 §6.2 的可选用例 B11/NeedAck**（B10/B12 已在必跑基线内），其次才按 §8 逐条豁免（**不得下调 90% 判据**）。
+3. 若差临门一脚：用 §7.4 的 FS 错误路径 + HTML 报告定位具体红行 → **优先补 §6.2 的可选用例 B11/NeedAck**（B10/B12/B13 已在必跑基线内），其次才按 §8 逐条豁免（**不得下调 90% 判据**）。
 
 ---
 
@@ -314,15 +317,15 @@ class UdpFileTransport : public QThread {
 | `isFilenameSafe` | `QDir::isAbsolutePath(name)` 的 `return false` 行 | 校验顺序为「空→`contains('/')`→`contains('\\')`→`isAbsolutePath`→`==".."`」；任何绝对路径（Unix `/…`、Win `C:\…`）必含 `/` 或 `\`，**先被前置 `contains` 拦截**，故此 `return false` 行经 `feed()` **不可达** | `// LCOV_EXCL_LINE` 于该 `return false` 行（备选：把 `isAbsolutePath` 检查**提前到 `contains` 之前**即可用 `feed("/abs")` 覆盖，但属生产改动，本计划不做） |
 | `feed` | `ds.status() != QDataStream::Ok` 的 `return {}` 行 | 前置已判 `datagram.size() < 18` 返回；能走到此处必 ≥18 字节，读取 18B 固定头不会流失败 → **不可达** | `// LCOV_EXCL_LINE` 于该 `return {}` 行 |
 | `extractTargetPeer` | `parts.isEmpty()` 的 `return {}` 行 | `QString::split("__")` **恒返回 ≥1 元素**（空串亦返回 `[""]`），故此判永假 → **不可达** | `// LCOV_EXCL_LINE` 于该 `return {}` 行 |
-| `pollOutbox` | ① 认领 `rename(.ready→.ready.sending)` 失败 `continue` | 需**并发认领竞态**才失败；单线程确定性测试无法稳定制造，且属 FS 竞态 | `LCOV_EXCL_LINE`（或尽力用 chmod 触发，能覆则不豁免） |
-| `pollOutbox` | ② 主文件 `rename(→.sending)` 失败分支 | 同上，罕见 FS 错误路径 | 同上 |
-| `pollOutbox` | ③ 读取失败块 `if (!readOk)`（**统一块**，同时含 open 失败 + `readAll` 后 `f.error()!=NoError`；非两条独立行） | open 失败/读中损坏均属 FS 竞态，无确定性手法 → 整块豁免；**备选**：认领后把主文件 `.sending` 换成不可读对象以覆盖 open-fail（能覆则不豁免） | `LCOV_EXCL_START/STOP` 包住该 `if (!readOk)` 块 |
+| `pollOutbox` | ③ 读取失败块 `if (!readOk)`（**统一块**，同时含 open 失败 + `readAll` 后 `f.error()!=NoError`；非两条独立行） | `readAll` **读中损坏**无确定性手法；**open 失败**可 `chmod 000`（非 root）把认领后的 `.sending` 主文件变不可读来触发——**能覆则不豁免**，否则整块属平台相关、收益低而豁免 | `LCOV_EXCL_START/STOP` 包住该 `if (!readOk)` 块（若已用 chmod 覆盖 open-fail，则仅豁免 `readAll` 损坏一路） |
+
+> **原豁免的两条 `pollOutbox` rename 失败分支已移出豁免**：认领 `rename(.ready→.ready.sending)` 失败、主文件 `rename(→.sending)` 失败——原判「需并发竞态、无法确定触发」**有误**。`QFile::rename` **拒绝覆盖已存在目标**，故单线程内**预建目标文件**即可确定性触发，现由 **B13** 覆盖（遵本节「有确定性手法即不得豁免」）。
 
 > **说明（对照实现）**：`fragmentMessage` 里的 `data.size() > UINT32_MAX` **在实现中已是纯注释、无 `if` 判定行**（见 `udp_transport.cpp` 内「不可达但保留语义」注释），故**本就不产生可执行行、不进分母、无需豁免**——不列入本表。
 >
-> **不豁免**：`run` 的 `waitForReadyRead` 返回 false 空转（每轮必经，B 系列自然覆盖）；以及任何有确定性触发手法（黑洞端口、只读 inbox、预占端口、坏包注入、255 字节文件名+`fragCount>65535`、不可路由名）的分支——**必须写用例覆盖，禁止用豁免凑数**。
+> **不豁免**：`run` 的 `waitForReadyRead` 返回 false 空转（每轮必经，B 系列自然覆盖）；以及任何有确定性触发手法（黑洞端口、只读 inbox、预占端口、坏包注入、**249 字节文件名+`fragCount>65535`（B7）**、**认领/主文件 rename 失败——预建目标文件使 `QFile::rename` 拒绝覆盖即可单线程触发（B13）**、不可路由名）的分支——**必须写用例覆盖，禁止用豁免凑数**。
 
-> 若最终仅靠豁免仍 < 90%，说明豁免过度或用例不足 → 回到 §6 补 B10/B11/B12/NeedAck 或用 chmod 覆盖 FS 竞态，**不得下调判据**。
+> 若最终仅靠豁免仍 < 90%，说明豁免过度或用例不足 → 回到 §6 补 **B11/NeedAck**（B10/B12/B13 已在达标基线内）或用 `chmod 000` 覆盖 open-fail，**不得下调判据**。
 
 ---
 
@@ -348,7 +351,7 @@ class UdpFileTransport : public QThread {
 | 单测编译(qmake) | 见实现计划 §7 的 tests 重生成 + `make -C tests/unit -f Makefile.tst_udp_reassembly` | 编译链接通过（含 network + moc） |
 | 单测运行 | `QT_QPA_PLATFORM=offscreen tests/unit/tst_udp_reassembly` | 全部 slot `PASS`；进程退出码 0 |
 | 组件用例(A) | 同上，`-run frag*,reasm*,peer*,set_max*,ctor*,extract*` | A1–A26 全绿；确定、亚秒级 |
-| 集成用例(B) | 同上，`-run e2e_*` | B1–B10 + B12 全绿（B11/NeedAck 可选）；含 giveUp 用例(~4s)；无线程泄漏 |
+| 集成用例(B) | 同上，`-run e2e_*` | B1–B10 + B12 + B13 全绿（B11/NeedAck 可选）；含 giveUp 用例(~4s)；无线程泄漏 |
 | **行覆盖率** | §2.3 lcov 流程 | `udp_transport.cpp` **Lines ≥ 90.0%**、Functions 100% |
 | 双构建(cmake) | `cmake --build build --target tst_udp_reassembly` + `QT_QPA_PLATFORM=offscreen build/tests/tst_udp_reassembly` | 编译+运行通过（AUTOMOC + Qt5::Network） |
 | 无回归 | `sync-suite --selftest`（800B）+ `sync-demo` | 加 friend 后 demo 行为不变、selftest 退出码 0（§11.5） |
@@ -369,7 +372,7 @@ class UdpFileTransport : public QThread {
 10. **clang-format 首提交重排**：提交测试代码时 pre-commit 会重排并中止首次 → 重新 `git add` 再 commit（实现计划 §5.1 同款）。
 11. **`offscreen` 足够**：单测不碰 SQLite/GUI，`QT_QPA_PLATFORM=offscreen` 即可，无需 QSQLITE session 插件。
 12. **B8 bind 失败的平台假设**：Linux/当前 CI 默认 bind 模式下，同 `LocalHost:P` 二次 bind 必失败；跨平台（如设 `ShareAddress`/`ReuseAddressHint`）不保证——文档限定本环境；若移植他处需另证 bind 失败可触发。
-13. **拆包失败用例（B7）不可用超长文件名**：Linux `NAME_MAX=255` 字节，文件名 UTF-8 >255 的工件在磁盘上根本创建不了 → 改用「255 字节文件名 + `setMaxTransmitBytes(274)` + 65536B 数据」使 `fragCount>65535` 触发 `ok=false`。
+13. **拆包失败用例（B7）不可用超长文件名**：Linux `NAME_MAX=255` 字节。① 文件名 UTF-8 >255 的工件在磁盘上根本创建不了；② 即便用 255 字节主文件名，其 sidecar `{name}.ready` 也达 **261 字节 > `NAME_MAX`**，`pollOutbox` 的 `*.ready` 扫不到 → 触发不了。**正确手法（与 §5.2/B7 完全一致）**：**单 peer 发送端** + **249 字节**主文件名（sidecar `.ready` = 255 = `NAME_MAX`，可建）+ `setMaxTransmitBytes(274)`（→ `M=274-18-249=7`）+ **458746B** 数据（`>65535×7=458745` → `fragCount=65536>65535`）触发 `ok=false`。**切勿**沿用旧稿的「255 字节文件名 + 65536B」——既建不出 sidecar，65536B 在 `M=7` 下也只有 9363 片、够不到阈值。
 
 ---
 
@@ -378,7 +381,7 @@ class UdpFileTransport : public QThread {
 - [ ] `tests/unit/tst_udp_reassembly.{cpp,pro}` 新增；`tests.pro`（两处）与 `tests/CMakeLists.txt`（含 Network + include + 覆盖率）登记完成。
 - [ ] `udp_transport.h` 加 `friend class TstUdpReassembly;`（**非限定名，切勿加 `::`**，见 §4.3；**必需**生产可测性改动；测试类须在全局命名空间且精确同名。或选 §4.3 零侵入备选并接受 A24/A25/A26 覆盖降级）。
 - [ ] Part A（A1–A26）全绿：组件①②③无 socket 分支全覆盖。
-- [ ] Part B（B1–B10 + B12 达标基线；B11/NeedAck 视覆盖率缺口可选补）全绿：ARQ 重传/giveUp、durable 落盘失败、路由/拆包失败、bind 失败、坏包丢弃、ACK msgId 不在 outbound、pollOutbox 边界均由**确定性手法**触发并断言。
+- [ ] Part B（B1–B10 + B12 + B13 达标基线；B11/NeedAck 视覆盖率缺口可选补）全绿：ARQ 重传/giveUp、durable 落盘失败、路由/**拆包失败（单 peer）**、bind 失败、坏包丢弃、ACK msgId 不在 outbound、pollOutbox 边界、**认领/主文件 rename 失败**均由**确定性手法**触发并断言。
 - [ ] `lcov --list` 报告 `udp_transport.cpp` **Lines ≥ 90.0%**、Functions 100%；§8 豁免逐条有理由与 `LCOV_EXCL` 标注。
 - [ ] qmake + cmake 双构建均能编译并运行该单测；`sync-suite --selftest`(800B) 与 `sync-demo` 无回归。
 - [ ] 分阶段提交（组件层 → 集成层 → 覆盖率接线各一 commit，信息含 Co-Authored-By；注意 pre-commit clang-format 首次重排 → 重新 `git add`）。

@@ -85,7 +85,7 @@ genhtml /tmp/cov_udp.info --output-directory /tmp/cov_html   # 可选:逐行红/
 
 ### 组件① `fragmentMessage`（自由函数，头文件可见）→ 全 A
 - 守卫：`fname>255`、`M<1`、`fragCount>65535`、空文件特判、正常单/多片、wire 头逐字段、totalSize 记录 → **A**
-- `data.size()>UINT32_MAX` → **X**（Qt5 `QByteArray::size()` 为 `int`，不可构造；§8 豁免）
+- `data.size()>UINT32_MAX`：实现中已是**纯注释、无可执行判定行**（Qt5 `QByteArray::size()` 为 `int`，不可构造）→ **不进分母、无需豁免**（见 §8 说明），既非 A 也非 X
 
 ### 组件② `FragmentReassembler`（类，头文件可见）+ 文件内 `static isFilenameSafe` → 全 A
 - `feed()` §4.4 六校验（长度<18 / magic / type / fragCount==0 / fragIdx≥fragCount / 文件名长度越界 / 文件名不安全）、短表命中→NeedAck、新建 pending、元数据不一致→丢弃、重复片不刷新进度、未 complete、总长校验失败→损坏、成功→Completed → **A**
@@ -178,7 +178,7 @@ class UdpFileTransport : public QThread {
 | **RTO 重传 + giveUp → `.failed`** | 只起发送端，**对端端口无接收者（黑洞）**或起一个「只收不回 ACK 的哑 `QUdpSocket`」；发送端首发后每 `RTO=500ms` 重发，`maxRetries=5` 后 giveUp → 断言 outbox 出 `.failed`；哑 socket 计 DATA 到达数 == **1+5=6**（实证重传次数） |
 | **durable 落盘失败 → 不 ACK → 持续重传** | 令接收端 `inboxDir_` **本身是一个已存在的普通文件**（非目录）：`mkpath` 失败、目标路径父级非目录 → `QFile::open(WriteOnly)` 失败。**不用**「inbox 目录下预放同名文件」（会被 `WriteOnly` 截断并**成功**）；`chmod 0500` 只读目录仅作备选。断言接收端 inbox 侧**无 `.ready` 产出**、发送端最终 `.failed`（B5） |
 | **不可路由 → `.failed`** | 多 peer 发送端；放一个文件名不符合任何命名契约（`extractTargetPeer` 返回空）或 peer 未登记的工件；断言直接 `.failed`（不发送）（B6） |
-| **拆包失败 → `.failed`** | **可落地手法（须单 peer 发送端**，使 `extractTargetPeer` 不介入、避免先走「不可路由」分支截获**）**：主文件名 UTF-8 **249 字节**（使 sidecar `{name}.ready` = 249+6 = **255** 正好 `NAME_MAX`，能建出）+ `setMaxTransmitBytes(274)`（→ `M=274-18-249=7`）+ 数据 **458746B**（`>65535×7`）→ `fragCount>65535` → `ok=false`。**不用**「文件名 255 字节」（`.ready` 会达 261 > `NAME_MAX`，sidecar 建不出、`pollOutbox` 扫不到）。断言 `.failed`、无 DATA 发出（B7） |
+| **拆包失败 → `.failed`** | **可落地手法（须单 peer 发送端**，使 `extractTargetPeer` 不介入、避免先走「不可路由」分支截获**）**：主文件名 UTF-8 **241 字节**（**关键**：认领会 `rename(.ready→.ready.sending)`，最长中间名约束 `{name}.ready.sending = name+14 ≤ 255` → `name ≤ 241`；取 241 时 `.ready.sending` 恰 = **255** = `NAME_MAX`，可建且可 rename）+ `setMaxTransmitBytes(274)`（→ `M=274-18-241=15`）+ 数据 **983026B**（`>65535×15=983025`）→ `fragCount=65536>65535` → `ok=false`。**不用** 249/255 字节文件名（其 `.ready.sending` 达 263/269 > `NAME_MAX`，**认领 rename 先失败**、根本到不了拆包）。断言 `.failed`、无 DATA 发出（B7） |
 | **bind 失败 → 线程即退** | 先用独立 `QUdpSocket` 预占端口 P（`LocalHost:P`），再 `start()` 一个 bind 到同址的 transport；断言其 `wait(1500)` 返回 true。**平台假设**：Linux/当前 CI 默认 bind 模式（跨平台不保证，见 §11.12）（B8） |
 | **坏包丢弃不崩溃** | 向接收端端口手工发：①`<5B` 短包 ②错 magic ③`type=0x03` 未知 ④`type=0x02` 但长度≠9 的坏 ACK；断言接收端存活、inbox 无产出、后续正常工件仍能送达（B9） |
 | **ACK msgId 不在 outbound** | 向发送端发一个 magic/type 正确、9B、但 `msgId` 不匹配任何在途消息的 ACK；断言被忽略、在途工件不受影响（B10） |
@@ -250,10 +250,10 @@ class UdpFileTransport : public QThread {
 | B1 | `e2e_happy_single` | A→B 单片工件端到端 | `QTRY`：outbox 出 `.sent`；B inbox 出工件+`.ready`；无 `.failed` | run(): bind ok / 收 DATA→Completed→写盘 ok→markDelivered→sendAck / 收 ACK→端点匹配→`.sent`；pollOutbox 全 happy；sendAck |
 | B2 | `e2e_happy_multifrag_800` | A→B，`setMaxTransmitBytes(800)`，工件 2KB 随机 | `QTRY`：`.sent`；B inbox 字节 == 原文（多片重组正确） | 同 B1 + fragmentMessage 多片 + 接收端多片 assemble |
 | B3 | `e2e_multipeer_routing` | 多 peer 中心，两个不同目标工件 | 各工件被投到对应端口的接收者 inbox（证 `extractTargetPeer` 端到端路由）；均 `.sent` | pollOutbox 多 peer 路由(7.2) |
-| B4 | `e2e_giveup_no_ack` | 只起发送端；对端为「只收不回 ACK 的哑 `QUdpSocket`」。**工件必须是单片小文件**（如 100B，默认 60000B 上限下 fragCount=1） | `QTRY(≈4s)`：outbox 出 `.failed`；哑 socket 累计收到 **6** 个 DATA（首发1+重传5）。**注**：断言 `6` 仅对单片成立——多片时每轮重发所有分片，总数=`fragCount×6`，故本用例锁定单片 | run(): RTO 重传(9.2) + giveUp(9.3) |
+| B4 | `e2e_giveup_no_ack` | 只起发送端；对端为「只收不回 ACK 的哑 `QUdpSocket`」。**工件必须是单片小文件**（如 100B，默认 60000B 上限下 fragCount=1） | `QTRY(≥4500ms)`（对齐 §11.7；实际 giveUp ≈ 3.0–3.5s，超时留余量）：outbox 出 `.failed`；哑 socket 累计收到 **6** 个 DATA（首发1+重传5）。**注**：断言 `6` 仅对单片成立——多片时每轮重发所有分片，总数=`fragCount×6`，故本用例锁定单片 | run(): RTO 重传(9.2) + giveUp(9.3) |
 | B5 | `e2e_durable_write_fail` | 让接收端 `inboxDir_` **本身是一个已存在的普通文件**（非目录）：则 `mkpath` 失败、`QDir(inboxDir_).filePath(fn)` 的父路径不是目录 → `QFile::open(WriteOnly)` 失败。**不用**「inbox 目录下预放同名文件」（那会被 `WriteOnly` 截断并**成功**，触发不了失败）；`chmod 0500` 只读目录作**备选**（受 root/FS 影响不稳） | 接收端**无 `.ready`** 产出；发送端最终 `.failed`（不 ACK→重传→giveUp） | run(): 落盘 `writeOk=false`→不 ACK(6.3) |
 | B6 | `e2e_unroutable_failed` | 多 peer；工件名不可解析或 peer 未登记 | `QTRY`：直接 `.failed`；对端无任何 DATA 到达 | pollOutbox 不可路由→`.failed`(7.3) |
-| B7 | `e2e_fragment_fail_failed` | **须用单 peer 发送端**（`peers_.size()==1`，跳过 `extractTargetPeer`，避免先走「不可路由→`.failed`」而覆盖不到拆包失败）。**可落地触发拆包失败**：主文件名 UTF-8 **249 字节**（则 sidecar `{name}.ready` = 249+6 = **255** = `NAME_MAX`，可创建；主文件本身 249B 亦 ≤ 255）+ 发送端 `setMaxTransmitBytes(274)`（→ `M=274-18-249=7`）+ 工件数据 **458746B**（`>65535×7=458745`）→ `fragCount=65536>65535` → `fragmentMessage` `ok=false`。**不用**「文件名 255 字节」——`{name}.ready` 会达 **261 字节 > `NAME_MAX`**，sidecar 根本建不出、`pollOutbox` 的 `*.ready` 扫不到，触发不了 | `QTRY`：`.failed`；对端无 DATA | pollOutbox 拆包失败→`.failed`(8.2) |
+| B7 | `e2e_fragment_fail_failed` | **须用单 peer 发送端**（`peers_.size()==1`，跳过 `extractTargetPeer`，避免先走「不可路由→`.failed`」而覆盖不到拆包失败）。**可落地触发拆包失败**：主文件名 UTF-8 **241 字节**（**关键约束**：认领会 `rename(.ready→.ready.sending)`，最长中间名 `{name}.ready.sending = name+14 ≤ 255` → `name ≤ 241`；241 时 `.ready.sending` 恰 = **255** = `NAME_MAX`，可创建且可 rename；主文件、`{name}.sending`、`{name}.ready` 亦均 ≤ 255）+ 发送端 `setMaxTransmitBytes(274)`（→ `M=274-18-241=15`）+ 工件数据 **983026B**（`>65535×15=983025`）→ `fragCount=65536>65535` → `fragmentMessage` `ok=false`。**不用** 249/255 字节文件名——其 `.ready.sending` 达 **263/269 字节 > `NAME_MAX`**，`pollOutbox` 认领 `rename` 直接失败走 `continue`、根本到不了拆包 | `QTRY`：`.failed`；对端无 DATA | pollOutbox 拆包失败→`.failed`(8.2) |
 | B8 | `e2e_bind_fail_thread_exits` | 预占端口 P（独立 `QUdpSocket` bind `LocalHost:P`），再起 bind 到同 `LocalHost:P` 的 transport。**平台假设**：Linux/当前 CI 下默认 bind 模式，同址同端口二次 bind 必失败（跨平台不保证，文档限定本环境） | 其 `wait(1500)`==true（线程速退）；放入的工件不被发出 | run(): bind 失败→return(1.2) |
 | B9 | `e2e_garbage_datagrams` | 向接收端发 4 类坏包（短/错 magic/未知 type/坏长 ACK），随后发 1 个正常工件 | 接收端存活；坏包无 inbox 产出；正常工件仍 `.sent`+inbox（证丢弃分支不影响后续） | run(): dg<5 / magic / 未知 type / ACK 长度≠9 丢弃(4.1/5.1/7.7/7.2) |
 | B10 | `e2e_ack_msgid_not_in_outbound` | 向**发送端**发一个格式合法但 `msgId` 不在其 outbound 的 ACK（9B，magic/type 正确） | 发送端存活、忽略该 ACK（`!outbound.contains` 分支）；在途工件不受影响 | run(): ACK `msgId` 不在 outbound→continue |
@@ -268,7 +268,7 @@ class UdpFileTransport : public QThread {
 ## 7. 覆盖率达成论证（源分支 → 用例映射 + 测算）
 
 ### 7.1 组件① `fragmentMessage`（≈40 行）
-- 守卫三分支：A3/A4/A5；空文件：A1；正常单/多片 + M/M+1 边界：A1；wire 头：A2；多片 payload 切分与 append：A1/A2/B2。→ **除 `UINT32_MAX`(X) 外全覆盖**。
+- 守卫三分支：A3/A4/A5；空文件：A1；正常单/多片 + M/M+1 边界：A1；wire 头：A2；多片 payload 切分与 append：A1/A2/B2。→ **除 `UINT32_MAX`（纯注释、无可执行行，见 §8）外全覆盖**。
 
 ### 7.2 组件② `FragmentReassembler` + `isFilenameSafe`（≈110 行）
 - `feed` 六校验：A8/A9/A10/A11/A12/A13；短表命中：A17/A18；新建/一致/不一致：A6/A14；重复片不刷进度：A7/A20；未 complete：A16；成功 + assemble：A6/A7；总长失败：A15。
@@ -296,8 +296,8 @@ class UdpFileTransport : public QThread {
 ```
 
 - **A 覆盖**：组件①（除 UINT32_MAX 注释，无可执行判定）+ ②（除 `isAbsolutePath` 行豁免）+ ③无socket 全部 → 近乎全覆盖其所辖行。
-- **B 覆盖**：③socket 除「§8 的 3 类 FS 竞态豁免行」外全部（含 B10/B12 补的 edge case、B4/B5 的 ARQ 路径）。
-- **残留红行 `U`**：把 §6.2 全部 B 用例（含 B10/B12）写全后，`U` 应趋近 0——非豁免行几乎都有用例命中。
+- **B 覆盖**：③socket 除「§8 豁免的读失败块 `if(!readOk)`」外全部（含 B10/B12/B13 的 edge case、B4/B5 的 ARQ 路径）。
+- **残留红行 `U`**：把 §6.2 全部 B 用例（含 B10/B12/B13）写全后，`U` 应趋近 0——非豁免行几乎都有用例命中。
 
 故先验判断 **行覆盖率 ≥ 90%**（分子恒 ≤ 分母，无逻辑矛盾）。
 
@@ -323,7 +323,7 @@ class UdpFileTransport : public QThread {
 
 > **说明（对照实现）**：`fragmentMessage` 里的 `data.size() > UINT32_MAX` **在实现中已是纯注释、无 `if` 判定行**（见 `udp_transport.cpp` 内「不可达但保留语义」注释），故**本就不产生可执行行、不进分母、无需豁免**——不列入本表。
 >
-> **不豁免**：`run` 的 `waitForReadyRead` 返回 false 空转（每轮必经，B 系列自然覆盖）；以及任何有确定性触发手法（黑洞端口、只读 inbox、预占端口、坏包注入、**249 字节文件名+`fragCount>65535`（B7）**、**认领/主文件 rename 失败——预建目标文件使 `QFile::rename` 拒绝覆盖即可单线程触发（B13）**、不可路由名）的分支——**必须写用例覆盖，禁止用豁免凑数**。
+> **不豁免**：`run` 的 `waitForReadyRead` 返回 false 空转（每轮必经，B 系列自然覆盖）；以及任何有确定性触发手法（黑洞端口、只读 inbox、预占端口、坏包注入、**241 字节文件名+`fragCount>65535`（B7）**、**认领/主文件 rename 失败——预建目标文件使 `QFile::rename` 拒绝覆盖即可单线程触发（B13）**、不可路由名）的分支——**必须写用例覆盖，禁止用豁免凑数**。
 
 > 若最终仅靠豁免仍 < 90%，说明豁免过度或用例不足 → 回到 §6 补 **B11/NeedAck**（B10/B12/B13 已在达标基线内）或用 `chmod 000` 覆盖 open-fail，**不得下调判据**。
 
@@ -372,7 +372,7 @@ class UdpFileTransport : public QThread {
 10. **clang-format 首提交重排**：提交测试代码时 pre-commit 会重排并中止首次 → 重新 `git add` 再 commit（实现计划 §5.1 同款）。
 11. **`offscreen` 足够**：单测不碰 SQLite/GUI，`QT_QPA_PLATFORM=offscreen` 即可，无需 QSQLITE session 插件。
 12. **B8 bind 失败的平台假设**：Linux/当前 CI 默认 bind 模式下，同 `LocalHost:P` 二次 bind 必失败；跨平台（如设 `ShareAddress`/`ReuseAddressHint`）不保证——文档限定本环境；若移植他处需另证 bind 失败可触发。
-13. **拆包失败用例（B7）不可用超长文件名**：Linux `NAME_MAX=255` 字节。① 文件名 UTF-8 >255 的工件在磁盘上根本创建不了；② 即便用 255 字节主文件名，其 sidecar `{name}.ready` 也达 **261 字节 > `NAME_MAX`**，`pollOutbox` 的 `*.ready` 扫不到 → 触发不了。**正确手法（与 §5.2/B7 完全一致）**：**单 peer 发送端** + **249 字节**主文件名（sidecar `.ready` = 255 = `NAME_MAX`，可建）+ `setMaxTransmitBytes(274)`（→ `M=274-18-249=7`）+ **458746B** 数据（`>65535×7=458745` → `fragCount=65536>65535`）触发 `ok=false`。**切勿**沿用旧稿的「255 字节文件名 + 65536B」——既建不出 sidecar，65536B 在 `M=7` 下也只有 9363 片、够不到阈值。
+13. **拆包失败用例（B7）的文件名长度须为「`.ready.sending` 留位」**：Linux `NAME_MAX=255` 字节，且 `pollOutbox` 认领会把 `{name}.ready` 先 `rename` 成 `{name}.ready.sending`。故真正约束**不是**「`{name}.ready` ≤ 255」，而是**最长中间名** `{name}.ready.sending = name + 14 ≤ 255` → **`name ≤ 241`**。用 249（甚至 255）字节文件名时 `.ready.sending` 达 **263（269）字节 > `NAME_MAX`**，**认领 `rename` 直接失败走 `continue`**，根本到不了拆包、`.failed` 断言不成立。**正确手法（与 §5.2/B7 完全一致）**：**单 peer 发送端** + **241 字节**主文件名（`.ready.sending` 恰 = 255 = `NAME_MAX`，可创建/可 rename）+ `setMaxTransmitBytes(274)`（→ `M=274-18-241=15`）+ **983026B** 数据（`>65535×15=983025` → `fragCount=65536>65535`）触发 `ok=false`。**切勿**沿用旧稿的「255/249 字节文件名」或「65536B 数据」——前者认领 rename 先失败到不了拆包；后者在 `M=15` 下仅 `ceil(65536/15)=4370` 片、够不到 `65535` 阈值（数据量须按 `>65535×M` 精确取，本例即 983026B）。
 
 ---
 

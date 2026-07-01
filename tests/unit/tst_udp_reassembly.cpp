@@ -3,6 +3,7 @@
 // Part B: socket 集成单测 (B1–B13)
 // 覆盖率目标：udp_transport.cpp 行覆盖率 ≥ 90%
 
+#include <QDataStream>
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFile>

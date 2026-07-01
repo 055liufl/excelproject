@@ -140,6 +140,9 @@ static int runSelfTest(const QString& ws) {
     // —— 场景2：比对会话 diff → 列级 stage → save 写回，校验 B 库更新 ——
     std::cout << "\n[selftest] 场景2：类 Beyond Compare 比对与列级同步 ...\n";
     Scenario2Model model(ws + QStringLiteral("/scenario2"));
+    // 把 UDP 快照往返的「请求→响应→比对」时序打到控制台（GUI 走日志区，此处走 stdout）。
+    model.setLogSink(
+        [](const QString& line) { std::cout << "  [场景2] " << line.toStdString() << "\n"; });
     QString err;
     bool s2ok = model.setup(&err);
     if (!s2ok) {

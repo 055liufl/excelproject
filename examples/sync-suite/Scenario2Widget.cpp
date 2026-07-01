@@ -2,10 +2,12 @@
 
 #include <QBrush>
 #include <QColor>
+#include <QDateTime>
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QLabel>
 #include <QMessageBox>
+#include <QPlainTextEdit>
 #include <QPushButton>
 #include <QTableWidget>
 #include <QTableWidgetItem>
@@ -59,7 +61,20 @@ Scenario2Widget::Scenario2Widget(const QString& ws, QWidget* parent)
     tableList_->verticalHeader()->setVisible(false);
     connect(tableList_, &QTableWidget::cellDoubleClicked, this,
             &Scenario2Widget::onRowDoubleClicked);
-    root->addWidget(tableList_, 1);
+    root->addWidget(tableList_, 3);
+
+    // —— UDP 快照往返时序日志区 ——
+    // 播报「子节点B 请求 → 中心A 读库回传 → 子节点B 比对」这条真实 UDP 往返（对应设计诉求）。
+    auto* logLabel = new QLabel(
+        QStringLiteral("UDP 快照往返日志（子节点B 请求 → 中心A 回传 → 差异比对）："), this);
+    root->addWidget(logLabel);
+    logView_ = new QPlainTextEdit(this);
+    logView_->setReadOnly(true);
+    logView_->setMaximumBlockCount(500);  // 限制行数，避免长期运行内存膨胀
+    logView_->setStyleSheet(
+        QStringLiteral("background:#1e1e1e;color:#dcdcdc;"
+                       "font-family:monospace;font-size:12px;"));
+    root->addWidget(logView_, 2);
 
     // —— 操作条 ——
     auto* bar = new QHBoxLayout();
@@ -83,6 +98,9 @@ Scenario2Widget::Scenario2Widget(const QString& ws, QWidget* parent)
     root->addLayout(bar);
 
     // —— 初始化 model ——
+    // 先接上日志接收器（务必在 setup 之前——首次比对的 UDP 往返就在 setup 里发生）。
+    model_->setLogSink([this](const QString& line) { appendLog(line); });
+    appendLog(QStringLiteral("【初始化】建立比对会话（首次向中心A 拉取快照）"));
     QString err;
     ready_ = model_->setup(&err);
     if (!ready_) {
@@ -93,6 +111,14 @@ Scenario2Widget::Scenario2Widget(const QString& ws, QWidget* parent)
             QStringLiteral("<br/><span style='color:#c62828'>初始化失败：%1</span>").arg(err));
     }
     refreshTable();
+}
+
+// appendLog —— 向底部日志区追加一行（带时间戳），播报 UDP 快照往返时序。
+void Scenario2Widget::appendLog(const QString& line) {
+    if (!logView_)
+        return;
+    const QString ts = QDateTime::currentDateTime().toString(QStringLiteral("HH:mm:ss.zzz"));
+    logView_->appendPlainText(QStringLiteral("[%1] %2").arg(ts, line));
 }
 
 // refreshTable —— 依据 model_ 的最新差异重绘清单与按钮态（每次决策/保存/重置后都会调）。
@@ -168,6 +194,7 @@ void Scenario2Widget::onSave() {
     if (!ready_)
         return;
     const int pending = model_->pendingCount();
+    appendLog(QStringLiteral("【保存】写回 B 库后重新向中心A 拉取快照并比对…"));
     QString err;
     if (!model_->save(&err)) {
         QMessageBox::critical(this, QStringLiteral("保存失败"),
@@ -186,6 +213,7 @@ void Scenario2Widget::onSave() {
 void Scenario2Widget::onCancel() {
     if (!ready_)
         return;
+    appendLog(QStringLiteral("【取消】放弃内存暂存后重新向中心A 拉取快照并比对…"));
     model_->discard();
     refreshTable();
 }
@@ -193,6 +221,7 @@ void Scenario2Widget::onCancel() {
 // onReset —— 「重置演示数据」按钮：reseed 把 A/B 两库恢复到初始差异态，便于反复演示。
 // reseed 内部即整套 setup 重跑，成功后更新 ready_ 并刷新清单；失败弹错框。
 void Scenario2Widget::onReset() {
+    appendLog(QStringLiteral("【重置演示数据】重建两库并重新向中心A 拉取快照…"));
     QString err;
     ready_ = model_->reseed(&err);
     if (!ready_) {

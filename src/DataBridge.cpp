@@ -319,6 +319,72 @@ QString DataBridge::generateAutoProfileJson(const QString& table, QString* err) 
     return d_->autoBuilder_.toJson(spec);  // ProfileSpec → JSON 文本
 }
 
+// ── schema 发现（对外公共接口，见 DataBridge.h / SchemaInfo.h）─────────────────
+
+// userTables —— 列出当前库的「用户表」（排除 sqlite_% 与 __sync_% 元数据表）。
+//   实现：仿 snapshotCatalog——要求已打开 → 刷新 catalog_ → 取 allTables() 过滤前缀 → 升序。
+//   排除口径与同步子系统 SchemaEligibility::expandSyncTables 一致（sqlite_ 内建 / __sync_
+//   元数据）。
+QStringList DataBridge::userTables(QString* err) {
+    if (!d_->dbOpen_) {
+        if (err)
+            *err = QStringLiteral("Database not open");
+        return {};
+    }
+    QString schErr;
+    if (!d_->refreshCatalog(&schErr)) {  // 对齐当前真实结构（可能被外部 DDL 改过）
+        if (err)
+            *err = QStringLiteral("Schema refresh failed: ") + schErr;
+        return {};
+    }
+    QStringList out;
+    for (const QString& t : d_->catalog_.allTables()) {
+        // 排除 SQLite 内建表与本库同步子系统的元数据表——它们不是业务「用户表」。
+        if (t.startsWith(QStringLiteral("sqlite_")) || t.startsWith(QStringLiteral("__sync_")))
+            continue;
+        out.append(t);
+    }
+    out.sort();  // 确定序：便于展示与两端比对对齐（allTables 本身次序不保证）
+    return out;
+}
+
+// describeTable —— 取某表的列/主键结构（列按建表列序），映射内部 ColumnInfo → 公共 ColumnDef。
+//   实现：要求已打开 → 刷新 catalog_ → 查该表 TableInfo → 逐列拷贝调用方关心的字段。
+bool DataBridge::describeTable(const QString& table, TableSchema* out, QString* err) {
+    if (!d_->dbOpen_) {
+        if (err)
+            *err = QStringLiteral("Database not open");
+        return false;
+    }
+    QString schErr;
+    if (!d_->refreshCatalog(&schErr)) {
+        if (err)
+            *err = QStringLiteral("Schema refresh failed: ") + schErr;
+        return false;
+    }
+    const detail::TableInfo* ti = d_->catalog_.table(table);
+    if (!ti) {  // 表不存在 → 明确报 E_PROFILE_TABLE_NOT_FOUND（与 generateAutoProfileJson 同码）
+        if (err)
+            *err =
+                QString::fromLatin1(err::E_PROFILE_TABLE_NOT_FOUND) + QStringLiteral(": ") + table;
+        return false;
+    }
+    if (out) {
+        out->table = ti->name;
+        out->columns.clear();
+        for (const detail::ColumnInfo& c : ti->columns) {  // 按 cid 自然序，即建表列序
+            ColumnDef cd;
+            cd.name = c.name;
+            cd.declaredType = c.declaredType;
+            cd.notNull = c.notNull;
+            cd.primaryKey = c.primaryKey;
+            cd.pkOrder = c.pkOrder;
+            out->columns.append(cd);
+        }
+    }
+    return true;
+}
+
 // setSyncActive —— 切换「同步活动」标志，供 importExcel() 的直写门控判断（J-09）。
 //   线程内存序关键点（见 DataBridge.h 注释）：先写普通成员 syncTables_，「最后」才写
 //   atomic 的 syncActive_。这样任何线程一旦读到 syncActive_==true，就保证已能看到对应的

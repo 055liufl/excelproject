@@ -17,6 +17,7 @@ endfunction()
 
 add_dbridge_test(tst_profile_loader unit/tst_profile_loader.cpp)
 add_dbridge_test(tst_schema_introspector unit/tst_schema_introspector.cpp)
+add_dbridge_test(tst_databridge_schema unit/tst_databridge_schema.cpp)
 add_dbridge_test(tst_validator_chain unit/tst_validator_chain.cpp)
 add_dbridge_test(tst_sql_builder unit/tst_sql_builder.cpp)
 add_dbridge_test(tst_topo_sorter unit/tst_topo_sorter.cpp)

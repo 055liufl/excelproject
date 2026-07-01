@@ -32,8 +32,14 @@
 #include <QStringList>
 #include <QVariantMap>
 
+#include <functional>
 #include <memory>
 #include <optional>
+
+// 传输/响应线程（完整定义在 .cpp 里 #include；此处前置声明即可，因成员为 unique_ptr 且析构在
+// .cpp）。
+class UdpFileTransport;  // 复用场景1 的 UDP 文件传输层（../sync-demo/udp_transport.h）
+class CenterSnapshotResponder;  // 中心A 快照响应线程（Scenario2SnapshotService.h）
 
 class Scenario2Model {
    public:
@@ -73,10 +79,11 @@ class Scenario2Model {
     QList<dbridge::sync::RowDiff> rowDiffs(const QString& table) const;
 
     // 该表的列顺序（用于双栏展示；取自 B 库 schema，A 与之同构）。
-    QStringList columns(const QString& table) const;
+    // 非 const：内部经 dbridge DataBridge::describeTable() 取结构（会刷新 schema catalog）。
+    QStringList columns(const QString& table);
 
-    // 该表主键列名。
-    QString pkColumn(const QString& table) const;
+    // 该表主键列名。非 const，原因同上。
+    QString pkColumn(const QString& table);
 
     // ── 合并决策（暂存到内存，不落库）──────────────────────────────────────
     // 采用中心A 的整行（acceptRemote）。
@@ -101,10 +108,6 @@ class Scenario2Model {
     // 放弃暂存，重建会话。
     void discard();
 
-    // 读取某库某表的全部行（B 用于左栏展示，A 用于右栏/远端快照）。
-    QList<QVariantMap> centerRows(const QString& table) const;  // 中心A（远端）
-    QList<QVariantMap> childRows(const QString& table) const;   // 子节点B（本地）
-
     QString centerDbPath() const {
         return centerDb_;
     }
@@ -115,22 +118,37 @@ class Scenario2Model {
     // headless 自检：制造一次列级 + 整行的「采用A」并 save，校验 B 库被正确写回。
     bool runHeadlessSelfTest(QString* err);
 
+    // 设置日志接收器：把 UDP 快照往返的「请求→响应→比对」时序播报给调用方（GUI 日志区 / 控制台）。
+    //   仅在建立 Scenario2Model 的线程（主线程）上被调用，故实现可直接更新 GUI。
+    void setLogSink(std::function<void(const QString&)> sink) {
+        logSink_ = std::move(sink);
+    }
+
    private:
+    // 便捷：向日志接收器播报一行（未设置则忽略）。
+    void log(const QString& line) const {
+        if (logSink_)
+            logSink_(line);
+    }
+
     // 行键 / 单元键的内部编码（QSet 用）。
     static QString rowKey(const QString& table, const QString& pk);
     static QString cellKey(const QString& table, const QString& pk, const QString& column);
 
-    // 从 center_A 读全库，构造 RemoteTableSnapshot 列表。
-    QList<dbridge::sync::RemoteTableSnapshot> buildRemoteSnapshots(QString* err) const;
+    // 经 UDP 向中心A 请求整库快照（写请求工件→等响应工件→反序列化）。需求 #2 的核心：
+    //   B 不再直读 center_A.db，而是走 UdpFileTransport 与 A 的 CenterSnapshotResponder 往返。
+    bool fetchRemoteSnapshotsOverUdp(QList<dbridge::sync::RemoteTableSnapshot>* out, QString* err);
+
+    // 启停场景2 的 UDP 快照通道（A/B 各一个单-peer 传输 + A 的快照响应线程）。
+    bool startSnapshotChannel(QString* err);
+    void stopSnapshotChannel();
 
     // 在指定库路径上建表 + 灌入 seed 数据（direct SQL）。
     bool seedDatabases(QString* err);
 
-    // 读取任意库某表所有行（独立连接）。
+    // 读取任意库某表所有行（独立连接；供 selftest 校验 B 库写回用）。
     static QList<QVariantMap> readRows(const QString& dbPath, const QString& table);
-    // 读取任意库某表列顺序。
-    static QStringList readColumns(const QString& dbPath, const QString& table);
-    // 读取任意库某表主键列。
+    // 读取任意库某表主键列（readRows 内部按主键排序用）。
     static QString readPkColumn(const QString& dbPath, const QString& table);
 
     QString ws_;
@@ -144,6 +162,15 @@ class Scenario2Model {
     // SyncConfig 的默认构造为私有，且本类在构造时尚无配置 → 用 optional 延迟构造。
     std::optional<dbridge::sync::SyncConfig> cfg_;
     bool engineReady_ = false;
+
+    // ── UDP 快照通道（需求 #2）──────────────────────────────────────────────────
+    // 两节点单-peer loopback：B(child) ⇄ A(center)。responder 常驻 A 侧应答快照请求。
+    std::unique_ptr<UdpFileTransport> childTransport_;    // B 侧传输：outbox→A、A→inbox
+    std::unique_ptr<UdpFileTransport> centerTransport_;   // A 侧传输：outbox→B、B→inbox
+    std::unique_ptr<CenterSnapshotResponder> responder_;  // A 侧快照响应线程
+
+    // UDP 快照往返的时序日志接收器（GUI 日志区 / selftest 控制台；未设置则静默）。
+    std::function<void(const QString&)> logSink_;
 
     // 暂存追踪（用于界面高亮 + pendingCount；比对会话本身不暴露"已暂存了哪些"）。
     QSet<QString> stagedRows_;   // "tablepk"

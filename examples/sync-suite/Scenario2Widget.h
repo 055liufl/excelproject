@@ -16,6 +16,7 @@
 class QTableWidget;
 class QLabel;
 class QPushButton;
+class QPlainTextEdit;
 
 class Scenario2Widget : public QWidget {
     Q_OBJECT
@@ -30,6 +31,7 @@ class Scenario2Widget : public QWidget {
 
    private:
     void refreshTable();  // 依据 model_ 的最新差异刷新清单与按钮状态
+    void appendLog(const QString& line);  // 向底部日志区追加一行（UDP 快照往返时序）
 
     QString ws_;
     std::unique_ptr<Scenario2Model> model_;
@@ -40,4 +42,5 @@ class Scenario2Widget : public QWidget {
     QPushButton* btnSave_ = nullptr;
     QPushButton* btnCancel_ = nullptr;
     QPushButton* btnReset_ = nullptr;
+    QPlainTextEdit* logView_ = nullptr;  // 「请求→响应→比对」时序日志区
 };

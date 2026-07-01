@@ -1,8 +1,10 @@
 #pragma once
 #include "dbridge/Export.h"
+#include "dbridge/SchemaInfo.h"
 #include "dbridge/Types.h"
 
 #include <QSqlDatabase>
+#include <QStringList>
 
 #include <memory>
 
@@ -88,6 +90,21 @@ class DBRIDGE_EXPORT DataBridge {
     //   用法：返回的字符串可保存到文件，或修改后再喂给 loadProfileFromString。
     //   返回：成功返回 JSON 文本；失败返回空串并置 *err（库未打开 / 表不存在 / 无主键等）。
     QString generateAutoProfileJson(const QString& table, QString* err = nullptr);
+
+    // ── schema 发现（表清单 / 表结构）───────────────────────────────────────────
+    // 这两个方法把库内部的 schema 自省结果以「公共值类型」（见 SchemaInfo.h）暴露给调用方，
+    // 使其无需自行编写 PRAGMA / sqlite_master 查询即可动态发现「库里有哪些表、每表的列与主键」。
+    // 二者都会先刷新一次内部 schema 目录（对齐当前真实结构），故要求库已 open()。
+
+    // userTables —— 列出当前库中的「用户表」，即排除 SQLite 内建表（sqlite_%）与本库同步
+    //   子系统的元数据表（__sync_%）后的全部基表，按表名升序返回（确定序，便于展示/比对）。
+    //   返回：表名列表；库未打开或自省失败时返回空列表并置 *err（若非空）。
+    QStringList userTables(QString* err = nullptr);
+
+    // describeTable —— 取某张表的列/主键结构（列按建表列序，含主键标记与复合主键次序）。
+    //   参数：table 表名；out 出参，成功时被填为该表的 TableSchema；err 出参（可空）。
+    //   返回：成功 true；库未打开 / 自省失败 / 表不存在 → false 并置 *err。
+    bool describeTable(const QString& table, TableSchema* out, QString* err = nullptr);
 
     // importExcel —— 【同步阻塞】按已载入的 Profile 把一张 .xlsx 导入数据库。
     //   流程：读 Excel→按路由展开成多表载荷→校验/类型转换/外键查找→UPSERT 写库。

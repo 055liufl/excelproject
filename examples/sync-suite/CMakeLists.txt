@@ -14,6 +14,7 @@ add_executable(
   Scenario1Widget.cpp
   Scenario2Model.cpp
   Scenario2Widget.cpp
+  Scenario2SnapshotService.cpp
   CompareDetailDialog.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/../sync-demo/udp_transport.cpp)
 

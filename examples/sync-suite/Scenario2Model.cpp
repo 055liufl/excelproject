@@ -1,17 +1,62 @@
 #include "Scenario2Model.h"
 
+#include "dbridge/SchemaInfo.h"
 #include "dbridge/Types.h"
 
+#include <QDateTime>
 #include <QDir>
 #include <QFile>
+#include <QHostAddress>
 #include <QSqlDatabase>
 #include <QSqlError>
 #include <QSqlQuery>
 #include <QSqlRecord>
+#include <QThread>
 #include <QUuid>
+
+#include "Scenario2SnapshotService.h"  // 快照编解码 + CenterSnapshotResponder
+#include "udp_transport.h"             // 复用场景1 的 UDP 文件传输层
 
 using namespace dbridge;
 using namespace dbridge::sync;
+
+// ── 两类 UDP 数据的严格区分（重要设计约束）──────────────────────────────────
+//
+// 本 demo 里经 UDP 流动的数据有两类，必须在每一层都能区分、互不干扰：
+//
+//   ① 数据库同步数据（SyncEngine 的 changeset/baseline/ack 等变更集工件）
+//        · 目录：ws/outbox、ws/inbox、ws/quarantine（SyncConfig 配置的引擎收发目录）
+//        · 文件名：{origin}__…__changeset__… / baselineresponse / blreq / ack（SyncDDL 命名契约）
+//        · 场景2 中 B 不与任何同步节点组网，故这些工件留在本地目录、不接传输层。
+//
+//   ② 远端快照数据（本文件新增，供"类 Beyond Compare"比对用）
+//        · 目录：ws/snap_child/{outbox,inbox}（B 侧）、ws/snap_center/{outbox,inbox}（A 侧）
+//        · 端口：A=15201 / B=15202（独立于场景1 的 15101-15104、sync-demo 的 15001-15004）
+//        · 文件名：snapreq__<id>.payload（请求）/ snapresp__<id>.payload（响应）
+//        · 由本文件专属的一对 UdpFileTransport 搬运，与 ① 的引擎目录/端口/传输实例完全隔离。
+//
+// 三重隔离（目录 + 端口/传输实例 + 文件名前缀）确保：同步变更集绝不会被当成快照、快照也绝不会
+// 被同步引擎误当成变更集应用；UdpFileTransport::extractTargetPeer 对 snapreq/snapresp 返回空，
+// 即便未来两类共用一个传输实例也不会被同步路由误投递。
+namespace {
+constexpr quint16 PORT_CENTER_A = 15201;  // 中心A 快照服务监听端口
+constexpr quint16 PORT_CHILD_B = 15202;   // 子节点B 监听端口
+constexpr int kSnapshotTimeoutMs = 6000;  // 等待 A 回传快照的超时（loopback 正常仅数十毫秒）
+
+// 快照通道目录（相对 ws_）——集中定义，避免各处字符串拼写漂移。
+inline QString snapChildOutbox(const QString& ws) {
+    return ws + QStringLiteral("/snap_child/outbox");
+}
+inline QString snapChildInbox(const QString& ws) {
+    return ws + QStringLiteral("/snap_child/inbox");
+}
+inline QString snapCenterOutbox(const QString& ws) {
+    return ws + QStringLiteral("/snap_center/outbox");
+}
+inline QString snapCenterInbox(const QString& ws) {
+    return ws + QStringLiteral("/snap_center/inbox");
+}
+}  // namespace
 
 // ── 分隔符（行键/单元键编码用，普通数据不会包含 \x01 / \x02）──────────────────
 // 为什么选控制字符 0x01/0x02 作分隔：表名/主键/列名等业务字符串几乎不可能含这类不可见控制符，
@@ -28,14 +73,14 @@ QString Scenario2Model::cellKey(const QString& table, const QString& pk, const Q
     return table + kSep1 + pk + kSep2 + column;
 }
 
-// 构造：只记录 workspace 路径、推导出 A/B 两库文件路径、固定参与比对的 4 张表名；
+// 构造：只记录 workspace 路径、推导出 A/B 两库文件路径；
+// tables_（参与比对的表清单）不再硬编码——改由 rebuildSession() 从"A 经 UDP 回传的快照"里
+// 动态填充（需求 #3：表名/数量来自数据库，不写死在代码里）。
 // 不打开任何库、不建会话（重活留给 setup()，构造保持零成本不可失败）。
 Scenario2Model::Scenario2Model(const QString& ws)
     : ws_(ws),
       centerDb_(ws + QStringLiteral("/center_A.db")),
-      childDb_(ws + QStringLiteral("/child_B.db")),
-      tables_{QStringLiteral("employee"), QStringLiteral("department"), QStringLiteral("project"),
-              QStringLiteral("region")} {
+      childDb_(ws + QStringLiteral("/child_B.db")) {
 }
 
 Scenario2Model::~Scenario2Model() {
@@ -44,6 +89,8 @@ Scenario2Model::~Scenario2Model() {
     childEngine_.reset();
     if (engineReady_)
         childBridge_.close();
+    // 最后停掉 UDP 快照通道（responder + 两个传输线程），避免线程在库/对象销毁后仍在跑。
+    stopSnapshotChannel();
 }
 
 // ── 公共连接工具：建库/读表/读列/读主键 ──────────────────────────────────────
@@ -84,28 +131,6 @@ QList<QVariantMap> Scenario2Model::readRows(const QString& dbPath, const QString
     return rows;
 }
 
-// readColumns —— 读任意库某表的列顺序（用 PRAGMA table_info，按建表时的列序返回）。
-// 用途：双栏视图按这个列序逐列展示；A、B 两库 schema 同构，故取任一即可（这里用 B）。
-QStringList Scenario2Model::readColumns(const QString& dbPath, const QString& table) {
-    QStringList cols;
-    const QString conn =
-        QStringLiteral("s2_cols_") + QUuid::createUuid().toString(QUuid::WithoutBraces);
-    {
-        auto db = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), conn);
-        db.setDatabaseName(dbPath);
-        if (db.open()) {
-            QSqlQuery q(db);
-            if (q.exec(QStringLiteral("PRAGMA table_info(\"%1\")").arg(QString(table)))) {
-                while (q.next())
-                    cols.append(q.value(QStringLiteral("name")).toString());
-            }
-            db.close();
-        }
-    }
-    QSqlDatabase::removeDatabase(conn);
-    return cols;
-}
-
 // readPkColumn —— 读任意库某表的主键列名（PRAGMA table_info 里 pk>0 的第一列）。
 // 说明：本演示各表都是单列整型主键，故取第一个 pk>0 的列即可；找不到则返回空串。
 QString Scenario2Model::readPkColumn(const QString& dbPath, const QString& table) {
@@ -132,18 +157,24 @@ QString Scenario2Model::readPkColumn(const QString& dbPath, const QString& table
     return pk;
 }
 
-// 下面四个是给 GUI 用的便捷包装：固定到 B 库（列序/主键，A 与之同构）或分别指向 A/B 库读行。
-QStringList Scenario2Model::columns(const QString& table) const {
-    return readColumns(childDb_, table);
+// columns / pkColumn —— 该表的列序 / 主键列名，改用 dbridge 公共接口 describeTable() 取得
+//   （需求 #3：字段从数据库读取、且由 dbridge 对外提供接口，而非 demo 自己写 PRAGMA）。
+//   取自 B 库的 schema（A 与之同构）：B 是当前节点、双栏对比以 B 的列序展示。
+QStringList Scenario2Model::columns(const QString& table) {
+    TableSchema ts;
+    if (!childBridge_.describeTable(table, &ts))
+        return {};
+    QStringList cols;
+    for (const ColumnDef& c : ts.columns)
+        cols.append(c.name);
+    return cols;
 }
-QString Scenario2Model::pkColumn(const QString& table) const {
-    return readPkColumn(childDb_, table);
-}
-QList<QVariantMap> Scenario2Model::centerRows(const QString& table) const {
-    return readRows(centerDb_, table);  // 中心A（远端，右栏）
-}
-QList<QVariantMap> Scenario2Model::childRows(const QString& table) const {
-    return readRows(childDb_, table);  // 子节点B（本地，左栏）
+QString Scenario2Model::pkColumn(const QString& table) {
+    TableSchema ts;
+    if (!childBridge_.describeTable(table, &ts))
+        return {};
+    const QStringList pk = ts.primaryKeyColumns();
+    return pk.isEmpty() ? QString() : pk.first();
 }
 
 // ── seed：建表 + 灌入"有意制造差异"的数据 ──────────────────────────────────────
@@ -246,40 +277,10 @@ bool Scenario2Model::seedDatabases(QString* err) {
     return true;
 }
 
-// ── 远端快照构造（从 center_A 读全库）────────────────────────────────────────
-
-// computeChecksum —— 为一张表的全部行算一个粗粒度内容指纹（顺序无关的累加 hash）。
-// 用途：填充 RemoteTableSnapshot.meta.contentChecksum，供比对会话的 checksum 快路径参考。
-// 为什么顺序无关（对每行 h 求和而非串接）：行序不应影响「整表内容是否相同」的判断。
-// 说明：仅演示用途的简单实现，非密码学 hash；真实差异仍以行级 diff 为准（见 tableStatuses 注释）。
-static QString computeChecksum(const QList<QVariantMap>& rows) {
-    quint64 sum = 0;
-    for (const auto& row : rows) {
-        quint64 h = 0;
-        for (auto it = row.begin(); it != row.end(); ++it)
-            h = h * 31 + qHash(it.key()) + qHash(it.value().toString());
-        sum += h;
-    }
-    return QString::number(sum, 16);
-}
-
-// buildRemoteSnapshots —— 从中心A 库读出全部参与表的快照，组装成 RemoteTableSnapshot 列表。
-// 做什么：逐表 readRows(centerDb_) 取全行，填好 schema 指纹/内容 checksum/行数等 meta。
-// 用途：作为 IComparisonSession::initialize 的入参——比对会话把「远端A 快照」与「本地B 库」逐表
-//   做 DiffEngine 比对。参数 err 当前未用（读 A 失败时该表退化为空快照，不致命）。
-QList<RemoteTableSnapshot> Scenario2Model::buildRemoteSnapshots(QString* /*err*/) const {
-    QList<RemoteTableSnapshot> snaps;
-    for (const QString& t : tables_) {
-        RemoteTableSnapshot snap;
-        snap.table = t;
-        snap.rows = readRows(centerDb_, t);
-        snap.meta.schemaFingerprint = QStringLiteral("fp_") + t;
-        snap.meta.contentChecksum = computeChecksum(snap.rows);
-        snap.meta.rowCount = snap.rows.size();
-        snaps.append(snap);
-    }
-    return snaps;
-}
+// ── 远端快照获取：改为经 UDP 向中心A 请求（见 fetchRemoteSnapshotsOverUdp / 快照响应线程）──
+//   原「buildRemoteSnapshots 直接读 center_A.db」的实现已删除——那不符合真实场景（B 不该持有
+//   A 的库文件）。现在 A 的整库快照由 CenterSnapshotResponder 读 A 自己的库、序列化后经 UDP
+//   回传给 B（需求 #2）。
 
 // ── setup / reseed / rebuildSession ─────────────────────────────────────────
 
@@ -289,22 +290,25 @@ QList<RemoteTableSnapshot> Scenario2Model::buildRemoteSnapshots(QString* /*err*/
 // 为什么引擎必须先初始化：createComparisonSession 依赖引擎建立的 SyncContext 与 __sync_* 元数据。
 // 返回：任一步失败即 false（err 带原因）；成功则 engineReady_=true 且已有可用会话。
 bool Scenario2Model::setup(QString* err) {
-    // 0. 拆除既有会话/引擎/桥（重入 setup 时必须先释放 SyncContext 与连接）。
+    // 0. 拆除既有会话/引擎/桥 + UDP 快照通道（重入 setup 时必须先释放线程/连接）。
     session_.reset();
     childEngine_.reset();
     if (engineReady_) {
         childBridge_.close();
         engineReady_ = false;
     }
+    stopSnapshotChannel();
     stagedRows_.clear();
     stagedCells_.clear();
 
-    // 1. 清理 workspace（删除旧库与 sync 目录，确保从干净状态出发）。
+    // 1. 清理 workspace（删除旧库、引擎 sync 目录与 UDP 快照通道目录，确保从干净状态出发）。
     QDir().mkpath(ws_);
     QFile::remove(centerDb_);
     QFile::remove(childDb_);
     for (const QString& sub :
-         {QStringLiteral("outbox"), QStringLiteral("inbox"), QStringLiteral("quarantine")}) {
+         {QStringLiteral("outbox"), QStringLiteral("inbox"), QStringLiteral("quarantine"),
+          QStringLiteral("snap_child/outbox"), QStringLiteral("snap_child/inbox"),
+          QStringLiteral("snap_center/outbox"), QStringLiteral("snap_center/inbox")}) {
         QDir(ws_ + QStringLiteral("/") + sub).removeRecursively();
         QDir().mkpath(ws_ + QStringLiteral("/") + sub);
     }
@@ -321,13 +325,17 @@ bool Scenario2Model::setup(QString* err) {
         return false;
 
     // 4. 构建子节点B 的 SyncConfig（比对场景 → 人工冲突策略）。
+    //    syncTables 从 B 库动态发现（需求 #3：不硬编码，经 dbridge 公共接口 userTables 读取）。
+    const QStringList syncTables = childBridge_.userTables(err);
+    if (syncTables.isEmpty())
+        return false;  // 空库/发现失败：无表可同步（err 已由 userTables 填充）
     cfg_ = SyncConfig::Builder()
                .nodeId(QStringLiteral("child_B"))
                .role(NodeRole::Edge)
                .centerNodeId(QStringLiteral("center_A"))
                .addPeerNode(QStringLiteral("center_A"))
                .database(childDb_)
-               .syncTables(tables_)
+               .syncTables(syncTables)
                .outboxDir(ws_ + QStringLiteral("/outbox"))
                .inboxDir(ws_ + QStringLiteral("/inbox"))
                .quarantineDir(ws_ + QStringLiteral("/quarantine"))
@@ -345,7 +353,11 @@ bool Scenario2Model::setup(QString* err) {
         return false;
     engineReady_ = true;
 
-    // 6. 建立首个比对会话。
+    // 6. 启动 UDP 快照通道（A/B 各一个单-peer 传输 + 中心A 快照响应线程）。
+    if (!startSnapshotChannel(err))
+        return false;
+
+    // 7. 建立首个比对会话（内部经 UDP 向 A 拉取快照）。
     return rebuildSession(err);
 }
 
@@ -369,17 +381,154 @@ bool Scenario2Model::rebuildSession(QString* err) {
             *err = QStringLiteral("SyncConfig 未构建");
         return false;
     }
+
+    // 经 UDP 向中心A 请求整库快照（需求 #2：B 不直读 A 的库文件）。
+    QList<RemoteTableSnapshot> snaps;
+    if (!fetchRemoteSnapshotsOverUdp(&snaps, err))
+        return false;
+
+    // 参与比对的表清单/数量来自 A 回传的快照（需求 #3：来自数据库，非硬编码）。
+    tables_.clear();
+    for (const RemoteTableSnapshot& s : snaps)
+        tables_.append(s.table);
+
     session_ = createComparisonSession(*cfg_, err);
     if (!session_)
         return false;
 
-    QString e2;
-    const QList<RemoteTableSnapshot> snaps = buildRemoteSnapshots(&e2);
     if (!session_->initialize(snaps, err)) {
         session_.reset();
         return false;
     }
+
+    // ④ 比对完成：汇总各表红/绿结论（由行级 diff 推导）。
+    int diffTables = 0, sameTables = 0;
+    for (const TableStatus& st : tableStatuses())
+        (st.identical ? sameTables : diffTables) += 1;
+    log(QStringLiteral("④ 差异比对完成：%1 张不同 / %2 张相同（共 %3 张表）")
+            .arg(diffTables)
+            .arg(sameTables)
+            .arg(tables_.size()));
     return true;
+}
+
+// ── UDP 快照通道：启停 + 请求/等待 ───────────────────────────────────────────
+
+// startSnapshotChannel —— 启动场景2 专属的 UDP 快照通道（与同步引擎目录/端口完全隔离）。
+//   三个后台线程：A 侧传输、B 侧传输（各单-peer loopback），以及 A 侧的快照响应线程。
+//   responder 在自己线程内 open 一个 DataBridge 读 center_A.db（用 dbridge 公共接口发现表/字段）。
+bool Scenario2Model::startSnapshotChannel(QString* err) {
+    const QHostAddress loopback(QHostAddress::LocalHost);
+
+    // 确保四个快照目录存在（setup 已建；此处兜底，responder/transport 也会各自 mkpath）。
+    for (const QString& d :
+         {snapChildOutbox(ws_), snapChildInbox(ws_), snapCenterOutbox(ws_), snapCenterInbox(ws_)})
+        QDir().mkpath(d);
+
+    // 中心A 快照响应线程：监视 A 的 inbox 里的 snapreq、读 A 的库、把快照写回 A 的 outbox。
+    responder_ = std::make_unique<CenterSnapshotResponder>(centerDb_, snapCenterInbox(ws_),
+                                                           snapCenterOutbox(ws_));
+    // A 侧传输：单-peer→B。把 A 的 outbox(snapresp) 经 UDP 送到 B、把收到的(snapreq)落 A 的 inbox。
+    centerTransport_ = std::make_unique<UdpFileTransport>(
+        PORT_CENTER_A, loopback, PORT_CHILD_B, snapCenterOutbox(ws_), snapCenterInbox(ws_));
+    // B 侧传输：单-peer→A。把 B 的 outbox(snapreq) 经 UDP 送到 A、把收到的(snapresp)落 B 的 inbox。
+    childTransport_ = std::make_unique<UdpFileTransport>(PORT_CHILD_B, loopback, PORT_CENTER_A,
+                                                         snapChildOutbox(ws_), snapChildInbox(ws_));
+
+    responder_->start();
+    centerTransport_->start();
+    childTransport_->start();
+    QThread::msleep(120);  // 给三个线程 bind/起转留出时间，避免首个请求丢失（仿场景1）
+    (void)err;  // 线程 start 本身不失败；bind 失败仅告警（见 UdpFileTransport::run）
+    return true;
+}
+
+// stopSnapshotChannel —— 停止并回收快照通道的三个后台线程（幂等）。
+//   次序：先停两个传输（不再收发），再停 responder（它用 center 库的连接随之释放）。
+void Scenario2Model::stopSnapshotChannel() {
+    if (childTransport_) {
+        childTransport_->requestStop();
+        childTransport_->wait();
+        childTransport_.reset();
+    }
+    if (centerTransport_) {
+        centerTransport_->requestStop();
+        centerTransport_->wait();
+        centerTransport_.reset();
+    }
+    if (responder_) {
+        responder_->requestStop();
+        responder_->wait();
+        responder_.reset();
+    }
+}
+
+// fetchRemoteSnapshotsOverUdp —— 经 UDP 向中心A 请求整库快照并等待回传（需求 #2 核心）。
+//   步骤：① 生成唯一 reqId，按 outbox 两步协议写 snapreq 工件到 B 的 outbox；
+//         ② 轮询 B 的 inbox 等 snapresp__<reqId>（带超时，不静默挂起）；
+//         ③ 读取响应体 → 反序列化为 RemoteTableSnapshot 列表。
+//   注意：B 全程只碰自己的 snap_child 目录，绝不读 center_A.db —— A 的数据完全经网络到达。
+bool Scenario2Model::fetchRemoteSnapshotsOverUdp(QList<RemoteTableSnapshot>* out, QString* err) {
+    const QString reqId = QUuid::createUuid().toString(QUuid::WithoutBraces).left(12);
+    const QString outDir = snapChildOutbox(ws_);
+    const QString inDir = snapChildInbox(ws_);
+
+    log(QStringLiteral("① 子节点B → 中心A：发送快照请求（UDP %1→%2，reqId=%3）")
+            .arg(PORT_CHILD_B)
+            .arg(PORT_CENTER_A)
+            .arg(reqId));
+
+    // ① 写请求工件：先 payload（空体即可，A 自行发现要发哪些表），再 .ready 哨兵。
+    const QString reqPayload = QStringLiteral("snapreq__%1.payload").arg(reqId);
+    const QString reqPath = QDir(outDir).filePath(reqPayload);
+    {
+        QFile f(reqPath);
+        if (!f.open(QIODevice::WriteOnly)) {
+            if (err)
+                *err = QStringLiteral("无法写快照请求工件：%1").arg(reqPath);
+            return false;
+        }
+        f.close();  // 空体
+        QFile ready(reqPath + QStringLiteral(".ready"));
+        ready.open(QIODevice::WriteOnly);
+        ready.close();
+    }
+
+    // ② 等待响应工件到达 B 的 inbox（snapresp__<reqId>.payload + .ready）。
+    const QString respName = QStringLiteral("snapresp__%1.payload").arg(reqId);
+    const QString respPath = QDir(inDir).filePath(respName);
+    const QString respReady = respPath + QStringLiteral(".ready");
+    const qint64 deadline = QDateTime::currentMSecsSinceEpoch() + kSnapshotTimeoutMs;
+    while (QDateTime::currentMSecsSinceEpoch() < deadline) {
+        if (QFile::exists(respReady) && QFile::exists(respPath)) {
+            QFile rf(respPath);
+            if (!rf.open(QIODevice::ReadOnly)) {
+                if (err)
+                    *err = QStringLiteral("无法读取快照响应工件：%1").arg(respPath);
+                return false;
+            }
+            const QByteArray body = rf.readAll();
+            rf.close();
+            // ② 抽干中心A 侧的处理日志（在 ① 与 ③ 之间按序输出，还原真实往返时序）。
+            if (responder_)
+                for (const QString& line : responder_->takeLog())
+                    log(QStringLiteral("   ② [中心A] %1").arg(line));
+            *out = s2snap::decodeSnapshots(body);
+            if (out->isEmpty()) {
+                if (err)
+                    *err = QStringLiteral("快照响应解析为空（格式/版本不符或 A 库无用户表）");
+                return false;
+            }
+            log(QStringLiteral("③ 子节点B ← 中心A：收到快照（%1 张表，%2 字节），开始差异比对")
+                    .arg(out->size())
+                    .arg(body.size()));
+            return true;
+        }
+        QThread::msleep(20);  // 让出 CPU；loopback 正常仅需一两次轮询即命中
+    }
+    if (err)
+        *err = QStringLiteral("等待中心A 快照超时（%1ms）——UDP 通道未回传").arg(kSnapshotTimeoutMs);
+    return false;
 }
 
 // ── 状态查询 ────────────────────────────────────────────────────────────────

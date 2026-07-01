@@ -10,6 +10,7 @@ CONFIG  += ordered
 SUBDIRS = \
     tst_profile_loader \
     tst_schema_introspector \
+    tst_databridge_schema \
     tst_validator_chain \
     tst_sql_builder \
     tst_topo_sorter \
@@ -47,6 +48,7 @@ SUBDIRS = \
 
 tst_profile_loader.file          = unit/tst_profile_loader.pro
 tst_schema_introspector.file     = unit/tst_schema_introspector.pro
+tst_databridge_schema.file       = unit/tst_databridge_schema.pro
 tst_validator_chain.file         = unit/tst_validator_chain.pro
 tst_sql_builder.file             = unit/tst_sql_builder.pro
 tst_topo_sorter.file             = unit/tst_topo_sorter.pro

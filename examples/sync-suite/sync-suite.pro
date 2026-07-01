@@ -56,6 +56,7 @@ SOURCES = \
     Scenario1Widget.cpp \
     Scenario2Model.cpp \
     Scenario2Widget.cpp \
+    Scenario2SnapshotService.cpp \
     CompareDetailDialog.cpp \
     ../sync-demo/udp_transport.cpp
 
@@ -65,5 +66,6 @@ HEADERS = \
     Scenario1Widget.h \
     Scenario2Model.h \
     Scenario2Widget.h \
+    Scenario2SnapshotService.h \
     CompareDetailDialog.h \
     ../sync-demo/udp_transport.h

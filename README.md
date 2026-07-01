@@ -55,6 +55,8 @@
   - [15.10 同步错误码（`E_SYNC_*` / `W_SYNC_*`）](#1510-同步错误码e_sync_--w_sync_)
   - [15.11 与 Excel 子系统的关系](#1511-与-excel-子系统的关系)
   - [15.12 构建、测试与实现状态](#1512-构建测试与实现状态)
+  - [15.13 可靠 UDP 分片传输（拆包与组包 ARQ）](#1513-可靠-udp-分片传输拆包与组包-arq)
+  - [15.14 QSQLITE Session 插件集成](#1514-qsqlite-session-插件集成)
 
 ---
 
@@ -218,19 +220,28 @@ dbridge/
 │       ├── payload/                    ← PayloadCodec（制品二进制编解码）
 │       └── diff/                       ← 场景 2：DiffEngine / ComparisonSession / StagingBuffer / InboundTableGate
 │
-├── 3rdparty/QXlsx/                     ← QXlsx 第三方库（vendored）
+├── 3rdparty/                           ← vendored 第三方依赖
+│   ├── QXlsx/                          ← Excel 读写库（vendored）
+│   ├── sqlite3/                        ← SQLite 放大版源码（session-enabled 构建：SESSION + PREUPDATE_HOOK）
+│   └── qsqlite_session/                ← 自编 QSQLITE 驱动插件（session-enabled，修复 E_SYNC_SESSION_UNAVAILABLE，§15.14）
 │
 ├── tests/                              ← 单元 + 集成测试（38 套 CTest 目标，CMake 列在 tests/CMakeLists.txt）
 │   ├── unit/                           ← 模块级单元测试
 │   │                                     Excel 篇：ProfileLoader/ProfileValidator/Schema/Validators/SqlBuilder/AutoProfileBuilder/Router/TopoSorter/FkPreflight/LookupPrefetch/LookupSemantics/ExportHelpers/ReverseLookupExport/TemporalImport/TemporalExport/ColumnOrderExport
 │   │                                     同步篇（19 套，§15.12）：tst_sync_applied_vector/changelog_store/conflict_arbiter/consistency_cache/dead_peer_evictor/foreground_gate/inbound_table_gate/inbox_ledger/outbound_ack/payload_codec/quarantine_store/routing_table/row_winner/schema_eligibility/schema_guard/staging_buffer/table_state/upsert_executor + tst_write_txn
+│   │                                     传输篇（1 套，§15.13）：tst_udp_reassembly（UDP 拆包/组包 ARQ，含 --coverage 插桩，行覆盖率 97.82%）
 │   ├── integration/                    ← DataBridge 端到端集成
 │   └── data/                           ← 测试夹具
 │       ├── sql/                        ← schema 初始化 SQL（01_customer / 02_orders / 03_mixed / 04_mixed_multitable / 05_time_formats / 06_column_order / 07_reverse_lookup）
 │       ├── profiles/                   ← Profile JSON 夹具（customer_basic / order_m_set / mixed_abc / mixed_abc_multitable / time_formats / column_order / reverse_lookup）
 │       └── xlsx/                       ← Excel 夹具（Orders / Mixed / Events / OrdersColOrder / ReverseLookup）；由 tools/build_fixtures.py 生成
 │
-├── examples/cli/                       ← 命令行示例程序（dbridge-cli）
+├── examples/                           ← 可运行示例程序
+│   ├── cli/                            ← 命令行导入导出（dbridge-cli）
+│   ├── sync-demo/                      ← 同步端到端演示（1 中心 + 3 边缘，五阶段）；自带 UDP ARQ 传输层
+│   │   └── udp_transport.*             ← 可靠 UDP 分片传输（拆包/组包 · ARQ，§15.13），sync-demo/sync-suite 共用
+│   ├── sync-suite/                     ← 两场景 GUI + --selftest（场景 1 指定库同步 / 场景 2 差异比对合并）
+│   └── diff-demo/                      ← 场景 2 差异比对最小示例
 │
 ├── tools/                              ← 配套脚本（独立于库本体）
 │   ├── build_fixtures.py               ← 生成 tests/data/xlsx/ 下所有夹具 xlsx（纯 Python stdlib）
@@ -2842,10 +2853,22 @@ graph LR
 - `src/sync/**` 与 `src/batch/BatchTransfer.cpp` 直接编进**同一个 `dbridge` 库**，**无独立 target**。
 - 单独的静态库 `dbridge_sqlite3`（从 Qt 自带 `sqlite3.c` 编译，开启 `SQLITE_ENABLE_SESSION` + `SQLITE_ENABLE_PREUPDATE_HOOK`），`dbridge` PRIVATE 链接它，并自身也加这两个编译宏 —— **没有这两个宏，Session/rebaser 不可用，同步无法工作**。
 - sqlite3 源路径默认 `/opt/Qt5.12.12/.../sqlite3.c`，可经 cache 变量 `QT_SQLITE_SRC` / `QT_SQLITE_INC` 覆盖。
+- 运行时还需 **session-enabled 的 QSQLITE 驱动插件**（`3rdparty/qsqlite_session/`），否则 `QSqlDatabase("QSQLITE")` 会加载系统官方插件、缺 SESSION 而报 `E_SYNC_SESSION_UNAVAILABLE`（详见 §15.14）。
+
+**可运行示例**（`examples/`，qmake 子项目，产物在 `build_qmake_demos/`）
+
+| 示例 | 作用 | 运行 |
+|---|---|---|
+| **`sync-demo`** | 1 中心 + 3 边缘、五阶段端到端（下行基线 → 上行增量 → 下行广播 → 选择推送 → 冲突仲裁），走**自研 UDP ARQ 传输层**（数据报 ≤ 800B，强制多分片，§15.13） | `./sync-demo <workspace-dir>`（启动即清理旧 DB 与 inbox/outbox；节点目录 `ws/<nodeId>/{outbox,inbox,quarantine}`） |
+| **`sync-suite`** | 两场景：场景 1 多节点指定库同步、场景 2 类 Beyond Compare 差异比对/合并（`IComparisonSession`）；Qt Widgets GUI + 无界面自测 | GUI：`./sync-suite [--ws <dir>]`；CI：`QT_QPA_PLATFORM=offscreen ./sync-suite --selftest` |
+| **`diff-demo`** | 场景 2 差异比对最小命令行示例 | `./diff-demo` |
+| **`dbridge-cli`** | Excel↔SQLite 导入导出（§14.13） | `dbridge-cli <db> <profile> <xlsx> [import\|export]` |
 
 **测试**
 
-同步子系统有 **19 套单元测试**（`tests/unit/tst_sync_*` 18 套 + `tst_write_txn`），随 `BUILD_TESTING` 经 CTest 运行（全库共 38 个 CTest 目标）。覆盖：applied_vector、changelog_store、conflict_arbiter、consistency_cache、dead_peer_evictor、foreground_gate、inbound_table_gate、inbox_ledger、outbound_ack、payload_codec、quarantine_store、routing_table、row_winner、schema_eligibility、schema_guard、staging_buffer、table_state、upsert_executor、write_txn。最近一次提交记录为 **209 个用例全绿**（数据驱动展开后）。每套同时提供 `.pro`（qmake）与 CMake 双构建。
+同步子系统有 **19 套单元测试**（`tests/unit/tst_sync_*` 18 套 + `tst_write_txn`），随 `BUILD_TESTING` 经 CTest 运行（全库共 ~38 个 CTest 目标）。覆盖：applied_vector、changelog_store、conflict_arbiter、consistency_cache、dead_peer_evictor、foreground_gate、inbound_table_gate、inbox_ledger、outbound_ack、payload_codec、quarantine_store、routing_table、row_winner、schema_eligibility、schema_guard、staging_buffer、table_state、upsert_executor、write_txn。最近一次提交记录为 **209 个用例全绿**（数据驱动展开后）。每套同时提供 `.pro`（qmake）与 CMake 双构建。
+
+此外，示例传输层 `examples/sync-demo/udp_transport.cpp` 有独立的 **`tst_udp_reassembly`**（纯组件 Part A + socket 集成 Part B），覆盖拆包边界 / 乱序 / 重复 / 越界 / 元数据不一致 / 文件名安全 / ARQ 重传恢复 / giveUp / durable 落盘失败等场景，`--coverage` 插桩下**行覆盖率 97.82% ≥ 90%、函数覆盖率 100%**（详见 §15.13）。
 
 **实现状态**
 
@@ -2863,6 +2886,152 @@ graph LR
 | **M5** | 加固（死节点驱逐、基线坍缩、隔离重放等） |
 
 > **设计 vs 计划的若干修订（最新结论）**：锚点拆为 `OutboundAckStore`（发送端）+ `AppliedVectorStore`（接收端），弃用含糊的 `AnchorStore`；表级判等用 `schema_fingerprint + row_count + content_checksum` 三元组（`high_water_seq` 不参与）；长推送不引入 per-push staging 表、不跨片回滚，靠"FK 安全 + 半截不外泄 + re-baseline 收口"三道边界。
+
+---
+
+### 15.13 可靠 UDP 分片传输（拆包与组包 ARQ）
+
+> 位置：`examples/sync-demo/udp_transport.{h,cpp}`，**sync-demo 与 sync-suite 共用同一份传输层**。它不属于 `libdbridge`，而是 demo 用来在节点间搬运同步制品（changeset / baseline / selectionpush）的**文件搬运层**：同步引擎把制品写进 outbox，本层负责可靠地把它送到对端 inbox。
+
+#### 15.13.1 为什么需要它
+
+生产链路带宽极小，要求**每个 UDP 数据报 ≤ 800 字节**。而旧 `UdpFileTransport` 的分片阈值 `kFragSize = 60000`，demo 工件（约 1702B 快照）几乎恒为「单片直通」，分片/重组路径基本休眠。一旦压到 800B，任何工件都被切成多片，暴露三个此前「存在但从未触发」的健壮性缺口：
+
+| 缺口 | 后果 | 本层修复 |
+|---|---|---|
+| 无重传 / 无 ACK | 任一分片丢失 → 接收端永不组齐 → 半成品永久滞留（内存泄漏）、文件到不了 inbox | **全量重传 ARQ**：发送端按 RTO 周期重发整条消息，直到 ACK 或放弃 |
+| 无 pending 超时淘汰 | 滞留半成品不清理 | 接收端 pending **超时淘汰** + 发送端超 `kMaxRetries` **释放** |
+| `msg_id` 为随机 32bit | 两个并发文件 `msg_id` 碰撞 → 分片混进同一消息 → 数据损坏 | 归并键含**发送端点** `(senderKey, msgId)`；`msg_id` 改**单调计数器 + 随机起点** |
+
+> 设计原则：**最小可落地**——只做全量重传 ARQ，不做选择性重传（NACK）/ 发送节流。已经过两轮 Codex 评审收敛（见 `specs/拆包和组包设计文档.md`）。
+
+#### 15.13.2 线格式（大端）
+
+DATA 固定头 **18 字节**，ACK 包精确 **9 字节**；收端先校验 `magic + type` 再分派：
+
+| 类型 | type | 布局 | 长度约束 |
+|---|:--:|---|---|
+| **DATA** | `0x01` | `magic(4) \| type(1) \| msg_id(4) \| frag_idx(2) \| frag_count(2) \| total_size(4) \| fname_len(1) \| fname[N] \| payload[M]` | `18 + fname_len ≤ len ≤ maxTransmitBytes` |
+| **ACK** | `0x02` | `magic(4) \| type(1) \| msg_id(4)` | 精确 9 字节 |
+
+关键常量（`udp_transport.h`）：
+
+| 常量 | 值 | 含义 |
+|---|---|---|
+| `kMagic` | `0xDB5ACED0` | 魔数 |
+| `kFixedHeader` | `18` | DATA 固定头长度 |
+| `kAckSize` | `9` | ACK 包长度 |
+| `kMinMaxBytes` | `274` | `maxTransmitBytes` 下限（18 头 + 255 最长文件名 + 1 净荷） |
+| `kRtoMs` | `500` | 重传超时（RTO） |
+| `kMaxRetries` | `5` | 放弃前最大重传次数 |
+| `kReassemblyTimeoutMs` | `8000` | 接收端 pending 超时淘汰 |
+| `kCompletedRetentionMs` | `8000` | 已完成短表保留 |
+| `kPollMs` | `50` | socket 轮询间隔 |
+
+- 每片净荷 `M = maxTransmitBytes − 18 − fname_len`，**逐文件计算**（文件名嵌在每片、长度可变）——所以不能简单把阈值设成 800（那会得到 ≈850B 的数据报，反而违约）。
+- 同一消息各分片的 `msg_id / frag_count / total_size / fname_len / fname` 完全相同、`frag_idx / payload` 各异 → **哪片先到都能初始化元数据**。
+
+#### 15.13.3 拆包：`fragmentMessage()`（纯函数）
+
+```cpp
+FragmentResult fragmentMessage(quint32 msgId, const QString& filename,
+                               const QByteArray& data, int maxTransmitBytes);
+```
+
+把一条消息切成若干 ≤ `maxTransmitBytes` 的自描述 DATA 数据报。守卫（任一不过 → `ok=false`，上层把工件改名 `.failed`、不进 outbound）：
+
+- 文件名 UTF-8 > 255（`fname_len` 为 `quint8`）→ 失败；
+- `M < 1`（无净荷余地）→ 失败；
+- `fragCount = ceil(size / M) > 65535`（`frag_count` 为 `quint16`）→ 失败；
+- **空文件特判 1 片空净荷**（空体也要被传输并触发接收端落盘）。
+
+#### 15.13.4 组包：`FragmentReassembler`（有状态机，可脱离 socket 单测）
+
+接收端重组状态机。归并键 `MsgKey = (senderKey, msgId)`；乱序分片存进 `QMap<quint16, QByteArray>`（稀疏、自动有序）。
+
+```cpp
+RxEvent feed(const QString& senderKey, const QByteArray& datagram, qint64 nowMs);
+void    markDelivered(const QString& senderKey, quint32 msgId, qint64 nowMs);
+void    evictStale(qint64 nowMs);
+int     pendingCount() const;   // 供测试断言「无泄漏」
+```
+
+`feed()` 入站校验（**宁丢勿污**，任一不过即丢弃该片 / 淘汰该消息）：长度 ≥ 18 → `magic`/`type` → `frag_idx < frag_count`（越界）→ `size ≥ 18 + fname_len` → **文件名安全**（非空、无 `/` `\`、非绝对路径、非 `..`，防路径穿越）→ 后续片元数据逐字段一致 → 组齐后 `assemble()` 校验 `size == total_size`。
+
+**交付以 durable 落盘为准**（解耦幂等）：`feed()` 组齐返回 `Completed` 时**不写短表**；外层把 payload + `.ready` 两步都写盘成功后，才调 `markDelivered()` 记入「已完成短表」并回 ACK。此后重收同消息 → 返回 `NeedAck`（只回 ACK，不重建 pending、不重复落盘）。写盘失败则不 ACK，交由发送端 RTO 重传自愈。`evictStale()`：`now − lastProgressAt > kReassemblyTimeoutMs` 的 pending → 淘汰；短表项超 `kCompletedRetentionMs` → 清理（重复片**不刷新进度**，避免冗余片续命）。
+
+#### 15.13.5 ARQ 与出站状态机（磁盘后缀为唯一真源）
+
+发送端用**原子认领**（单次 `rename`）替代内存表，严格「先落定 `.sending` 终态对象、再发送」：
+
+```text
+name.payload + name.payload.ready
+   │ ① 原子认领 rename(.ready → .ready.sending)   失败=被并发认领 → 跳过
+   ▼
+name.payload + name.payload.ready.sending
+   │ ② rename(.payload → .payload.sending)         此步在发送前，保证终态改名有对象
+   ▼
+name.payload.sending + name.payload.ready.sending
+   ├─ ③ 读 payload 失败 / ④ 拆包失败 → 两文件 rename → .failed + 告警，不进 outbound
+   └─ ⑤ 全部分片发出 → 记入 outbound(lastSentAt=now, retries=0)
+        ├─ 收 ACK（校验来源端点 == dest）→ rename → .sent、删 outbound
+        └─ RTO 到期且 retries < 5 → 全量重发（从内存 datagrams，不读盘）、retries++
+             retries == 5（giveUp）→ rename → .failed + 告警（E_UDP_DELIVERY_GIVEUP 语义）、删 outbound
+```
+
+要点：单片 / 空文件也走同一路径（不分叉）；RTO 兜底永不关闭（不引入「收到某反馈后停重传」的开关，避免反馈丢失时永久卡死）；`run()` 单线程收发交替 → 所有 ARQ 状态**无锁**、以 `QElapsedTimer` 单调毫秒为超时基准。
+
+#### 15.13.6 对外 API
+
+```cpp
+class UdpFileTransport : public QThread {
+  // 单 peer（edge 节点）
+  UdpFileTransport(quint16 localPort, const QHostAddress& peerHost, quint16 peerPort,
+                   const QString& outboxDir, const QString& inboxDir, QObject* parent=nullptr);
+  // 多 peer（center 节点）
+  UdpFileTransport(quint16 localPort, const QHash<QString, UdpPeerEndpoint>& peers,
+                   const QString& outboxDir, const QString& inboxDir, QObject* parent=nullptr);
+
+  bool setMaxTransmitBytes(int bytes);  // 单个 UDP 数据报总长上限；须在 start() 前调用；< 274 拒绝并返回 false；默认 60000
+  void requestStop();                   // 线程安全停止（置原子标志，须再 wait()）
+};
+```
+
+sync-demo / sync-suite 在启动时对所有节点 `setMaxTransmitBytes(800)`，把 800B 网络约束落到实处。
+
+#### 15.13.7 测试与覆盖率
+
+`tests/unit/tst_udp_reassembly.cpp` 分两部分：
+
+- **Part A（纯组件）**：`fragmentMessage` 边界与线格式、乱序/重复幂等重组、各类拒绝（短包 / 错 magic / 错 type / 越界 / 文件名超长 / 不安全文件名 / 元数据不一致 / 总长不一致）、durable 交付解耦、超时淘汰、短表过期、跨发送端同 `msg_id` 隔离。
+- **Part B（socket 集成）**：单片与多分片（800B）端到端字节一致、多 peer 路由、黑洞端口触发 RTO 重传 → giveUp（断言重发 6 次 = 首发 + 5 重传）、durable 写失败终态 `.failed`、bind 失败线程速退、垃圾数据报丢弃、认领 / 改名失败确定性路径。
+
+构建运行（CMake 已登记，`--coverage -O0` 插桩）：
+
+```bash
+cmake --build build --target tst_udp_reassembly
+QT_QPA_PLATFORM=offscreen ctest -R tst_udp_reassembly --output-on-failure
+```
+
+行覆盖率 **97.82% ≥ 90%**、函数覆盖率 100%；不可达分支（如已被 `/` 拦截后的绝对路径判断、前置 size 校验后的流读失败）逐条 `LCOV_EXCL_*` 标注豁免。
+
+---
+
+### 15.14 QSQLITE Session 插件集成
+
+同步依赖 SQLite 的 **SESSION + PREUPDATE_HOOK** 扩展。库本体已把开启这两个宏的 `sqlite3.c` 编成 `dbridge_sqlite3` 链接进 `libdbridge`（§15.12），但**运行时** `QSqlDatabase("QSQLITE")` 仍会去加载 **Qt 的 QSQLITE 驱动插件**——系统官方插件没开这两个宏，于是报 `E_SYNC_SESSION_UNAVAILABLE`。
+
+修复（commit `7470403`）：`3rdparty/qsqlite_session/` 从 Qt 5.12 自带插件源码（`qsql_sqlite.cpp` / `smain.cpp`）+ bundled `sqlite3.c` 重编，叠加 `SQLITE_ENABLE_SESSION + SQLITE_ENABLE_PREUPDATE_HOOK`，`TARGET` / 类名 / 驱动 key 与官方完全一致 → 只要它先于系统插件被命中即可无感替换。三种命中手段：
+
+| 手段 | 适用 | 说明 |
+|---|---|---|
+| **部署覆盖**（生产首选） | 自包含部署 | `INSTALLS` 把 session 版 `libqsqlite.so` 覆盖进主程序 `sqldrivers/`，零源码、零运行时配置 |
+| **`QT_PLUGIN_PATH`** | 开发期 / 跑别人的 exe | 该路径在 `libraryPaths()` 里天然优先于系统插件；指向**含 `sqldrivers/` 的父目录** |
+| **`qt.conf`** | 纯文件部署 | exe 旁 `[Paths] Plugins=plugins` 重定向，但会替换整个 PluginsPath（`platforms/` 等须一并放入） |
+
+demo 采用「改 `main`」的手段：首次 SQL 前调 `QCoreApplication::setLibraryPaths([appDir] + existing)` 把应用目录提到搜索列表**首位**。
+
+> ⚠️ **必须用 `setLibraryPaths`，不能用 `addLibraryPath`**：Qt 5.12 把 `applicationDirPath()` append 在列表末尾，`addLibraryPath` 判定重复直接返回、是彻底的 no-op。详见 `specs/QSQLITE-Session插件集成-无main场景方案.md`。
 
 ---
 

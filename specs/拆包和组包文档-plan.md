@@ -7,7 +7,7 @@
 
 ## 0. 关系、影响面与切片总览
 
-- **影响面（很小、可控）**：只改 demo 传输层 `examples/sync-demo/udp_transport.{h,cpp}`（+ 新增 `udp_framing.{h,cpp}`）、8 个构造点、新增 1 个单测；**不触碰 dbridge 库**。
+- **影响面（很小、可控）**：只改 demo 传输层 `examples/sync-demo/udp_transport.{h,cpp}`（+ 新增 `udp_framing.{h,cpp}`）、10 个构造点、新增 1 个单测；**不触碰 dbridge 库**。
 - **一个源、两处编译**：`udp_transport.cpp` 被 **sync-demo** 与 **sync-suite** 各自编译进自己的二进制。改一次 → **两 demo 同时受影响**，两处都要验。
 - **文件组织决策（对设计 §9 的小幅细化，理由：设计 §5.1 要求「脱离 socket 单测」）**：把纯逻辑 `FragmentResult` / `fragmentMessage` / `FragmentReassembler` 放进**新文件 `examples/sync-demo/udp_framing.{h,cpp}`（无 Qt Network、无 QObject）**，由 `udp_transport.cpp` `#include`。这样单测只编译 `udp_framing.cpp`（纯、无 moc、无 network），干净地实现「脱离 socket 单测」；`udp_transport.{h,cpp}` 只保留 socket/ARQ 编排。
   - 代价：`udp_framing.{cpp,h}` 需加入 4 个 demo 构建文件（见 §3）。
@@ -17,10 +17,10 @@
 |----|------|------|
 | 0 | 基线确认 | 两 demo 在默认 60000 下 qmake+cmake 均构建+跑通（回归对照锚点） |
 | 1 | `udp_framing`：`fragmentMessage` + 拆包单测 | 新文件编译进两 demo；拆包单测绿；**两 demo 行为不变**（未接入） |
-| 2 | `udp_framing`：`FragmentReassembler` + 组包单测 | 组包/丢包恢复/淘汰/碰撞/校验单测绿；**两 demo 行为不变** |
+| 2 | `udp_framing`：`FragmentReassembler` + 组包单测 | **接收端**组包健壮性(校验/淘汰/去重/重组/durable 解耦)单测绿；**两 demo 行为不变**（发送端 RTO/giveUp 属 run()，见 Step 4/5） |
 | 3 | 接口 `setMaxTransmitBytes` + 常量/成员（未接入 run） | 编译通过；接口存在但 run() 仍旧路径 |
 | 4 | `run()` 集成 ARQ + 交付状态机（**默认 60000**） | 两 demo 走**新 ARQ 路径**（ACK/重传/durable/淘汰），60000/单片下 selftest 绿 |
-| 5 | 8 构造点设 `setMaxTransmitBytes(800)` | 两 demo 在 **800B/多分片** 下 selftest 绿；inbox 见多分片 + `.sent` |
+| 5 | 10 构造点设 `setMaxTransmitBytes(800)` | 两 demo 在 **800B/多分片** 下 selftest 绿；**日志断言** `fragCount>1 且每 datagram≤800`、终态 `.sent` |
 | 6 | 双构建 + 全量验证 + 观测 | qmake+cmake 全绿；单测 + 两 demo(800) 全通过；重传/分片计数可观测 |
 
 ---
@@ -46,10 +46,10 @@
 - **目标**：产出「文件 → N 个 ≤ maxBytes 的 DATA 数据报」的纯函数，可单测。
 - **改动**：
   - 新增 `examples/sync-demo/udp_framing.h`：`FragmentResult`、`fragmentMessage(...)` 声明、`type` 常量（DATA=0x01/ACK=0x02）、头长常量（18）、`magic`（沿用现值 `0xDB5ACED0`）。
-  - 新增 `examples/sync-demo/udp_framing.cpp`：实现 `fragmentMessage`（设计 §4.1 守卫：`data>UINT32_MAX` / `fname>255` / `fragCount>65535` → `ok=false`；空文件 1 片；净荷 `M = maxBytes−18−fname_len`；大端 `QDataStream`）。
+  - 新增 `examples/sync-demo/udp_framing.cpp`：实现 `fragmentMessage`。守卫（任一 → `ok=false`）：`fname>255`、`fragCount>65535`、**`M = maxBytes−18−fname_len < 1`（纯函数自守，不只靠 `setMaxTransmitBytes(<274)` 拦截）**；`data>UINT32_MAX` 为**防御性**分支（Qt5 `QByteArray::size()` 为 `int`，实际不可构造 → 不单测，仅代码保留）。空文件 1 片；大端 `QDataStream`。
   - 4 个 demo 构建文件登记 `udp_framing.{cpp,h}`（见 §3）——本步只是**编译进来**，`udp_transport.cpp` 尚未使用。
   - 新增单测骨架 `tests/unit/tst_udp_reassembly.{cpp,pro}` + 登记（见 §3），先写 `frag_sizes`、`frag_errors` 两个用例（设计 §6.1）。
-- **关键点**：`fragmentMessage` 无副作用、不碰 socket；与接收端头字段严格对应（设计 §4.2）。
+- **关键点**：`fragmentMessage` 无副作用、不碰 socket；与接收端头字段严格对应（设计 §4.2）。`frag_errors` 只测**可达**分支——`fname>255`、`M<1`（传极小 `maxBytes`）、`fragCount>65535`（用极小 `M` + 约 64KB 数据即 > 65535 片，内存可控）；`data>UINT32_MAX` 标注不可实测。
 - **构建**：qmake 重跑 + 建 `tst_udp_reassembly` + 建两 demo（确认新文件不破坏 demo 编译）。
 - **验证**：`tst_udp_reassembly` 中 `frag_sizes`/`frag_errors` 绿；两 demo 仍按 Step 0 跑通（行为不变）。
 - **landable**：拆包函数可用、可测；demo 无行为变化。**回滚**：删新文件 + 撤 4 处登记。
@@ -62,7 +62,7 @@
   - `tst_udp_reassembly.cpp` 补齐用例（设计 §6.1）：`roundtrip_inorder/reorder`、`retransmit_recovery`、`durable_delivery`、`eviction`、`collision`、`dup_after_complete`、`reject_out_of_range/meta_mismatch/size_mismatch/unsafe_filename`。丢包=「不喂某些片」；淘汰=注入小超时 + 手推时间（`feed(..., nowMs)` 的 `nowMs` 由测试给定，天然可控，无需真实等待）。
 - **关键点**：`feed→Completed` 与 `markDelivered` 的**解耦**是幂等交付的关键（设计 §4.3、原则 5）；单测里可显式「Completed 后不 markDelivered → 再喂整条 → 仍 Completed」验证落盘失败可重投。
 - **构建/验证**：单测全绿（尤其 `retransmit_recovery/durable_delivery/eviction/collision/reject_*`）；两 demo 行为仍不变。
-- **landable**：组包健壮性**完全可测、已验证**（此时 ARQ 的「大脑」已就绪且证明正确）。**回滚**：撤 `udp_framing` 的 reassembler 部分 + 相应用例。
+- **landable**：**接收端**组包健壮性（§4.4 校验、pending 淘汰、去重、重组、durable 交付解耦）**完全可单测、已验证**。注意：发送端 `RTO/giveUp`（缺口①的重传侧）在 `run()` 里、**不**由本步单测覆盖（见 Step 4/5 的说明）。**回滚**：撤 `udp_framing` 的 reassembler 部分 + 相应用例。
 
 ### Step 3 · 对外接口 `setMaxTransmitBytes` + 常量/成员（尚未接入 run）
 
@@ -78,34 +78,35 @@
 
 - **目标**：把 `run()`/`pollOutbox` 切到 `fragmentMessage` + `FragmentReassembler` + ARQ；**先不改 800B**，用默认 60000（单片、近无损）**隔离验证「新代码路径本身对不对」**。
 - **改动**：`udp_transport.cpp` 按设计 §5.1④ 重写 `run()`、按 §5.2 实现交付状态机：
-  - 发送：`pollOutbox` 原子认领（`.ready→.ready.sending`）→ `payload→.sending`（发送前）→ `readPayload`(Result) → `fragmentMessage` → 发送 → 入 `outbound`（顺序与失败处理严格照 §4.3 首发 1–5 与 §5.1 伪代码）。
-  - 接收：`feed` → `Completed` 则「写 inbox(payload)+`.ready` 成功 → `markDelivered`+回 ACK；失败 → 不 ACK+告警」；`NeedAck` → 回 ACK。
+  - **⚠️ 通用 artifact（对设计伪代码 `payload/readPayload` 措辞的落地澄清，务必照此实现）**：`pollOutbox` 扫的是**通用** `*.ready`，其主文件既可能是 `.payload`（changeset/基线/快照）**也可能是同步协议的 `.ack` 文件**。实现**必须**用 `artifactName = readyName 去掉 ".ready"` 统一处理二者——**不得只按 `.payload` 后缀**，否则 `.ack` 工件不发、demo 会卡住。终态改名同时作用于「主文件」与其 `.ready.sending`。
+  - 发送：原子认领（`rename(name.ready → name.ready.sending)`）→ **主文件** `rename(artifact → artifact.sending)`（发送前）→ 读取该文件（**用局部 helper struct `{QByteArray data; bool ok;}` 或 `QFile+bool`——仓库无通用 `Result<T>`，勿臆造**）→ `fragmentMessage` → 发送 → 入 `outbound`（顺序与失败处理严格照 §4.3 首发 1–5 与 §5.1 伪代码；1–4 任一失败 → 主文件与 `ready.sending` 均 `.failed` + 告警、不进 outbound）。
+  - 接收：`feed` → `Completed` 则「写 inbox(主文件)+`.ready` 成功 → `markDelivered`+回 ACK；失败 → 不 ACK+告警」；`NeedAck` → 回 ACK。
   - 维护：`RTO` 兜底全量重传（`retries<maxRetries`）/ 超限 `.failed`；`evictStale`。
   - ACK 分派：先 §4.2 ACK 校验（精确 9 字节）+ 端点校验（`==outbound[msgId].dest`）→ `.sending→.sent`、删 outbound。
-  - **删除** `sentFiles_`（磁盘后缀为唯一出站真源，设计 §5.2）；删除旧 `sendFile/handleDatagram`（逻辑并入新组件）。
+  - **删除** `sentFiles_`（磁盘后缀为唯一出站真源，设计 §5.2）；删除旧 `sendFile/handleDatagram`。
+  - **观测（本步必做，验证多分片的唯一可信来源）**：每条消息发送时记日志/计数 `{msgId, artifactName, fragCount, 最大 datagram 字节, retries}`；接收/重传/giveUp 亦计数。文件系统**看不到** wire 层 `fragCount`，故多分片只能由此日志证明。
 - **关键点/陷阱**：
-  - `.ready.sending` **不得**被 `*.ready` 扫描命中（glob `*.ready` 只匹配以 `.ready` 结尾者，`.ready.sending` 结尾是 `.sending`，安全——但实现后要抓目录确认）。
+  - `.ready.sending` **不得**被 `*.ready` 扫描命中（glob `*.ready` 只匹配以 `.ready` 结尾者，`.ready.sending` 结尾是 `.sending`，安全——实现后抓目录确认）。
   - 单/多 peer 路由 `extractTargetPeer` **保持不变**（中心节点多 peer 仍按文件名路由）。
   - 所有超时用 `QElapsedTimer` 单调毫秒。
-- **构建/验证（关键回归）**：两 demo **在默认 60000** 下：
-  - sync-suite `--selftest` 退出码 0（场景1 收敛 + 场景2 比对/写回）；
-  - sync-demo 输出收敛、无 error 记录；
-  - 抓 inbox：60000 下多为**单片**，但已走「ACK→`.sent`」新状态机（确认终态 `.sent` 出现、无 `.sending` 残留）。
-- **landable**：新 ARQ 路径在安全配置下**证明可用**（此步不引入多分片，风险最低）。**回滚**：`git revert` 本步（`run()` 改写是单文件、可整体回退）。
+- **构建/验证（关键回归，仍用默认 60000）**：两 demo **在默认 60000** 下：
+  - sync-suite `--selftest` 退出码 0（场景1 收敛 + 场景2 比对/写回）；sync-demo 输出收敛、无 error 记录；
+  - 由**观测日志**确认走了「ACK→`.sent`」新状态机、终态 `.sent`、无 `.sending` 残留。
+- **landable（如实、不夸大）**：60000/loopback 近无损**只验证 happy path**——新线格式、ACK、`.sent` 状态机、durable 交付主路径；**不会**自然触发发送端 `RTO` 重传/`giveUp`、接收端 `pending` 淘汰。后三者由 **Step 2 的接收端单测**（`eviction/retransmit_recovery/dup`）覆盖；发送端 `RTO/giveUp` 与端到端丢包恢复**不被 loopback 覆盖**，需**可选**的可控丢包注入（设计 §6.3，本计划列为可选增强）来实证。**回滚**：`git revert` 本步（单文件改写，可整体回退）。
 
-### Step 5 · 8 构造点设 `setMaxTransmitBytes(800)`（激活多分片）
+### Step 5 · 10 构造点设 `setMaxTransmitBytes(800)`（激活多分片）
 
 - **目标**：把每次传输上限切到 800B，真正激活多分片 + ARQ。
-- **改动**：在 8 个构造点**紧接构造、`start()` 之前**调 `setMaxTransmitBytes(800)`（设计 §2.3、原则「配置须在 start() 前」）：
+- **改动**：在**全部 10 个** UdpFileTransport 构造点**紧接构造、`start()` 之前**调 `setMaxTransmitBytes(800)`（设计 §2.3、原则「配置须在 start() 前」）：
   - `examples/sync-demo/main.cpp`：`centerTransport/edgeB/edgeC/edgeDTransport`（栈对象，`x.setMaxTransmitBytes(800)` 在 `x.start()` 前）；
   - `examples/sync-suite/Scenario1Runner.cpp`：同上 4 个；
   - `examples/sync-suite/Scenario2Model.cpp`：`centerTransport_/childTransport_`（`make_unique` 后、`->start()` 前 `->setMaxTransmitBytes(800)`）。
   - 建议各 demo 用一个常量（如 `constexpr int kMaxUdpBytes = 800;`）集中，避免散落魔数。
-- **构建/验证（核心）**：两 demo **在 800B** 下：
+- **构建/验证（核心，此处才真正证明多分片路径）**：两 demo **在 800B** 下：
   - sync-suite `--selftest` 退出码 0；场景2 的 1702B 快照被切成 **3 片**并正确重组、比对结论不变；
   - sync-demo 收敛、无 error；
-  - 抓 inbox / outbox：出现 `frag_count>1` 的多分片、终态 `.sent`；无半成品泄漏。
-- **landable**：800B 端到端跑通——**需求达成**。**回滚**：把 8 处改回默认（或删该行）。
+  - **由观测日志断言**（非 `ls`）：存在 `fragCount>1` 的消息、每 datagram ≤ 800、终态 `.sent`、`pendingCount()` 有界。
+- **landable**：800B 端到端跑通——**需求达成**。**回滚**：把 10 处改回默认（或删该行）。
 
 ### Step 6 · 双构建 + 全量验证 + 观测
 
@@ -138,26 +139,28 @@
   # udp_framing 为纯逻辑：无需 QT+=network、无需 moc（不含 Q_OBJECT）
   ```
 - `tests/tests.pro`：`SUBDIRS += tst_udp_reassembly` + `tst_udp_reassembly.file = unit/tst_udp_reassembly.pro`（仿 `tst_databridge_schema` 的两处登记）。
-- `tests/CMakeLists.txt`：`add_dbridge_test(tst_udp_reassembly "unit/tst_udp_reassembly.cpp;${CMAKE_SOURCE_DIR}/examples/sync-demo/udp_framing.cpp")` + `target_include_directories(... examples/sync-demo)`（按 `add_dbridge_test` 现有签名传多源；若签名只收单源，则改用直接 `add_executable` 或扩展该函数）。
+- `tests/CMakeLists.txt`：`add_dbridge_test(tst_udp_reassembly "unit/tst_udp_reassembly.cpp;${CMAKE_SOURCE_DIR}/examples/sync-demo/udp_framing.cpp")`——`add_dbridge_test(name sources)` 内部把 `${sources}` 展开给 `add_executable`，**分号 list 多源可行**（已核对）；随后 `target_include_directories(tst_udp_reassembly PRIVATE ${CMAKE_SOURCE_DIR}/examples/sync-demo)` 追加头路径。
 - 单测**不碰 SQLite**，故**无需** QSQLITE session 插件（比 `tst_databridge_schema` 更简单）。
 
-### 3.3 8 个构造点（Step 5，均在 `start()` 之前）
+### 3.3 10 个构造点（Step 5，均在 `start()` 之前）
 
-`examples/sync-demo/main.cpp`（4）、`examples/sync-suite/Scenario1Runner.cpp`（4）、`examples/sync-suite/Scenario2Model.cpp`（2）。
+`examples/sync-demo/main.cpp`（`centerTransport` + `edgeB/C/DTransport` = 4）、`examples/sync-suite/Scenario1Runner.cpp`（同构 4）、`examples/sync-suite/Scenario2Model.cpp`（`centerTransport_` + `childTransport_` = 2）。**共 4+4+2 = 10。**
 
 ---
 
 ## 4. 验证矩阵
 
+> **时序分离**：同一最终二进制在 Step 5 后硬编码 800、**不能再跑 60000**。故「60000」在 **Step 4 的 commit** 上验、「800」在 **Step 5/6 的 commit** 上验——不是同一二进制同时验两档。
+
 | 维度 | 方式 | 判据 |
 |---|---|---|
-| 单测（11 用例） | `QT_QPA_PLATFORM=offscreen ./tst_udp_reassembly` | 全绿（重点 `retransmit_recovery/durable_delivery/eviction/collision/reject_*`） |
-| sync-suite · 60000（Step 4） | `--selftest` | 退出码 0；新 ARQ 路径、终态 `.sent`、无 `.sending` 残留 |
-| sync-suite · 800（Step 5） | `--selftest` | 退出码 0；1702B 快照=3 片正确重组；比对结论不变 |
-| sync-demo · 60000/800 | 跑主流程（**恒返回 0**，须核对输出） | 输出收敛值一致、无 `[WARNING] … 存在错误记录`；inbox 见多分片(800)/`.sent` |
+| 单测 | `QT_QPA_PLATFORM=offscreen ./tst_udp_reassembly` | 全绿（重点 `retransmit_recovery/durable_delivery/eviction/collision/reject_*`） |
+| sync-suite · 60000（Step 4 commit） | `--selftest` | 退出码 0；由观测日志确认走新 ARQ 路径、终态 `.sent`、无 `.sending` 残留 |
+| sync-suite · 800（Step 5 commit） | `--selftest` | 退出码 0；日志见 `fragCount>1`（1702B 快照=3 片）且每 datagram≤800；比对结论不变 |
+| sync-demo · 60000 / 800（各自 commit） | 跑主流程（**恒返回 0**，须机器核对 stdout） | 收敛：末尾四端探测字段一致；正确性：`! grep -qE '存在错误记录\|\[ERR\]'` 于 stdout；800 档另由观测日志见多分片 |
 | 双构建 | qmake（`build_qmake_demos`）+ cmake（`build`） | 两套均编译通过、上述运行判据均满足 |
 | 内存有界 | 单测 `eviction` + 长跑观察 `pendingCount()` | 不单调增长 |
-| 观测激活 | 分片数/重传次数日志或计数 | 无损：分片>1(800)、重传=0；注入丢包(单测)：重传>0 且最终成功 |
+| 观测激活 | 每消息 `{msgId/artifact/fragCount/最大datagram/retries}` 日志或计数 | 无损：分片>1(800)、重传=0；（可选）单测注入丢包：重传>0 且最终成功 |
 
 > **注意**：sync-demo `main()` 恒 `return 0`（见其结尾），**不能只看退出码**——须核对 stdout 的收敛字段与「无错误记录」。sync-suite `--selftest` 有真实退出码。
 
@@ -167,7 +170,7 @@
 
 1. **pre-commit `clang-format` 会重排并中止首次提交**：提交 C++ 改动时，钩子自动格式化并失败；**重新 `git add` 已格式化的文件再 `git commit`** 即通过（第二次一次过）。`.md` 不受影响。
 2. **一个源、两处编译**：`udp_transport.cpp`/`udp_framing.cpp` 同时进 sync-demo 与 sync-suite；**每步两 demo 都要验**，别只测一个。
-3. **`setMaxTransmitBytes` 必须在 `start()` 之前**（8 处）——`run()` 启动后配置只读（设计原则）。栈对象在 `.start()` 前调；`unique_ptr` 在 `->start()` 前调。
+3. **`setMaxTransmitBytes` 必须在 `start()` 之前**（10 处）——`run()` 启动后配置只读（设计原则）。栈对象在 `.start()` 前调；`unique_ptr` 在 `->start()` 前调。
 4. **`.ready.sending` 命名与 `*.ready` glob**：确认认领后的文件不再被 `pollOutbox` 的 `*.ready` 扫到（实现后抓目录确认，防重复发送）。
 5. **多 peer 路由不变**：中心节点仍靠 `extractTargetPeer` 按文件名路由；ACK/重传的目标端点取自 `outbound[msgId].dest`。
 6. **大端一致**：`QDataStream` 显式 `BigEndian`（沿用现状）；头字段读写严格对称。
@@ -181,13 +184,14 @@
 ## 6. 完成定义（DoD）
 
 - [ ] `udp_framing.{h,cpp}` 实现 `fragmentMessage` + `FragmentReassembler`（含设计 §4.4 全部校验、durable 交付语义）。
-- [ ] `udp_transport.{h,cpp}`：`setMaxTransmitBytes(bool)` + ARQ + §5.2 交付状态机；删除 `sentFiles_` 与旧 `sendFile/handleDatagram`。
-- [ ] `tst_udp_reassembly` 11 用例全绿。
-- [ ] 8 构造点设 800B（`start()` 前）。
-- [ ] sync-suite `--selftest`（60000 与 800）退出码 0；sync-demo（60000 与 800）输出收敛、无错误记录。
+- [ ] `udp_transport.{h,cpp}`：`bool setMaxTransmitBytes(int)` + ARQ + §5.2 交付状态机（**通用 artifact 处理，`.payload`/`.ack` 一视同仁**）；删除 `sentFiles_` 与旧 `sendFile/handleDatagram`。
+- [ ] `udp_transport.{h,cpp}` 加**每消息观测**（msgId / filename / fragCount / 最大 datagram 字节 / retries）日志或计数。
+- [ ] `tst_udp_reassembly` 用例全绿（含 `retransmit_recovery/durable_delivery/eviction/collision/reject_*`）。
+- [ ] **10** 构造点设 800B（`start()` 前）。
+- [ ] **60000 在 Step 4 的 commit 验、800 在 Step 5/6 的 commit 验**（同一最终二进制硬编码 800、不能再跑 60000）：各自 sync-suite `--selftest` 退出码 0；sync-demo 输出收敛且 `! grep 存在错误记录`。
 - [ ] qmake 与 cmake 双路径均编译+运行通过。
-- [ ] 抓包确认：800B 下多分片到达、终态 `.sent`、`pendingCount()` 有界。
-- [ ] 分阶段提交（每步一 commit，信息含 Co-Authored-By）。
+- [ ] **日志断言**：800B 下存在 `fragCount>1` 的消息、每 datagram ≤ 800、终态 `.sent`、`pendingCount()` 有界（**不靠 `ls` 判分片**）。
+- [ ] 分阶段提交（每步一 commit，信息含 Co-Authored-By；注意 pre-commit clang-format 首次会重排 → 重新 `git add` 再提交）。
 
 ---
 
@@ -209,7 +213,8 @@ QT_QPA_PLATFORM=offscreen tests/unit/tst_udp_reassembly
 ( cd examples/sync-demo  && qmake ../../../examples/sync-demo/sync-demo.pro   && make -j$(nproc) )
 ( cd examples/sync-suite && qmake ../../../examples/sync-suite/sync-suite.pro && make -j$(nproc) )
 QT_QPA_PLATFORM=offscreen examples/sync-suite/sync-suite --selftest --ws /tmp/ss-ws
-QT_QPA_PLATFORM=offscreen examples/sync-demo/sync-demo /tmp/sd-ws   # 核对 stdout 收敛/无错误记录
+QT_QPA_PLATFORM=offscreen examples/sync-demo/sync-demo /tmp/sd-ws | tee /tmp/sd.out
+! grep -qE '存在错误记录|\[ERR\]' /tmp/sd.out && echo "sync-demo OK(无错误记录)"   # 机器判据(恒返回0, 须核对输出)
 
 # ── cmake ──
 cd /home/lfl/excelproject
@@ -218,8 +223,10 @@ cmake --build build --target tst_udp_reassembly sync-demo sync-suite -j$(nproc)
 QT_QPA_PLATFORM=offscreen build/tests/tst_udp_reassembly
 QT_QPA_PLATFORM=offscreen build/examples/sync-suite/sync-suite --selftest --ws /tmp/ss-cm
 
-# ── 抓多分片/终态（Step 5 验证）──
-ls /tmp/ss-ws/scenario2/snap_center/outbox   # 期望见 snapresp__*.payload.sent（800 下多分片）
+# ── 多分片/终态（Step 5 验证）──
+# 注意: 文件系统看不到 wire 层 fragCount。多分片由【传输层观测日志】证明, 不是 ls。
+#   期望日志: 某 msgId 的 fragCount>1 且每 datagram<=800; ls 仅能看终态 .sent:
+ls /tmp/ss-ws/scenario2/snap_center/outbox   # 仅证终态 snapresp__*.payload.sent(不证分片数)
 ```
 
 > `cd` 进子目录跑 `qmake/make` 若触发沙箱提示，改用 `make -C <dir> -f <Makefile>` 形式（本会话用过）。

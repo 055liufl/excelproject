@@ -2532,6 +2532,96 @@ flowchart TB
 
 **长推送"半截"语义**：分片直接落真实表、**不引入 per-push staging 表、不跨片回滚**。安全靠三道边界 —— ① FK 安全（父片不晚于子片，绝无悬挂）；② **半截不外泄下游**（中心推迟广播本 push 的直选变更，直到 `push_progress=done`）；③ 撞 schema 迁移时整发拒收（`E_SYNC_PUSH_SCHEMA_MOVED`）。
 
+#### 15.5.4 `sync()` 前台流程与 ACK 生命周期（两层 ACK）
+
+`ISyncEngine::sync()` 是一次**前台操作**：把本地已捕获的变更**抽干广播**给所有对端，然后**等它们回 ACK** 才算完成。它跑在**调用方线程**，真正的收发在 **worker 线程**（`SyncWorker::run()` 常驻循环）。
+
+> **务必先分清两层 ACK**（本节主角是「应用层同步 ACK」）：
+>
+> | | 传输层 UDP ACK | **应用层同步 ACK** |
+> |---|---|---|
+> | 位置 | `examples/sync-demo/udp_transport.cpp`（§15.13） | `src/sync/`（库内） |
+> | 形态 | 9 字节 UDP 包 | `.ack` 二进制**文件工件** |
+> | 语义 | "这个**数据报**我收到了" | "你那条变更我**成功应用**了，水位到某序号" |
+> | 类型 | 无 | `ChangesetAck` / `PushChunkAck`（`SyncTypes.h`） |
+>
+> 两者互不依赖：哪怕 UDP-ACK 丢了，应用层 ACK 仍靠 outbox 文件重传自愈；反之库本体在非 UDP 传输（U 盘/共享目录）下根本没有 UDP ACK，只有应用层 ACK。
+
+**① `sync()` 前台决策（`SyncEngine::sync`）**
+
+```mermaid
+flowchart TB
+    a([sync 调用 · 调用方线程]) --> g{gate.tryAcquire<br/>抢前台门控?}
+    g -->|被占| b[E_BUSY 返回]
+    g -->|成功| arm[startAckWait<br/>先武装 ACK 等待（C-1 修复：防广播完成到武装间漏收 ACK）]
+    arm --> d[[enqueueDrain：投递闭包给 worker 并阻塞等它跑完<br/>闭包内 scanInbox 收 + broadcastTopeer 发]]
+    d --> w{本轮写出工件?}
+    w -->|否 · 不会有 ACK| c0[cancelAckWait → Completed/100% → 还闸]
+    w -->|是| build[建 pendingAckWindow<br/>登记要等哪些 peer,origin,epoch,targetSeq]
+    build --> hold[门控继续持有，静待对端回 ACK]
+    hold --> j{processAckArtifact 收齐<br/>窗口全部 ackedSeq ≥ targetSeq?}
+    j -->|是| ok[Completed → onWorkerProgress 还闸]
+    j -->|超过 ackMaxDelayMs| to[E_SYNC_ACK_TIMEOUT → Failed → 还闸]
+```
+
+**worker 主循环每轮四阶段**（`SyncWorker::run`）：① `processPendingTasks`（执行 `sync` 的 drain 闭包等写任务）→ ② `scanInbox`（**收**：应用入站工件 + 生成/消费 ACK）→ ③ `broadcast`（到点的**后台周期**广播，独立于 `sync`）→ ④ ACK 超时检查。`sync()` 走的是「①里执行的 drain 闭包」这条前台主动路径，与 ③ 的后台广播是两条独立触发路径。
+
+**② 应用层 ACK 的生成与消费闭环**（都在 `scanInbox` 阶段——因为 `.ack` 也是 inbox 里的一种工件，`SyncWorker::processArtifact` 按 `.ack` 后缀分派到 `processAckArtifact`）
+
+```mermaid
+flowchart LR
+    ap[接收端 apply 成功<br/>processChangesetArtifact] --> sc[scheduleChangesetAck + flush<br/>生成 .ack 工件落 outbox]
+    sc --> mc[再 markConsumed<br/>H-01 铁律：先持久 ACK 再消费]
+    mc --> net[[.ack 经 outbox → inbox 回到发送端]]
+    net --> pa[发送端 processAckArtifact]
+    pa --> up[OutboundAckStore.updateAcked<br/>acked_seq = MAX，只增不减]
+    up --> win[命中 pendingAckWindow 且全达成<br/>→ 前台 sync 判 Completed]
+    up --> tr[minAckedSeq 之前的 changelog 可安全裁剪]
+```
+
+**关键不变量**：
+- **先持久 ACK，再 `markConsumed`**（H-01）：若两步之间崩溃，工件停在 `seen` 态，重启后**幂等重放 + 重发 ACK**，绝不静默丢确认。
+- **`acked_seq` 只增不减**（`updateAcked` 用 `MAX`）：ACK 可能乱序/重复到达，迟到的旧 ACK 不能把已确认水位拉回。
+- **入站 apply 本身不清 `ackWaiting_`**（J-02/I-19）：本端的等待只由本端收到对端回的 typed ACK（`processAckArtifact`）或超时才清除。
+- **重发下界用 `minUnackedLocalSeq`**（C-02）：广播读取起点取"最早未确认"而非"最后已发送"，保证丢包的变更下轮仍被重读重发。
+- `PushChunkAck` 是选择性推送的**分片级**确认（`pushId + chunkSeq + checksum + ok`）：全片 ok 才算发完，支撑断点续传与完整性核对（见 §15.5.3）。
+
+**③ 端到端时序（edge 上行增量 → center 回 ACK → edge 收 ACK 并裁剪）**
+
+```text
+Edge   sync(): 抢门控 → startAckWait → enqueueDrain
+       └ drain 闭包: broadcastTopeer(center) 读 changelog(origin=edge, seq=N)
+                     → 编码 changeset 工件写 outbox
+                     → 登记 pendingAckWindow{ center, edge, epoch, targetSeq=N }
+       ── changeset 工件经传输层搬到 center/inbox ──
+Center scanInbox → processChangesetArtifact
+       ├ SchemaGuard 校验 → AppliedVectorStore.check(seq=N):
+       │      Apply(=水位+1) / NoOp(≤水位,幂等跳过) / Gap(>水位+1,不应用,留 seen)
+       ├ Apply: ChangesetApplier.apply_v2 + advance(N) + changelog 转发   （同一 WriteTxn）
+       └ scheduleChangesetAck{origin=edge, appliedSeq=N, toPeer=edge} → flush → 再 markConsumed
+       ── ack__center__edge__ts.ack 搬回 edge/inbox ──
+Edge   scanInbox → processAckArtifact
+       ├ OutboundAckStore.updateAcked(peer=center, origin=edge, epoch, N)   // MAX 推进
+       └ pendingAckWindow 全达成 → ackWaiting=false → Completed → 还闸
+Edge   后台某轮: minAckedSeq=N → 删除 __sync_changelog 中 origin=edge 且 seq ≤ N 的行
+```
+
+**代码坐标速查**（符号名，避免行号随代码漂移）：
+
+| 环节 | 位置 |
+|---|---|
+| `sync()` 前台入口 / 门控 / 武装 ACK | `SyncEngine::sync` |
+| 抽干广播（收+发+建 ACK 窗口） | `SyncWorker::enqueueDrain` |
+| 主循环四阶段 | `SyncWorker::run` → `processPendingTasks` / `scanInbox` / `broadcast` |
+| `.ack` 分派 | `SyncWorker::processArtifact`（`.ack` 后缀） |
+| ACK 生成（先 flush 后 markConsumed，H-01） | `SyncWorker::processChangesetArtifact` + `AckChannel::scheduleChangesetAck/flush` |
+| ACK 消费 / 推进水位 / 判定完成 | `SyncWorker::processAckArtifact` + `OutboundAckStore::updateAcked` |
+| 重发下界（C-02）/ 裁剪下界 | `OutboundAckStore::minUnackedLocalSeq` / `minAckedSeq` |
+| ACK 攒批（默认 `ackMaxDelayMs=5000`） | `AckChannel`（`transport/AckChannel.h`） |
+| ACK 结构体 | `SyncTypes.h`：`ChangesetAck` / `PushChunkAck` / `PendingAckEntry` |
+
+> **传输层 UDP ACK 补充**：以上 `.ack` 工件如何在节点间**可靠送达**，是传输层的事。demo 用自研 UDP ARQ（9 字节 UDP ACK + 全量重传）保证 outbox→inbox 的文件不丢，详见 [§15.13](#1513-可靠-udp-分片传输拆包与组包-arq)。生产可换成任意"目录搬运"通道（U 盘、共享盘、rsync），此时无 UDP ACK，应用层 ACK 语义不变。
+
 ---
 
 ### 15.6 局部架构（按模块）

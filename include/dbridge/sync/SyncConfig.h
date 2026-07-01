@@ -337,30 +337,41 @@ class DBRIDGE_EXPORT SyncConfig::Builder {
         return *this;
     }
 
+    // ── build —— 集中校验并产出最终 SyncConfig（唯一合法出口）────────────────────
+    // 做什么：按“必填项 → 拓扑一致性 → 各数值下界 → soft<=hard 关系 → rank 全局唯一”
+    //         的顺序逐项检查；任一不通过即写 *err（可空）并返回默认构造的对象
+    //         （其 isValid()==false）；全部通过才把 valid_ 置 true 并返回填好的 cfg_。
+    // 设计意图：把“非法配置根本造不出 isValid()==true 对象”这一不变式坐实在此一处，
+    //           下游（SyncEngine/Worker）拿到 isValid()==true 即可免去重复防御性校验。
+    // 返回：SyncConfig。失败时是空对象，调用方须以 isValid() 或 *err 判定成败。
     SyncConfig build(QString* err = nullptr) {
-        if (cfg_.nodeId_.isEmpty()) {
+        // ── 必填项：缺一不可（无默认值兜底的核心身份/路径）──────────────────────
+        if (cfg_.nodeId_.isEmpty()) {  // 本节点 id 是变更 origin 的来源，必填
             if (err)
                 *err = QStringLiteral("nodeId is required");
             return {};
         }
-        if (cfg_.sqlitePath_.isEmpty()) {
+        if (cfg_.sqlitePath_.isEmpty()) {  // 不知道同步哪个库，无从谈起
             if (err)
                 *err = QStringLiteral("database path is required");
             return {};
         }
-        if (cfg_.outboxDir_.isEmpty() || cfg_.inboxDir_.isEmpty()) {
+        if (cfg_.outboxDir_.isEmpty() || cfg_.inboxDir_.isEmpty()) {  // 收发件箱是传输载体，必填
             if (err)
                 *err = QStringLiteral("outboxDir and inboxDir are required");
             return {};
         }
+        // ── 拓扑一致性：peerNodes / role / centerNode 之间的关系约束 ─────────────
         // M-01 fix: additional validation.
         // peerNodes must not contain the local nodeId.
+        // 自己不能出现在对端列表里（否则会给自己发/等自己的 ACK，逻辑自指）。
         if (cfg_.peerNodes_.contains(cfg_.nodeId_)) {
             if (err)
                 *err = QStringLiteral("nodeId must not appear in peerNodes");
             return {};
         }
         // peerNodes must not contain empty strings.
+        // 空串不是合法节点 id，禁止混入（否则后续按 id 路由/建目录会出错）。
         for (const QString& p : cfg_.peerNodes_) {
             if (p.isEmpty()) {
                 if (err)
@@ -369,6 +380,8 @@ class DBRIDGE_EXPORT SyncConfig::Builder {
             }
         }
         // peerNodes must not contain duplicates.
+        // 对端不得重复：先排序再比相邻项，命中即报第一个重复者。重复会导致对同一对端
+        // 重复堆 outbox、重复登记 pending-ACK，破坏水位统计的正确性。
         {
             QStringList sorted = cfg_.peerNodes_;
             std::sort(sorted.begin(), sorted.end());
@@ -382,20 +395,23 @@ class DBRIDGE_EXPORT SyncConfig::Builder {
             }
         }
         // Edge nodes must specify a centerNode.
+        // 边缘节点只与中心交换，故必须知道中心是谁；缺 centerNodeId 无法定向收发。
         if (cfg_.role_ == NodeRole::Edge && cfg_.centerNodeId_.isEmpty()) {
             if (err)
                 *err = QStringLiteral("centerNodeId is required for Edge role");
             return {};
         }
         // centerNode must not appear in peerNodes (for non-Edge roles).
+        // 中心节点本身不应又被列为普通对端（角色语义冲突）。
         if (cfg_.role_ != NodeRole::Edge && !cfg_.centerNodeId_.isEmpty() &&
             cfg_.peerNodes_.contains(cfg_.centerNodeId_)) {
             if (err)
                 *err = QStringLiteral("centerNodeId must not appear in peerNodes");
             return {};
         }
+        // ── 数值下界：以下各项若 <=0 会让配额/超时/间隔失去意义或退化为“禁用”，逐一拒绝 ─
         // outboxMaxBytesPerPeer must be positive.
-        if (cfg_.outboxMaxBytesPerPeer_ <= 0) {
+        if (cfg_.outboxMaxBytesPerPeer_ <= 0) {  // 发件箱字节配额须为正，否则无法约束膨胀
             if (err)
                 *err = QStringLiteral("outboxMaxBytesPerPeer must be positive");
             return {};
@@ -469,6 +485,8 @@ class DBRIDGE_EXPORT SyncConfig::Builder {
                 *err = QStringLiteral("peerLagHardMs must be > 0");
             return {};
         }
+        // ── soft<=hard 关系：软阈值（告警 lagging）不得高于硬阈值（驱逐 evicted），否则
+        //    会出现“还没告警就先被驱逐”的悖论；三个维度（seq/bytes/ms）各校验一次 ──────
         // M-01 fix: validate soft <= hard threshold relationships and positive-only fields.
         if (cfg_.peerLagSoftSeq_ > cfg_.peerLagHardSeq_) {
             if (err)
@@ -496,16 +514,20 @@ class DBRIDGE_EXPORT SyncConfig::Builder {
                 *err = QStringLiteral("outboxMaxArtifactsPerPeer must be > 0");
             return {};
         }
-        if (cfg_.baselineSizeWarnBytes_ != 0 && cfg_.baselineSizeWarnBytes_ <= 0) {
+        // 下面两项约定“0 = 关闭该功能”（0 合法），但负数无意义故拒绝。
+        // 注意 `!=0 && <=0` 等价于“<0”：允许 0（关闭），仅拦截负值。
+        if (cfg_.baselineSizeWarnBytes_ != 0 && cfg_.baselineSizeWarnBytes_ <= 0) {  // 0=不告警
             if (err)
                 *err = QStringLiteral("baselineSizeWarnBytes must be > 0 when set");
             return {};
         }
-        if (cfg_.changelogRetention_ != 0 && cfg_.changelogRetention_ <= 0) {
+        if (cfg_.changelogRetention_ != 0 && cfg_.changelogRetention_ <= 0) {  // 0=不限保留条数
             if (err)
                 *err = QStringLiteral("changelogRetention must be > 0 when set");
             return {};
         }
+        // ── rank 全局唯一：冲突仲裁先比 rank、rank 相同再比 seq；若两个 origin 配了相同
+        //    rank，当 seq 也打平时“谁胜”就无法确定，破坏多节点最终一致，故此处拒绝重复 ──
         // H-01 fix: validate that all explicitly configured ranks are globally unique
         // across all participating nodes (nodeId + peerNodes). Two origins with the same
         // rank would make conflict resolution non-deterministic when seq also ties.

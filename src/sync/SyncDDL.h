@@ -458,6 +458,19 @@ inline QString changesetArtifactName(const QString& origin, qint64 epoch, qint64
 // M-01 fix: naming follows the stable contract used by changeset artifacts:
 //   origin__epoch__selectionpush__pushId.chunkSeq__[peer-]uuid.payload
 // origin and epoch are at fixed positions; a UUID suffix guarantees global uniqueness.
+//
+// selectionPushArtifactName —— 拼装一个“选择性推送分片”工件的文件名。
+// 【M-01 修复】沿用与 changeset 工件一致的稳定契约：
+//   origin__epoch__selectionpush__<pushId>.<chunkSeq>__[peer-]uuid.payload
+//   origin/epoch 在固定位置；末尾总带 UUID 后缀保证全局唯一。
+// 与 changeset 名的关键差异：把“批次 id + 分片序号”编进第 4 字段（pushId.chunkSeq），
+//   使收方仅凭文件名即可知道“这属于哪次推送的第几片”，配合 __sync_push_chunk_progress 做
+//   分片级幂等与断点续传。
+// 参数：origin 发起推送的来源；epoch 纪元；pushId 本次推送批次 id；chunkSeq 分片序号（0 起）；
+//   targetPeer 目标对端（可空；非空时以 "peer-<peer>-<uuid>" 形式嵌在末尾，区分发给不同 peer）。
+// 返回：拼装好的工件文件名。
+// 细节：chunkSeq 用 rightJustified(6,'0') 左补零到 6 位 → 同一 pushId 下分片按字典序即按序号
+//   升序；uuid 取去花括号后的前 8 位，避免同毫秒偶发重名。线程：纯函数，无副作用。
 inline QString selectionPushArtifactName(const QString& origin, qint64 epoch, const QString& pushId,
                                          int chunkSeq, const QString& targetPeer = QString()) {
     const QString uuid = QUuid::createUuid().toString(QUuid::WithoutBraces).left(8);
@@ -478,6 +491,18 @@ inline QString selectionPushArtifactName(const QString& origin, qint64 epoch, co
         .arg(uuid);
 }
 
+// baselineRequestArtifactName —— 拼装一个“基线请求（baseline request）”工件的文件名。
+// 用途：当接收方发现自己相对某来源落后过多（如出现无法补洞的 gap、或对端标记 pending_baseline）
+//   时，会主动发出一个“基线请求”，向对端索要从某个 seq 起的全量基线（而非逐条增量）。
+//   本函数生成该请求工件的文件名。
+// 命名形态：<fromPeer>__<toPeer>__<epoch>__<zero-padded fromSeq>__<suffix>__baselinerequest.payload
+//   与 changeset 名不同：这里把 fromPeer/toPeer 双方都编进名字（请求是点对点的“我向你要”），
+//   kind 标识 "baselinerequest" 放在末尾。
+// 参数：fromPeer 发出请求的一方（即需要基线的落后节点）；toPeer 被请求提供基线的一方；
+//   epoch 纪元；fromSeq 请求“从该 origin_seq 起”的基线；uniqueSuffix 唯一后缀（可空，
+//   为空则自动生成一段 8 位 UUID，保证同参数下多次请求不重名）。
+// 返回：拼装好的工件文件名。
+// 细节：fromSeq 左补零到 12 位使字典序=数值序。线程：纯函数，无副作用（UUID 来自系统熵源）。
 inline QString baselineRequestArtifactName(const QString& fromPeer, const QString& toPeer,
                                            qint64 epoch, qint64 fromSeq,
                                            const QString& uniqueSuffix = QString()) {
@@ -492,6 +517,17 @@ inline QString baselineRequestArtifactName(const QString& fromPeer, const QStrin
         .arg(suffix);
 }
 
+// baselineResponseArtifactName —— 拼装一个“基线响应（baseline response）”工件的文件名。
+// 用途：与上面的基线请求配对——被请求方（toPeer 侧的持有者）据请求导出一份全量基线，用本函数
+//   生成响应工件的文件名发回。接收方套用该基线后，即可把自己的 applied_vector 水位一次性
+//   对齐到 sourceMaxSeq，跨过原先无法逐条补上的 gap。
+// 命名形态：<fromPeer>__<toPeer>__<epoch>__<zero-padded
+// sourceMaxSeq>__<suffix>__baselineresponse.payload 参数：fromPeer 提供基线的一方；toPeer
+// 接收基线的一方；epoch 纪元；
+//   sourceMaxSeq 本基线快照所覆盖到的“来源最大 origin_seq”（接收方套用后水位直接推进到此）；
+//   uniqueSuffix 唯一后缀（可空，为空则自动生成 8 位 UUID）。
+// 返回：拼装好的工件文件名。
+// 细节：sourceMaxSeq 左补零到 12 位使字典序=数值序。线程：纯函数，无副作用。
 inline QString baselineResponseArtifactName(const QString& fromPeer, const QString& toPeer,
                                             qint64 epoch, qint64 sourceMaxSeq,
                                             const QString& uniqueSuffix = QString()) {
@@ -507,6 +543,18 @@ inline QString baselineResponseArtifactName(const QString& fromPeer, const QStri
 }
 
 // H-03 fix: include a per-call UUID suffix so same-millisecond ACKs never collide.
+//
+// ackArtifactName —— 拼装一个“确认（ACK）”工件的文件名。
+// 用途：接收方成功应用了某来源的变更后，回一个 ACK 告知发送方“我已推进到某进度”，发送方据此
+//   更新 __sync_outbound_ack 的 acked_seq、收束前台操作的 ACK 等待。本函数生成该 ACK 工件名。
+// 命名形态：ack__<fromPeer>__<toPeer>__<ms>__<suffix>.ack
+//   注意扩展名是 .ack（区别于其它工件的 .payload），且以 "ack__" 前缀开头，便于扫描时快速识别
+//   类别；fromPeer/toPeer 表明“谁确认给谁”。
+// 【H-03 修复】追加每次调用独立的 UUID 后缀 suffix：否则同一毫秒内产生的多个 ACK 会算出相同
+//   文件名而互相覆盖（同目录不能有两个同名文件），导致 ACK 丢失。
+// 参数：fromPeer 发出确认的一方；toPeer 被确认的一方；ms 产生该 ACK 的毫秒时间戳；
+//   uniqueSuffix 唯一后缀（可空，为空则自动生成 8 位 UUID）。
+// 返回：拼装好的 ACK 工件文件名。线程：纯函数，无副作用。
 inline QString ackArtifactName(const QString& fromPeer, const QString& toPeer, qint64 ms,
                                const QString& uniqueSuffix = QString()) {
     const QString suffix = uniqueSuffix.isEmpty()
@@ -519,6 +567,19 @@ inline QString ackArtifactName(const QString& fromPeer, const QString& toPeer, q
 // ALTER TABLE ADD COLUMN fails if the column already exists; we intentionally ignore that
 // error so the function is idempotent and works for both fresh and pre-existing databases.
 // Returns false only on catastrophic failures (not "column already exists").
+//
+// applyMigrations —— 对“已存在的老库”补做增量式 schema 迁移（新库无需，但调它也无害）。
+// 【M-04 修复】背景：allCreateStatements() 里的 CREATE TABLE 只在“表尚不存在”时生效
+//   （IF NOT EXISTS）；对早于某新列存在的老库，表已在、CREATE 直接跳过，新列不会被补上。
+//   故需要本函数用 ALTER TABLE ADD COLUMN 单独补列。SyncWorker.run() 在建表之后调用它。
+// 做什么：目前只做一件事——给 __sync_changelog 补 push_id 列（非选择性推送的 changeset 该列为
+//   NULL）。将来若有更多列/表演进，都在此按序追加 ALTER 语句。
+// 幂等的关键技巧：ALTER TABLE ADD COLUMN 在列已存在时会失败（"duplicate column name"），这里
+//   【刻意不检查该 exec 的返回值】——把这种“已经加过了”的失败当成预期情况直接忽略，从而无论
+//   新库/老库、执行一次/多次都安全。
+// 返回：恒 true。真正灾难性的失败（并非“列已存在”）这里不拦截，会在后续真正 INSERT 用到该列
+//   时暴露出来（此时报错信息更贴近问题现场）。
+// 线程：在 worker 写线程、对其独占写连接调用。副作用：可能给老库新增一列。
 inline bool applyMigrations(QSqlDatabase& db) {
     // M-04: add push_id column to __sync_changelog (NULL for non-push changesets).
     QSqlQuery q(db);
@@ -526,6 +587,8 @@ inline bool applyMigrations(QSqlDatabase& db) {
     // Ignore error: "duplicate column name" is expected when column already exists.
     // Any other error is a schema mismatch we cannot auto-fix — it will surface later
     // when a real INSERT fails.
+    // 忽略错误：列已存在时报 "duplicate column name" 属预期；其它错误是无法自动修复的 schema
+    // 不匹配，会在后续真正 INSERT 时才浮现（届时更易定位）。
     return true;
 }
 

@@ -205,9 +205,13 @@ static QSet<int> applyLookups(QVector<RoutePayload>& payloads, const QVector<Rou
 
         for (const LookupSpec& lk : route.lookups) {
             const TableInfo* gTable = catalog.table(lk.fromTable);
+            // 本行这条 lookup 归属哪个「查找身份」——用它去 Phase A.5 预取好的 cache 里取对应桶。
             QString identityKey = buildIdentityKey(lk);
 
             // Build match key with affinity cast
+            // 【译】构造「匹配键」：逐个取本行 Excel 里的匹配列原始值，做亲和性强转后收进
+            // matchVals。
+            //   matchVals 各分量的顺序与 lk.match 一致，稍后 makeTupleKey 会把它拼成缓存查询键。
             QVector<QVariant> matchVals;
             bool hasError = false;
             QStringList matchHeaders;
@@ -217,6 +221,8 @@ static QSet<int> applyLookups(QVector<RoutePayload>& payloads, const QVector<Rou
                 QVariant raw = reader.cellBySource(row, mp.second);
 
                 // §5.2 empty: null or trimmed-empty; numeric zero is NOT empty
+                // 【译】判空规则：SQL NULL 或「去空白后为空串」都算空键；但数值 0 不算空——
+                //   因为 0 是合法业务键（如 ID=0）。空键无法参与匹配，报 E_LOOKUP_KEY_EMPTY。
                 bool isEmpty = raw.isNull();
                 if (!isEmpty && raw.toString().trimmed().isEmpty())
                     isEmpty = true;
@@ -233,6 +239,10 @@ static QSet<int> applyLookups(QVector<RoutePayload>& payloads, const QVector<Rou
                 }
 
                 // §5.3 cast to G column affinity
+                // 【译】把匹配列原始值强转成「参照表 G 对应列的亲和性」类型（见 castToAffinity）。
+                //   为什么：Excel 读出的多是文本，而 G 表匹配列可能是 INTEGER；不归一就会因
+                //   SQLite 严格区分存储类而失配。gCol 为空（G 表/列查不到）时退化为字符串处理。
+                //   转换失败（如把 "abc" 当 INT）→ 报 E_LOOKUP_KEY_INVALID。
                 const ColumnInfo* gCol = gTable ? gTable->column(mp.first) : nullptr;
                 QVariant casted = gCol ? castToAffinity(raw, *gCol) : QVariant(raw.toString());
                 if (!casted.isValid()) {
@@ -256,6 +266,9 @@ static QSet<int> applyLookups(QVector<RoutePayload>& payloads, const QVector<Rou
             }
 
             // §5.4 look up in prefetch cache
+            // 【译】在预取缓存里查：先把匹配键元组序列化成 tkey，取本身份的桶 idCache，
+            //   再按 tkey 定位命中。命中不到（it==end）→ 参照表里没有这条业务键，报
+            //   E_LOOKUP_NOT_FOUND；下面把各匹配列拼成 "col=value" 便于用户排查是哪对键没配上。
             QString tkey = makeTupleKey(matchVals);
             const auto& idCache = cache.value(identityKey);
             auto it = idCache.find(tkey);
@@ -278,6 +291,8 @@ static QSet<int> applyLookups(QVector<RoutePayload>& payloads, const QVector<Rou
             const LookupHit& hit = it.value();
 
             // §5.5 ambiguous
+            // 【译】歧义：同一匹配键在 G 表里命中了多行（hitCount>1）。无法确定该取哪一行的
+            //   代理主键，只能报 E_LOOKUP_AMBIGUOUS 并让该路由失败——提示用户按匹配列去重 G 表。
             if (hit.hitCount > 1) {
                 errors->add(sheet, row, matchHeaders.join(QLatin1Char(',')), tkey,
                             QString::fromLatin1(err::E_LOOKUP_AMBIGUOUS),
@@ -291,19 +306,25 @@ static QSet<int> applyLookups(QVector<RoutePayload>& payloads, const QVector<Rou
             }
 
             // §5.6 append select results (NULL transparent)
+            // 【译】唯一命中：把查得的「选取列」值写回本路由载荷。NULL 透明传递——命中行里
+            //   若某选取列本身是 NULL，就照样写 NULL（这是合法结果，不当错误）。
             for (int si = 0; si < lk.select.size(); ++si) {
-                const QString& targetCol = lk.select[si].second;
-                const QVariant& val = hit.values[si];
+                const QString& targetCol = lk.select[si].second;  // 该选取列要落到的本地 dbColumn
+                const QVariant& val = hit.values[si];  // 从缓存取回的值（即外键值）
 
+                // 该目标列可能已由 Mapper 映射过（载荷里已有）：已有则「覆盖」其 bind 值，
+                // 否则「追加」一列。这样查找结果总是以最终值胜出（外键由查找权威决定）。
                 int existingIdx = payload.indexOf(targetCol);
                 if (existingIdx >= 0) {
-                    payload.binds[existingIdx] = val;
+                    payload.binds[existingIdx] = val;  // 覆盖已有绑定
                 } else {
-                    payload.dbColumns.append(targetCol);
+                    payload.dbColumns.append(targetCol);  // 追加新列
                     payload.binds.append(val);
                 }
 
                 // Update conflictVals if this target is a conflict column
+                // 【译】若这个被查出的列同时也是 UPSERT 的冲突键列，必须同步更新 conflictVals——
+                //   否则 UPSERT 的「插入还是更新」判断会用到过时的旧值，导致错误地新插或误更新。
                 for (int ci = 0; ci < payload.conflictKey.size(); ++ci) {
                     if (payload.conflictKey[ci] == targetCol && ci < payload.conflictVals.size()) {
                         payload.conflictVals[ci] = val;
@@ -313,6 +334,8 @@ static QSet<int> applyLookups(QVector<RoutePayload>& payloads, const QVector<Rou
         }
 
         // §D11: any lookup failure on this route → seed cascade suppression
+        // 【译】本路由只要有任一 lookup 失败，就把它记入 failedRoutes 作为「级联抑制」的种子——
+        //   写阶段会据此跳过该路由「及其所有子孙路由」（父外键没查到，子的外键更无从谈起）。
         if (routeFailed)
             failedRoutes.insert(i);
     }
@@ -365,6 +388,7 @@ static bool buildLookupCache(const ProfileSpec& profile, const SchemaCatalog& ca
     }
 
     // For each identity: pre-scan Excel, batch SELECT, populate cache
+    // 【译】对每个去重后的查找身份，独立走一遍「预扫 Excel 收键 → 分批 SELECT → 填缓存桶」。
     for (auto it = identitySpecs.begin(); it != identitySpecs.end(); ++it) {
         const QString& ikey = it.key();
         const LookupSpec& lk = it.value();
@@ -404,12 +428,15 @@ static bool buildLookupCache(const ProfileSpec& profile, const SchemaCatalog& ca
         }
 
         // §4.5 K == 0: skip SELECT entirely
+        // 【译】本身份一个可查的键都没有（全被空/转换失败跳过）→ 干脆不发 SELECT，缓存置空桶。
         if (keyMap.isEmpty()) {
             (*cache)[ikey] = {};
             continue;
         }
 
         // Build batch SELECT: SELECT <match cols>, <select cols> FROM G WHERE ...
+        // 【译】拼预取列清单：先放匹配列、再放选取列。这个「先匹配后选取」的固定列序很关键——
+        //   下面读结果时正是靠它把结果切成 [匹配段 | 选取段]（前 numMatchCols 个是匹配值）。
         QStringList selectColNames;
         for (const auto& mp : lk.match)
             selectColNames.append(mp.first);
@@ -681,6 +708,8 @@ ImportResult ImportService::run(const ProfileSpec& profile, const SchemaCatalog&
 
         // Map Excel columns to payloads
         // M-06 fix: pass sheetName so Mapper error entries carry the correct sheet location.
+        // 【译】把本行 Excel 列映射成各路由载荷，并做行级校验。M-06 修复：传入 sheetName，
+        //   让 Mapper 记录的错误条目带上正确的工作表名（否则定位不到是哪张 sheet 出错）。
         ctx.payloads = mapper.map(*routesPtr, r, ctx.classId, reader, validatorMap, profile,
                                   &errors, sheetName);
         // H-01 fix: validator and temporal-conversion failures are route-local (Mapper sets
@@ -688,6 +717,10 @@ ImportResult ImportService::run(const ProfileSpec& profile, const SchemaCatalog&
         // so only the affected route (and its descendants) is skipped, while sibling routes whose
         // payloads are valid still proceed.  hasNonRouteError is reserved for structural errors
         // (missing columns, codec failures) that render the entire row unusable.
+        // 【H-01 修复｜译】校验失败、时间转换失败都属「路由局部」错误——Mapper 只把对应路由的
+        //   payload.hasError 置位。这里据此把受影响路由加入 failedRouteIndices，从而只跳过该路由
+        //   （及其子孙），数据完好的兄弟路由仍照常写入。hasNonRouteError 则专留给「结构性错误」
+        //   （缺列、编解码失败等）——那种错误会让整行载荷不可用，必须整行跳过。
         for (int pi = 0; pi < ctx.payloads.size(); ++pi) {
             if (ctx.payloads[pi].hasError)
                 ctx.failedRouteIndices.insert(pi);
@@ -702,13 +735,22 @@ ImportResult ImportService::run(const ProfileSpec& profile, const SchemaCatalog&
         // return value overwrote ctx.failedRouteIndices, discarding the Mapper failures.
         // H-04 fix: capture failedRouteIndices so write phase skips only affected payloads
         // (and their descendants) rather than the entire Excel row.
-        QSet<int> initialFailed = ctx.failedRouteIndices;  // save Mapper failures
-        initialFailed |= lookupFailed;
+        // 【H-01/H-04 修复｜译】此处要把「三种失败来源」合并成一个种子集交给 FkInjector：
+        //   ①Mapper 校验失败(ctx.failedRouteIndices) ②applyLookups 查找失败(lookupFailed)。
+        //   合并后传入 inject()，inject 再叠加它自己发现的外键注入失败，返回「最终失败路由集」。
+        //   历史 bug：早期直接用 inject() 的返回值覆盖 ctx.failedRouteIndices，把前两种来源丢了——
+        //   故现在先 save 再用 |= 合并，三源都保留。写阶段据最终集只跳受影响路由及其子孙。
+        QSet<int> initialFailed =
+            ctx.failedRouteIndices;     // save Mapper failures 先保存 Mapper 侧失败
+        initialFailed |= lookupFailed;  // 并入查找失败
         FkInjector fkInjector;
         ctx.failedRouteIndices = fkInjector.inject(ctx.payloads, *routesPtr, r, sheetName, &errors,
                                                    std::move(initialFailed));
 
         // Batch uniqueness check — only on payloads that did not fail injection
+        // 【译】批内唯一性检查：只对「未失败」的载荷做。同一批数据里，冲突键不得重复；若某路由是
+        //   父表(hasChildren)，其主键在批内重复会破坏子表外键引用，故需带 hasChildren
+        //   标志更严格检查。
         for (int pi = 0; pi < ctx.payloads.size(); ++pi) {
             if (ctx.failedRouteIndices.contains(pi))
                 continue;
@@ -852,12 +894,21 @@ ImportResult ImportService::run(const ProfileSpec& profile, const SchemaCatalog&
         // below so that sibling routes whose payloads are valid can still be written.
         // M-04: hasNonRouteError covers the case where both kinds of errors coexist — the
         // presence of non-route errors means the whole row must be skipped.
+        // 【H-02/M-04 修复｜译】这是「部分成功」模型的关键判定：本行既然出过错(在 failedExcelRows
+        //   里)，是「整行跳过」还是「只跳坏路由、保留好路由」？规则——只有当
+        //   ①存在非路由局部错误(hasNonRouteError，载荷整体不可用)，或 ②根本没有任何路由级失败标记
+        //   (failedRouteIndices 为空，说明错误无法归因到具体路由) 时，才整行跳过(continue)。
+        //   否则（错误都能归到具体路由）就放行到下面的「按路由过滤」，让数据完好的兄弟路由照常写入。
         if (failedExcelRows.contains(ctx.excelRow) &&
             (ctx.hasNonRouteError || ctx.failedRouteIndices.isEmpty()))
             continue;
         // Rows with only failedRouteIndices fall through; skipPayloadIndices below handles them.
+        // 【译】仅有路由级失败的行「落」到这里继续处理，由下方的 skipPayloadIndices
+        // 精确剔除坏路由。
 
         // H-04 fix: determine the routes for this context.
+        // 【H-04 修复｜译】取本行 ctx 对应的路由集：Mixed 模式按 classId 取，其余用空串 key 取。
+        //   需要它是因为下面要按外键父子关系计算「失败子孙闭包」，必须知道本行用的是哪套路由。
         const QVector<RouteSpec>* routesForCtx = nullptr;
         if (profile.mode == ProfileMode::Mixed) {
             auto it = topoRoutes.find(ctx.classId);

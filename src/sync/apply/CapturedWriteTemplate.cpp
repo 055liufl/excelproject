@@ -448,10 +448,16 @@ WriteResult CapturedWriteTemplate::branchBC(const WriteParams& p) {
         preScan.append(ps);
     }
 
+    // ── 逐行 UPSERT 落库（设计 I-08）───────────────────────────────────────────
     // Execute row mutations via UpsertExecutor (I-08).
+    // 此刻 session 已开启：下面这批 UPSERT 实际产生的行变更会被 SQLite session 逐条录进
+    //   changeset（稍后由 sealInto 封存）。UpsertExecutor 会把逐行的约束/外键失败收集进
+    //   rowErrors（非致命、不中断），只有“致命”错误（如 prepare 失败/库未打开）才返回 false。
     UpsertExecutor upsertEx;
     QList<dbridge::RowError> rowErrors;
     if (!upsertEx.apply(wconn_, p.mutations, &rowErrors, &err)) {
+        // 致命写失败：先 rec_.abort() 拆掉已开的 session（否则会话会悬挂在连接上），再回滚事务。
+        //   顺序固定为“先拆会话、后回滚事务”——两者都作用于同一连接/句柄。
         rec_.abort();
         txn.rollback();
         result.errorCode = QStringLiteral("E_DB_UPSERT");
@@ -460,7 +466,14 @@ WriteResult CapturedWriteTemplate::branchBC(const WriteParams& p) {
     }
     // C-09 fix: any row-level errors (FK violation, constraint) must abort the whole chunk.
     // Committing with partial row errors would let the receiver ACK a broken chunk.
+    // 【C-09 修复 / 全有或全无】任何一条逐行错误（外键违反 / 约束冲突）都必须让“整个 chunk”
+    //   失败回滚。为什么不能只丢掉出错那几行、提交其余？因为一旦提交，接收方就会对这个
+    //   chunk 回 ACK，发送端便认为“整块已成功送达”，那几条失败的行将永远补不回来——形成
+    //   静默丢更。故这里只要 rowErrors 非空，就连同已成功的行一起回滚。
     if (!rowErrors.isEmpty()) {
+        // 同样先拆 session、再回滚整块。错误码按“首条失败”的性质粗分：含 "FK"/"foreign"
+        //   归为外键失败 E_SYNC_APPLY_FK，否则归为一般约束失败 E_SYNC_APPLY_CONSTRAINT。
+        //   errorMsg 汇总失败行数并附上首条详情，便于诊断。
         rec_.abort();
         txn.rollback();
         result.errorCode = rowErrors.first().code.contains(QLatin1String("FK")) ||
@@ -473,12 +486,25 @@ WriteResult CapturedWriteTemplate::branchBC(const WriteParams& p) {
         return result;
     }
 
+    // ── 封存 changeset 进 changelog ────────────────────────────────────────────
     // Seal changeset into changelog
+    // 到这里 UPSERT 已全部成功，session 里录着这批写产生的 changeset。sealInto 会：收集
+    //   session 的 changeset → 分离(detach)会话 → 把 changeset 连同来源元信息写进
+    //   __sync_changelog，并回带本地分配的 local_seq。这一步与业务写同事务（见 §15.7.1
+    //   “短命 session、同事务”），保证“已落库”与“已记 changelog”是同一次原子提交。
     qint64 localSeq = 0;
     qint64 parentSeq = 0;
+    // originSeq / origin / epoch 三者按方向选择来源（见方法头“B 与 C 为何共用”）：
+    //   · 入站(B)：沿用来件里的 origin/epoch/seq（转发别人的变更，保留其身份）；
+    //   · 本地(C)：origin=本节点 nodeId_、epoch=本节点 streamEpoch_、seq 为本地预分配序号。
+    // 注：这里 isInbound?p.seq:p.seq 两支相同，是因为无论哪支 originSeq 都取自 p.seq
+    //     （本地写的序号在进入本方法前已被上游分配进 p.seq），保留三元写法只为对齐可读性。
     qint64 originSeq = isInbound ? p.seq : p.seq;
     const QString origin = isInbound ? p.origin : nodeId_;
     const qint64 epoch = isInbound ? p.epoch : streamEpoch_;
+    // 分支 C 的不变式：本地写必须“先分配好 origin_seq 再来封存”。若 seq<=0 说明上游漏了
+    //   分配步骤，这是编程/时序错误——直接拆会话、回滚并报 E_SYNC_INIT，绝不带着非法序号入库
+    //   （否则该本地变更的连续序列会从错误的起点计数，破坏对端的 gap 判定）。
     if (!isInbound && originSeq <= 0) {
         rec_.abort();
         txn.rollback();
@@ -489,18 +515,27 @@ WriteResult CapturedWriteTemplate::branchBC(const WriteParams& p) {
 
     // H-01 fix: pass p.pushId so selection-push changesets (InboundSelectionPush) have their
     // push_id recorded in the changelog, enabling the broadcast barrier to filter by specific push.
+    // 【H-01 修复】把 p.pushId 一并传给 sealInto，让“选择性推送(分支 B)”产生的 changelog 记录
+    //   带上 push_id。这样下游广播时的“半截不外泄”屏障（broadcastToPeer 里按 push 过滤，
+    //   见 §15.5.3）才能识别“这条变更属于哪次 push”，在该 push 未 done 前推迟外发。
+    //   本地写(分支 C) p.pushId 为空，不受影响。
     if (!rec_.sealInto(h_, clog_, wconn_, txn, origin, epoch, isInbound ? p.schemaVer : schemaVer_,
                        isInbound ? p.schemaFp : schemaFp_, parentSeq, originSeq, &localSeq, &err,
                        /*pushId=*/p.pushId)) {
+        // 注意：sealInto 内部若失败通常已 detach 会话，这里只需回滚事务（不再 rec_.abort()）。
         txn.rollback();
-        result.errorCode = QStringLiteral("SEAL");
+        result.errorCode = QStringLiteral("SEAL");  // 内部码：封存失败
         result.errorMsg = err;
         return result;
     }
 
+    // ── 入站：标记本 chunk 已应用，并在集齐全部 chunk 时把整个 push 置为 done ──────────
     // Mark push chunk applied
     if (isInbound && !p.pushId.isEmpty()) {
         const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+        // 在 __sync_push_chunk_progress 里把本 (pushId, chunkSeq) 记为 'applied'，并存下其
+        //   checksum（供将来重投时比对，见前面的“分片幂等检查”）。用 UPSERT：首见则插入，
+        //   重放则更新。与前面的幂等检查配对——这里“落状态”，那里“读状态”。
         QSqlQuery upsert(wconn_);
         upsert.prepare(
             QStringLiteral("INSERT INTO __sync_push_chunk_progress "
@@ -514,6 +549,8 @@ WriteResult CapturedWriteTemplate::branchBC(const WriteParams& p) {
         upsert.addBindValue(p.checksum);
         upsert.addBindValue(nowMs);
         if (!upsert.exec()) {
+            // 分片进度记账失败：与业务写同事务，故必须整体回滚（不能只落数据不记进度，否则
+            //   幂等/续传状态会与实际数据不符）。归为传输类错误 E_SYNC_TRANSPORT。
             txn.rollback();
             result.errorCode = QLatin1String(err::E_SYNC_TRANSPORT);
             result.errorMsg = upsert.lastError().text();
@@ -525,7 +562,15 @@ WriteResult CapturedWriteTemplate::branchBC(const WriteParams& p) {
         // This is critical for center nodes which receive every chunk from the originator
         // but never send push-chunk ACKs back to themselves — without this, the push barrier
         // in broadcastToPeer (status != 'done') permanently blocks downstream broadcast.
+        // 【H-01 修复 / 为何中心节点必须在此处判 done】选择性推送被切成 total_chunks 个分片。
+        //   普通对端靠“收全部分片 ACK”把整个 push 置 done；但中心节点是自己“接收并应用”来自
+        //   发起者的每一个分片，它不会给自己发分片 ACK——若没有下面这段“集齐即置 done”的逻辑，
+        //   broadcastToPeer 里的“半截不外泄”屏障（要求 status=='done' 才放行下游广播，见 §15.5.3）
+        //   会永久卡住，导致这批直选变更永远发不到下游。故这里每应用一个分片就自查一次：
+        //   已 applied 的分片数是否达到 total_chunks，达到则把 __sync_push_progress 置 'done'。
         {
+            // 子查询统计“该 push 已 applied 的分片数”，与登记的 total_chunks 比较。
+            //   只在 push 尚未 done 且未 failed 时才检查（避免重复/无谓更新）。
             QSqlQuery doneQ(wconn_);
             doneQ.prepare(
                 QStringLiteral("SELECT pp.total_chunks, "
@@ -539,6 +584,7 @@ WriteResult CapturedWriteTemplate::branchBC(const WriteParams& p) {
             if (doneQ.exec() && doneQ.next()) {
                 const int total = doneQ.value(0).toInt();
                 const int applied = doneQ.value(1).toInt();
+                // total>0 排除“总数未知/未登记”的情形；applied>=total 即“全片到齐”。
                 if (total > 0 && applied >= total) {
                     QSqlQuery markDone(wconn_);
                     markDone.prepare(
@@ -548,7 +594,7 @@ WriteResult CapturedWriteTemplate::branchBC(const WriteParams& p) {
                     markDone.addBindValue(nowMs);
                     markDone.addBindValue(p.pushId);
                     if (!markDone.exec()) {
-                        txn.rollback();
+                        txn.rollback();  // 置 done 失败也同事务回滚
                         result.errorCode = QLatin1String(err::E_SYNC_TRANSPORT);
                         result.errorMsg = markDone.lastError().text();
                         return result;
@@ -558,35 +604,49 @@ WriteResult CapturedWriteTemplate::branchBC(const WriteParams& p) {
         }
     }
 
+    // ── 用“预扫描结果”增量更新 table_state（H-05 的收尾）─────────────────────────
     // Update table_state from RowMutations using pre-scanned (correct) old-row info (H-05).
+    // 这里把每条 RowMutation 翻译成一条 TableMutation（before/after/pk 哈希 + insert/delete
+    // 标记），
+    //   喂给 TableStateStore 增量维护各表校验和。关键是 beforeHash/rowExists 全部取自“UPSERT 之前”
+    //   的预扫描 preScan（见上），而非现读——否则读到的是被覆盖后的新值，校验和会算错。
     // M-01 fix: skip table_state update for DoNothing (INSERT OR IGNORE) mutations when the
     // row already existed before the UPSERT. In that case the INSERT is a no-op — SQLite does
     // not modify the row — so the actual session changeset contains no entry for it. Adding an
     // afterHash for a no-op write would pollute the checksum and cause divergence with peers
     // that compute table_state from the real changeset (branchA / extractMutations path).
+    // 【M-01 修复 / 跳过“空操作”的 DoNothing】若某条是 DoNothing(INSERT OR IGNORE) 且该行本就存在，
+    //   则这次 INSERT 是彻底的空操作：SQLite 不改任何数据，session 里也不会为它录任何变更条目。
+    //   若我们仍给它记一笔 afterHash 去更新校验和，本地校验和就会“凭空多算一行”，而其它用真实
+    //   changeset 算 table_state 的对端（分支 A / extractMutations 路径）不会多算——两端校验和从此
+    //   发散(diverge)。所以这种空操作行必须在记账时跳过。
     QList<TableMutation> tmuts;
     tmuts.reserve(p.mutations.size());
     for (int i = 0; i < p.mutations.size(); ++i) {
         const RowMutation& m = p.mutations[i];
-        const PreScan& ps = preScan[i];
+        const PreScan& ps = preScan[i];  // 与 p.mutations[i] 同下标对应的预扫描结果
         if (m.mode == UpsertMode::DoNothing && ps.rowExists) {
             // INSERT OR IGNORE was a no-op: row already existed and was not changed.
             // Do not update table_state for this row.
+            // 空操作（行已存在、IGNORE 未改动）→ 不为它更新 table_state（见上 M-01 说明）。
             continue;
         }
         TableMutation tm;
         tm.table = m.table;
-        tm.isInsert = !ps.rowExists;
-        tm.isDelete = false;
-        tm.pkHash = QString::fromLatin1(ps.pkHash.toHex());
-        tm.afterHash = ps.afterHash;
-        tm.beforeHash = ps.beforeHash;  // correctly from pre-UPSERT scan
+        tm.isInsert = !ps.rowExists;  // 预扫描时行不存在 → 本次是 INSERT；存在 → UPDATE
+        tm.isDelete = false;  // 分支 B/C 的 RowMutation 只做 UPSERT，从不产生 DELETE
+        tm.pkHash = QString::fromLatin1(ps.pkHash.toHex());  // 定位行的规范 pk 哈希（十六进制）
+        tm.afterHash = ps.afterHash;                         // 新行哈希（写入后的内容）
+        tm.beforeHash = ps.beforeHash;  // correctly from pre-UPSERT scan（正确地取自写前扫描）
         tmuts.append(tm);
     }
 
     if (!tmuts.isEmpty()) {
         // M-03 fix: applyMutations() failure must roll back the entire write transaction
         // so that the upserted rows, changelog entry, and table_state remain atomic.
+        // 【M-03 修复】table_state 更新失败必须回滚整个写事务，让“已 UPSERT 的行 + changelog 记录 +
+        //   table_state”三者保持原子。理由同分支 A：一个无法纠正的陈旧 table_state 会让各节点
+        //   校验和悄悄发散。epoch/schemaFp 按方向选择（入站用来件的、本地用本节点的）。
         if (!ts_.applyMutations(wconn_, tmuts, isInbound ? p.epoch : streamEpoch_,
                                 isInbound ? p.schemaFp : schemaFp_, originSeq, &err)) {
             txn.rollback();
@@ -596,6 +656,7 @@ WriteResult CapturedWriteTemplate::branchBC(const WriteParams& p) {
         }
     }
 
+    // ── 提交：业务数据 + changelog + push 进度 + table_state 一次性原子落地 ──────────
     if (!txn.commit(&err)) {
         result.errorCode = QStringLiteral("TXN_COMMIT");
         result.errorMsg = err;
@@ -603,21 +664,33 @@ WriteResult CapturedWriteTemplate::branchBC(const WriteParams& p) {
     }
 
     result.ok = true;
-    result.localChangelogSeq = localSeq;
-    result.tableMutations = tmuts;
+    result.localChangelogSeq = localSeq;  // 回带本次封存所得的本地 changelog 序号（可为 0=无变更）
+    result.tableMutations = tmuts;  // 回带本次涉及的逐行表变更
     return result;
 }
 
 // ---------------------------------------------------------------------------
 // private: extractMutations — parse changeset blob into TableMutation list (I-07)
+// 私有：extractMutations —— 把一段 changeset 二进制解析成逐行 TableMutation（供 table_state 记账）
 // ---------------------------------------------------------------------------
-
+//
+// 【做什么】遍历 changeset 里的每一行变更，按 INSERT/UPDATE/DELETE 算出该行的 pkHash（定位）、
+//   beforeHash（旧内容，DELETE/UPDATE 有）、afterHash（新内容，INSERT/UPDATE 有），组装成一条
+//   TableMutation。分支 A 用它把“刚 apply 的对端 changeset”翻译成表校验和的增量输入。
+// 【为什么与预扫描路径分开】分支 A 手里有现成的 changeset blob（对端录好的），可直接解析拿到
+//   before/after 值；分支 B/C 手里只有 RowMutation，才需要 UPSERT 前预扫描（见 branchBC）。
+//   两条路径殊途同归，但都必须用“相同的哈希编码”，否则各节点校验和会发散——这正是下面各处
+//   反复强调“与 TableStateStore::rowHash / RowWinnerStore::pkHash 同格式”的原因。
+// 【参数/返回】changeset=原始字节；syncTables=同步表白名单（不在白名单/__sync_* 元表跳过）。
+//   返回逐行 TableMutation；空 changeset 或无法起迭代器 → 返回空列表（不算错误）。
+// 【副作用】仅对每张表跑一次 PRAGMA table_info（结果缓存）；不写任何数据。
 QList<TableMutation> CapturedWriteTemplate::extractMutations(const QByteArray& changeset,
                                                              const QStringList& syncTables) {
     QList<TableMutation> muts;
     if (changeset.isEmpty())
-        return muts;
+        return muts;  // 空 changeset：无行可解析
 
+    // 起一个 changeset 迭代器从头遍历；起不来（如损坏/空）→ 返回空列表，不视为失败。
     sqlite3_changeset_iter* iter = nullptr;
     if (sqlite3changeset_start(
             &iter, changeset.size(),
@@ -629,17 +702,25 @@ QList<TableMutation> CapturedWriteTemplate::extractMutations(const QByteArray& c
     // This ensures beforeHash / afterHash computed here are directly comparable to
     // the checksums produced by resetFromBaseline(), preventing checksum divergence
     // after a baseline reset followed by incremental UPDATE/DELETE.
+    // 【M-03 修复】按表名缓存“列下标→列名”映射。changeset 迭代器只给列的下标，不给列名，但
+    //   TableStateStore::rowHash() 要求以“按列名排序的 QVariantMap”算哈希。必须拿到真实列名，
+    //   本处算出的 before/after 哈希才能与 resetFromBaseline()（全表重扫）算出的校验和逐位可比——
+    //   否则“基线重置后再来若干增量 UPDATE/DELETE”会让本地校验和与基线校验和发散。
     QMap<QString, QStringList> colNameCache;
 
+    // getColNames —— 惰性取某表的列名列表（首次查 PRAGMA table_info 并缓存，后续直接命中缓存）。
+    //   查不到的列下标退化为占位名 "_col_N"，保证返回列表长度恒为 nCol、不为空。
     auto getColNames = [&](const QString& tableName, int nCol) -> QStringList {
         auto it = colNameCache.find(tableName);
         if (it != colNameCache.end())
             return it.value();
         QStringList names;
         QSqlQuery ti(wconn_);
+        // 表名内嵌的双引号要转义成两个双引号，防止 PRAGMA 语法被破坏/注入。
         ti.prepare(QStringLiteral("PRAGMA table_info(\"%1\")")
                        .arg(QString(tableName).replace(QLatin1Char('"'), QLatin1String("\"\""))));
         if (ti.exec()) {
+            // table_info 返回 (cid, name, ...)；先建 cid→name 映射，再按 0..nCol-1 取名。
             QMap<int, QString> cidMap;
             while (ti.next())
                 cidMap.insert(ti.value(0).toInt(), ti.value(1).toString());
@@ -647,6 +728,7 @@ QList<TableMutation> CapturedWriteTemplate::extractMutations(const QByteArray& c
                 names.append(cidMap.value(i, QStringLiteral("_col_%1").arg(i)));
         } else {
             // Fallback: use positional names so the cache is not empty.
+            // PRAGMA 失败（表已不存在等）→ 全用占位名，保证缓存非空、后续逻辑不崩。
             for (int i = 0; i < nCol; ++i)
                 names.append(QStringLiteral("_col_%1").arg(i));
         }
@@ -654,18 +736,22 @@ QList<TableMutation> CapturedWriteTemplate::extractMutations(const QByteArray& c
         return names;
     };
 
+    // 逐行推进迭代器（next 返回 SQLITE_ROW 表示还有下一行）。
     while (sqlite3changeset_next(iter) == SQLITE_ROW) {
         const char* tbl = nullptr;
         int nCol = 0, op = 0, indirect = 0;
-        sqlite3changeset_op(iter, &tbl, &nCol, &op, &indirect);
+        sqlite3changeset_op(iter, &tbl, &nCol, &op, &indirect);  // 取表名/列数/操作类型/是否间接
 
         unsigned char* pkMask = nullptr;
-        sqlite3changeset_pk(iter, &pkMask, nullptr);
+        sqlite3changeset_pk(iter, &pkMask,
+                            nullptr);  // 取主键掩码：pkMask[i] 非 0 表示第 i 列是主键
 
         const QString tableName = QString::fromUtf8(tbl ? tbl : "");
 
         // H-01 fix: skip tables rejected by the allow-list so __sync_* meta tables and
         // non-sync tables are never written to __sync_table_state.
+        // 【H-01 修复】白名单拒绝的表（含 __sync_* 元表、非同步表）直接跳过——与 filterCb /
+        //   updateWinnersFromChangeset 使用同一判定，绝不让它们污染 __sync_table_state 校验和。
         if (!ChangesetApplier::isAllowedSyncTable(tableName, syncTables))
             continue;
 
@@ -673,6 +759,11 @@ QList<TableMutation> CapturedWriteTemplate::extractMutations(const QByteArray& c
 
         // M-03 fix: build a QVariantMap keyed by column name (sorted automatically by QMap),
         // then delegate to TableStateStore::rowHash() for a consistent hash format.
+        // rowHashFromIter —— 计算当前行的“整行内容哈希”。useNew=true 取新值(INSERT/UPDATE 后)，
+        //   false 取旧值(UPDATE/DELETE 前)。做法：把每列按列名塞进 QVariantMap（QMap 自动按 key
+        //   排序，从而与 TableStateStore::rowHash 的“按列名排序”格式一致），再委托 rowHash()
+        //   出结果。 逐类型转换与 conflictCb 一致（FLOAT 走 rowHash 内部规范化），NULL 列记入
+        //   QVariant()。
         auto rowHashFromIter = [&](bool useNew) -> QByteArray {
             QVariantMap rowMap;
             for (int i = 0; i < nCol; i++) {
@@ -711,22 +802,27 @@ QList<TableMutation> CapturedWriteTemplate::extractMutations(const QByteArray& c
 
         // H-04 fix: use canonical type-tagged encoding via RowWinnerStore::pkHash()
         // so pkHash in extractMutations() is consistent with the winner-store key space.
+        // pkHashStr —— 计算当前行的“定位哈希 pkHash”。只收集主键列(pkMask[i] 为真)进 pkMap，
+        //   委托 RowWinnerStore::pkHash()
+        //   出规范化(带类型标签)的哈希，确保与胜者账本同键空间(H-04)。 若该表无主键信息(pkMap
+        //   为空)，退化为整行内容哈希作键（与 conflictCb 的退化规则一致）。
         auto pkHashStr = [&](bool useNew) -> QString {
             QVariantMap pkMap;
             for (int i = 0; i < nCol; i++) {
                 if (!pkMask || !pkMask[i])
-                    continue;
+                    continue;  // 非主键列跳过
                 const QString cname =
                     (i < colNames.size()) ? colNames[i] : QStringLiteral("_col_%1").arg(i);
                 sqlite3_value* val = nullptr;
                 if (useNew)
-                    sqlite3changeset_new(iter, i, &val);
+                    sqlite3changeset_new(iter, i, &val);  // INSERT/UPDATE 用新值定位
                 else
-                    sqlite3changeset_old(iter, i, &val);
+                    sqlite3changeset_old(iter, i, &val);  // DELETE 用旧值定位（新值不存在）
                 if (!val) {
-                    pkMap[cname] = QVariant();
+                    pkMap[cname] = QVariant();  // 该列未提供 → 记 NULL 占位
                     continue;
                 }
+                // 按存储类型转成 QVariant（与 rowHashFromIter 相同的类型分派）。
                 const int vt = sqlite3_value_type(val);
                 if (vt == SQLITE_TEXT) {
                     const char* txt = reinterpret_cast<const char*>(sqlite3_value_text(val));
@@ -742,13 +838,19 @@ QList<TableMutation> CapturedWriteTemplate::extractMutations(const QByteArray& c
                                        ? QVariant(QByteArray(static_cast<const char*>(b), bl))
                                        : QVariant(QByteArray());
                 } else {
-                    pkMap[cname] = QVariant();
+                    pkMap[cname] = QVariant();  // NULL
                 }
             }
             return pkMap.isEmpty() ? QString::fromLatin1(rowHashFromIter(useNew).toHex())
                                    : RowWinnerStore::pkHash(pkMap);
         };
 
+        // 按操作类型组装 TableMutation：
+        //   · INSERT —— 只有新值：填 pkHash(新) + afterHash(新)，isInsert=true。
+        //   · DELETE —— 只有旧值：填 pkHash(旧) + beforeHash(旧)，isDelete=true。
+        //   · UPDATE —— 新旧都有：填 pkHash(旧) + beforeHash(旧) + afterHash(新)。
+        //     （UPDATE 不允许改主键，故用旧值算 pkHash 与新值等价，取旧值即可。）
+        //   · 其它未知 op —— 保守跳过（不产生记账）。
         TableMutation tm;
         tm.table = tableName;
 
@@ -763,22 +865,36 @@ QList<TableMutation> CapturedWriteTemplate::extractMutations(const QByteArray& c
             tm.isInsert = false;
             tm.isDelete = true;
         } else if (op == SQLITE_UPDATE) {
-            tm.pkHash = pkHashStr(false);  // PK must not change across UPDATE
+            tm.pkHash = pkHashStr(false);  // PK must not change across UPDATE（UPDATE 不改主键）
             tm.beforeHash = rowHashFromIter(false);
             tm.afterHash = rowHashFromIter(true);
             tm.isInsert = false;
             tm.isDelete = false;
         } else {
-            continue;
+            continue;  // 未知/间接操作：跳过
         }
         muts.append(tm);
     }
-    sqlite3changeset_finalize(iter);
+    sqlite3changeset_finalize(iter);  // 释放迭代器（与 sqlite3changeset_start 配对，必须调用）
     return muts;
 }
 
+// ---------------------------------------------------------------------------
+// public static: extractMutationsStatic —— extractMutations 的“免实例化”静态版
+// ---------------------------------------------------------------------------
+//
 // M-01 fix: static public wrapper so submitImportSync can call extractMutations without
 // instantiating a full CapturedWriteTemplate.
+// 【M-01 修复 / 为何要一个静态版】导入路径的 submitImportSync 想直接从“导入产生的 changeset”
+//   里抽取增量 TableMutation 去更新 table_state，但它并不持有 CapturedWriteTemplate 所需的
+//   一整套 store 引用（av_/rw_/ts_/...）。为省去“为解析一段 changeset 而构造整个模板”的沉重
+//   依赖，这里提供一个静态方法：只额外接收一个 db 连接（用于 PRAGMA table_info 取列名），
+//   逻辑与实例版 extractMutations() 完全一致——差别仅在“列名查询用传入的 db 而非成员 wconn_”。
+// 【为何不直接转调实例版】实例版依赖成员 wconn_，静态上下文没有 this。与其伪造一个残缺实例，
+//   不如把核心循环原样重实现一遍（下方两处 lambda 与 op 分派均与实例版逐字对应）。两份代码
+//   必须保持同步演进——任一处修改哈希/编码规则，另一处也要同改，否则导入路径与同步路径算出的
+//   table_state 会发散。
+// 【参数/返回】同实例版，只是 db 显式传入。返回逐行 TableMutation；空/损坏 changeset → 空列表。
 QList<TableMutation> CapturedWriteTemplate::extractMutationsStatic(const QByteArray& changeset,
                                                                    QSqlDatabase& db,
                                                                    const QStringList& syncTables) {
@@ -792,19 +908,22 @@ QList<TableMutation> CapturedWriteTemplate::extractMutationsStatic(const QByteAr
 
     // Re-implement the core of extractMutations here to avoid a full-template dependency.
     // This shares the same logic as extractMutations() with db passed explicitly.
+    // 下面这段与实例版 extractMutations() 是“同一套逻辑”的镜像，仅把 wconn_ 换成参数 db。
+    //   详细的“为什么这么算哈希/为什么要真实列名”等解释见实例版注释，此处不再重复。
     sqlite3_changeset_iter* iter = nullptr;
     if (sqlite3changeset_start(
             &iter, changeset.size(),
             const_cast<void*>(static_cast<const void*>(changeset.constData()))) != SQLITE_OK)
-        return muts;
+        return muts;  // 起不了迭代器（空/损坏）→ 空列表，不算错误
 
+    // 列名缓存 + 惰性查询（同实例版；连接用参数 db）。
     QMap<QString, QStringList> colNameCache;
     auto getColNames = [&](const QString& tableName, int nCol) -> QStringList {
         auto it = colNameCache.find(tableName);
         if (it != colNameCache.end())
             return it.value();
         QStringList names;
-        QSqlQuery ti(db);
+        QSqlQuery ti(db);  // 唯一区别：用参数 db 而非成员 wconn_
         ti.prepare(QStringLiteral("PRAGMA table_info(\"%1\")")
                        .arg(QString(tableName).replace(QLatin1Char('"'), QLatin1String("\"\""))));
         if (ti.exec()) {
@@ -814,6 +933,7 @@ QList<TableMutation> CapturedWriteTemplate::extractMutationsStatic(const QByteAr
             for (int i = 0; i < nCol; ++i)
                 names.append(cidMap.value(i, QStringLiteral("_col_%1").arg(i)));
         } else {
+            // 退化占位名，保证缓存非空（同实例版）。
             for (int i = 0; i < nCol; ++i)
                 names.append(QStringLiteral("_col_%1").arg(i));
         }
@@ -821,6 +941,7 @@ QList<TableMutation> CapturedWriteTemplate::extractMutationsStatic(const QByteAr
         return names;
     };
 
+    // 逐行遍历（同实例版）：取表名/列数/操作/主键掩码，过白名单，再算 pk/before/after 哈希。
     while (sqlite3changeset_next(iter) == SQLITE_ROW) {
         const char* tbl = nullptr;
         int nCol = 0, op = 0, indirect = 0;
@@ -828,10 +949,13 @@ QList<TableMutation> CapturedWriteTemplate::extractMutationsStatic(const QByteAr
         unsigned char* pkMask = nullptr;
         sqlite3changeset_pk(iter, &pkMask, nullptr);
         const QString tableName = QString::fromUtf8(tbl ? tbl : "");
+        // 白名单门控：__sync_* 元表与非同步表一律跳过（与 filterCb 同判定），防污染校验和。
         if (!ChangesetApplier::isAllowedSyncTable(tableName, syncTables))
             continue;
         const QStringList colNames = getColNames(tableName, nCol);
 
+        // 整行内容哈希：以列名为 key 建 QVariantMap（自动排序）→ 委托 rowHash()，
+        //   保证与全量 resetFromBaseline() 同格式（同实例版说明）。
         auto rowHashFromIter = [&](bool useNew) -> QByteArray {
             QVariantMap rowMap;
             for (int i = 0; i < nCol; i++) {
@@ -869,11 +993,13 @@ QList<TableMutation> CapturedWriteTemplate::extractMutationsStatic(const QByteAr
         };
 
         // H-04 fix: same canonical encoding as extractMutations() above.
+        // 定位哈希 pkHash：只收主键列 → RowWinnerStore::pkHash() 规范化，与胜者账本同键空间；
+        //   无主键则退化为整行哈希作键（编码与上方实例版逐字一致）。
         auto pkHashStr = [&](bool useNew) -> QString {
             QVariantMap pkMap;
             for (int i = 0; i < nCol; i++) {
                 if (!pkMask || !pkMask[i])
-                    continue;
+                    continue;  // 非主键列跳过
                 const QString cname =
                     (i < colNames.size()) ? colNames[i] : QStringLiteral("_col_%1").arg(i);
                 sqlite3_value* val = nullptr;

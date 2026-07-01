@@ -253,12 +253,21 @@ QString SyncWorker::initError() const {
 //   内即天然保证 worker 线程独占，永不跨线程使用 QSqlDatabase(C-03 不变量的根基)。
 // 线程：worker 线程自身(本函数即该线程)。复杂度：随生命周期运行，受任务量与轮询间隔支配。
 void SyncWorker::run() {
-    // --- Create write connection on the worker thread (I-02 fix) ---
+    // --- 阶段①：在 worker 线程内创建 SQLite 写连接（I-02 修复）---
+    // 【为什么必须在这里(run 内部)创建】QSqlDatabase 及其底层 sqlite3* 句柄都不能跨线程使用；
+    //   SQLite 的 session/changeset 捕获又必须绑定这条写连接。把创建动作放进 run()，就让这条
+    //   连接从诞生到销毁始终活在 worker 线程上，从根本上杜绝“跨线程使用同一连接”（C-03 不变量）。
+    // 连接名用 UUID 保证全局唯一：Qt 以连接名索引 QSqlDatabase，重名会互相覆盖。
     QString connName =
         QStringLiteral("dbridge_sw_") + QUuid::createUuid().toString(QUuid::WithoutBraces);
     QSqlDatabase wconn = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), connName);
     wconn.setDatabaseName(config_.sqlitePath());
+    // 忙等待 5s：多进程/多连接争锁时，SQLite 会自旋重试而非立刻报 "database is locked"。
     wconn.setConnectOptions(QStringLiteral("QSQLITE_BUSY_TIMEOUT=5000"));
+    // 打开失败：写下错误、release 信号量唤醒 waitForInit（否则调用方会一直等到超时），
+    // 再清理连接后退出。
+    // 下方每一处 init 失败路径都重复这套“写 initError_ + release + 清理 + return”的收尾——务必成对，
+    // 漏掉 release 会让 waitForInit 卡满 timeout，漏掉 removeDatabase 会泄漏 Qt 连接表条目。
     if (!wconn.open()) {
         initError_ = QStringLiteral("cannot open db: ") + wconn.lastError().text();
         initSemaphore_.release();
@@ -266,13 +275,17 @@ void SyncWorker::run() {
         return;
     }
 
-    // WAL + foreign_keys
+    // 连接级 PRAGMA：
+    //   · WAL（预写日志）：允许“多读单写”并发——正是本设计把写集中到单线程、读可并行的前提。
+    //   · foreign_keys=ON：应用入站 changeset 时按外键约束校验，配合拓扑序应用避免悬挂引用。
     {
         QSqlQuery q(wconn);
         q.exec(QStringLiteral("PRAGMA journal_mode=WAL"));
         q.exec(QStringLiteral("PRAGMA foreign_keys=ON"));
     }
 
+    // 取底层 sqlite3* 句柄：session/changeset 的 C API 只认原生句柄，QSqlDatabase 封装拿不到。
+    // SqliteHandle::of 从 Qt 驱动内部挖出该句柄；拿不到说明驱动不是 QSQLITE 或版本异常。
     sqlite3* h = SqliteHandle::of(wconn);
     if (!h) {
         initError_ = QStringLiteral("cannot get sqlite3* handle");
@@ -281,6 +294,9 @@ void SyncWorker::run() {
         QSqlDatabase::removeDatabase(connName);
         return;
     }
+    // 探测 session 扩展是否可用：本库的整套变更捕获都依赖它，不可用则同步根本无法开展。
+    // 注：Qt 5.12 的 QSQLITE 插件加载存在陷阱（见项目记忆 project_qsqlite_session.md），
+    // 若此处报 E_SYNC_SESSION_UNAVAILABLE，多半是加载了不含 session 的 SQLite 库。
     if (!SqliteHandle::sessionAvailable(h)) {
         initError_ = QStringLiteral("E_SYNC_SESSION_UNAVAILABLE");
         initSemaphore_.release();
@@ -289,7 +305,9 @@ void SyncWorker::run() {
         return;
     }
 
-    // Run DDL
+    // 执行 DDL：建齐所有 __sync_* 元数据表（changelog / applied_vector / inbox_ledger /
+    // outbound_ack / push_progress 等），它们都建在被同步的这同一个 SQLite 库里。
+    // allCreateStatements() 里夹带的注释行（以 "-- " 开头）跳过，不当作 SQL 执行。
     for (const QString& stmt : ddl::allCreateStatements()) {
         if (stmt.startsWith(QStringLiteral("-- ")))
             continue;  // skip comment-only lines
@@ -303,19 +321,26 @@ void SyncWorker::run() {
         }
     }
 
-    // M-04 fix: apply additive schema migrations (idempotent, errors are non-fatal).
+    // M-04 修复：施加“只增不改”的 schema 迁移（幂等；单条失败不致命，故不检查返回值）。
+    //   用于给旧库补上后续版本新增的列/表，让不同历史版本的库都能升到当前 __sync_* 结构。
     ddl::applyMigrations(wconn);
 
-    // C-08 fix: expand empty syncTables to all user tables so session always attaches something.
+    // C-08 修复：把“空的同步表清单”展开成“全部用户表”。
+    // 【为什么必须展开】SQLite session 若 attach 不到任何表，捕获会退化成“抓全库”或直接失败；
+    //   把空配置显式展开成具体表清单，保证 session 总能 attach 到确定的一批表（见 rec_->begin）。
+    // canonicalSyncTables_ 此后就是本 worker 全生命周期内“权威的被同步表清单”，
+    //   广播过滤(p.syncTables)、指纹计算、门控判断等处处引用它。
     QString expandErr;
     canonicalSyncTables_ =
         SchemaEligibility::expandSyncTables(wconn, config_.syncTables(), &expandErr);
     if (canonicalSyncTables_.isEmpty() && !config_.syncTables().isEmpty()) {
-        // explicit tables given but expansion failed — use original list
+        // 显式给了表清单但展开失败（如自省出错）：退化为原始配置清单，至少不丢用户意图。
         canonicalSyncTables_ = config_.syncTables();
     }
 
-    // Schema eligibility check
+    // schema 资格校验：逐表检查是否满足同步前提（如必须有主键、不含不支持的类型/约束）。
+    // 不合格的表收集进 rejected；有任一不合格即判 E_SYNC_UNSUPPORTED_SCHEMA 并中止初始化——
+    // 宁可启动即失败，也不要带着无法正确同步的表跑起来后再出难查的数据错乱。
     QStringList rejected;
     QString eligErr;
     if (!SchemaEligibility::verify(wconn, canonicalSyncTables_, &rejected, &eligErr)) {
@@ -342,13 +367,20 @@ void SyncWorker::run() {
         }
     }
 
-    // Expose pointers for task closures (valid only within this run() lifetime)
+    // 把写连接与句柄的地址暴露给成员指针，供“排进队列、在本线程执行的任务闭包”使用。
+    // 【生命周期铁律】wconn 是 run() 的局部变量，wconnPtr_/hPtr_ 仅在 run() 执行期间有效；
+    //   run() 返回前会先把队列排空并把这两个指针置空（见文件末尾 teardown），故闭包读到它们
+    //   非空时一定处于 run() 生命周期内、且就在 worker 线程上——绝不会悬空或跨线程。
     wconnPtr_ = &wconn;
     hPtr_ = h;
 
-    // --- One-time store initialization on the worker thread ---
+    // --- 阶段②：在 worker 线程上一次性初始化各 store（全部把表建在本库的 __sync_* 上）---
+    // streamEpoch_ = 本次进程启动纪元（毫秒时间戳）。重启即换新纪元，使 ACK / applied_vector
+    //   的 (origin, epoch, seq) 命名空间不跨进程混淆（旧纪元的残留 ACK 不会误配到新纪元）。
     streamEpoch_ = QDateTime::currentMSecsSinceEpoch();
 
+    // 下面每个 store 的 init 都遵循同一失败收尾：写 initError_ → release 信号量 → 置空指针 →
+    // 关连接 → removeDatabase → return。任一 store 初始化失败都会导致整条 worker 启动失败。
     QString initErr;
     if (!av_->init(wconn, &initErr)) {
         initError_ = initErr;
@@ -386,6 +418,10 @@ void SyncWorker::run() {
         QSqlDatabase::removeDatabase(connName);
         return;
     }
+    // 从 changelog 恢复 localOriginSeq_ 水位：取本节点(origin=nodeId)已写过的最大 origin_seq。
+    // 【为什么必须恢复】origin_seq 要“跨进程重启仍单调连续”。若重启后从 0 重新计，就会重复
+    //   分配旧序号，对端会把冲突的 seq 视为错乱。COALESCE(...,0) 让首次运行(无记录)从 0 起，
+    //   于是 nextLocalOriginSeq() 首个返回 1。
     {
         QSqlQuery q(wconn);
         q.prepare(
@@ -423,8 +459,10 @@ void SyncWorker::run() {
         return;
     }
 
-    // M-01 fix: initialize ConsistencyCache as a persistent SyncWorker member so that
-    // baseline/authoritative down-link applies can feed it and selection push can consume it.
+    // 初始化“一致性缓存”（M-01 修复）：记录“本地某行已与权威端(center/基线)一致”的指纹。
+    // 【它有什么用】选择性推送做“依赖剪枝”时，若某外键依赖行已被证明与中心端一致，就不必
+    //   再把它塞进推送闭包，省带宽。基线套用、权威下行(center→edge)会持续往这里“盖章”喂数据。
+    // 初始化失败按非致命处理：退化成空缓存——只是没有剪枝收益，功能仍完全正确，故不中止启动。
     {
         QString cacheErr;
         if (!consistencyCache_.init(wconn, config_.consistencyCacheDurable(), &cacheErr)) {
@@ -433,18 +471,28 @@ void SyncWorker::run() {
         }
     }
 
+    // 计算本地 schema 指纹并交给 SchemaGuard 记为“本地基准”。
+    // 指纹 = 对被同步表结构的摘要；收到入站包时 guard_->verifyPayload 拿包里的指纹与它比对，
+    //   不一致说明两端结构不同步 → 该包进隔离区等本地 schema 升级后再重放
+    //   （见 processChangesetArtifact）。
     QString schemaFp = SchemaGuard::computeFingerprint(wconn, canonicalSyncTables_);
     guard_->setLocal(config_.schemaVersion(), schemaFp);
 
+    // 配置路由与仲裁：
+    //   routing_：告知“我是谁 + 有哪些 peer”，据此做 anti-echo（绝不把某来源的变更发回其来源）。
+    //   arbiter_：装入全体 origin 的 rank 映射，冲突时“高 rank 胜”的裁决依据。
     routing_->configure(config_.nodeId(), config_.peerNodes());
     arbiter_->setRankMap(config_.allRanks());
 
-    // Initialize CapturedWriteTemplate now that all stores are ready
+    // 各 store 就绪后，才构造 CapturedWriteTemplate（“捕获写模板”）。它统一封装三类写入的
+    //   “事务 + session 捕获 + 冲突仲裁 + 封存 changelog”流程，是所有会改库操作的收口：
+    //   分支 A=应用入站 changeset；分支 B=应用选择性推送；分支 C=本地写（导入/比对保存）。
+    //   注意它要吃到写连接 wconn 与句柄 h，所以只能在这里（run 内、句柄有效时）构造。
     tpl_ = std::make_unique<CapturedWriteTemplate>(wconn, h, *av_, *rw_, *ts_, *clog_, *rec_,
                                                    *guard_, *applier_, config_.nodeId(),
                                                    streamEpoch_, schemaFp, config_.schemaVersion());
 
-    // Create InboxWatcher on this thread.
+    // 在本线程创建 InboxWatcher。
     // I-10 fix: InboxWatcher no longer uses QFileSystemWatcher/QTimer (which require an event
     // loop).  It now exposes a synchronous scan() method called explicitly in scanInbox().
     watcher_ = std::make_unique<InboxWatcher>(config_.inboxDir(), wconn, *ledger_);
@@ -456,13 +504,21 @@ void SyncWorker::run() {
     // H-01 fix: persist contextUuid to __sync_context_meta so it survives process restarts.
     // M-03 fix: use the resolved main-library path from the open connection (PRAGMA database_list)
     // instead of the raw config path, so URI/relative/alias paths find the same SyncContext.
+    // 把本 worker 算出的“权威运行参数”回写进共享的 SyncContext，供同库其它模块统一读取：
+    //   · canonicalSyncTables_：展开后的同步表清单（ComparisonSession/BatchTransfer 要读同一份）；
+    //   · streamEpoch_：当前纪元（H-13：让比对会话按正确纪元读 __sync_table_state，而非占位 0）；
+    //   · contextUuid：持久化到 __sync_context_meta，使其跨进程重启后仍是同一身份（H-01）。
+    // M-03：SyncContext 的键必须是“同一个 OS 文件”的身份。用打开连接实际解析出的 main 库路径
+    //   （PRAGMA database_list）而非原始配置串，才能让 URI 路径/相对路径/SQLite 别名
+    //   都归一到同一 ctx。
     {
-        // Resolve the actual main DB path from the open write connection.
+        // 从已打开的写连接解出真正的 main 库文件路径（归一化为绝对路径）。
         QString resolvedPath = config_.sqlitePath();
         {
             QSqlQuery pragmaQ(wconn);
             if (pragmaQ.exec(QStringLiteral("PRAGMA database_list"))) {
                 while (pragmaQ.next()) {
+                    // database_list 每行：seq(0) / name(1) / file(2)。只认 name=="main" 的主库。
                     if (pragmaQ.value(1).toString() == QLatin1String("main")) {
                         const QString p = pragmaQ.value(2).toString();
                         if (!p.isEmpty())
@@ -494,11 +550,13 @@ void SyncWorker::run() {
         }
     }
 
-    // H-16 fix: on startup, replay any quarantined payloads whose schema version is now
-    // applicable — e.g. payloads quarantined before a restart that brought the local schema up
-    // to date, or after a baseline. drainReady() removes the rows; a replay that still fails
-    // re-quarantines. We drain once at init (not every scan) because the worker's schema version
-    // is fixed for its lifetime, so re-draining at runtime would only churn incompatible rows.
+    // 启动时清一次隔离区（H-16 修复）：把此前因“本地 schema 版本过低”而被隔离、但按当前
+    //   schema 版本已可应用的 payload 捞出来重放（典型场景：重启后本地 schema 已升级到位，或
+    //   刚套过基线）。drainReady() 取出成熟条目；重放仍失败者会被重新隔离。
+    // 【为什么只在 init 清一次、而非每次 scan】worker 的 schema 版本在其整个生命周期内固定不变，
+    //   运行期反复清只会把“仍不兼容”的条目反复搅动却无进展；真正会“解锁”隔离条目的时机是
+    //   schema 升级(需重启)或套用基线(那时 processBaselineResponseArtifact 会另行
+    //   drainQuarantine)。
     {
         const auto readyPayloads = quarantine_->drainReady(wconn, config_.schemaVersion());
         for (const auto& entry : readyPayloads) {
@@ -513,14 +571,19 @@ void SyncWorker::run() {
         }
     }
 
-    // Signal successful initialization to initialize() caller
+    // 初始化全部成功：release 信号量，唤醒在 waitForInit() 上阻塞的 initialize() 调用方。
+    // 走到这里，wconnPtr_/hPtr_ 与所有 store 均已就绪，主循环可以安全开跑。
     initSemaphore_.release();
 
-    qint64 lastBroadcastMs = 0;
+    qint64 lastBroadcastMs = 0;  // 上次后台广播的时刻，用于按 broadcastIntervalMs 节流
 
-    // --- Main event loop ---
+    // --- 阶段③：主事件循环（worker 线程的常驻循环，直到收到停止请求）---
+    // 每一轮做四件事：等活/超时 → 执行队列写任务 → 扫 inbox（收） → 到点则 broadcast（发） →
+    //   检查前台 ACK 是否超时。注意本循环用 QWaitCondition 而非 Qt 事件循环，故 QTimer/
+    //   QFileSystemWatcher 之类依赖事件循环的机制在这里不生效（这正是 I-10 改用同步 scan 的原因）。
     while (true) {
-        // Wait for work or timeout for periodic tasks
+        // 等待“有新任务 / 收到停止 / 定时到点”三者之一。为避免睡过头错过定时工作，需算出
+        // “最紧”的等待上限（下面三个截止点取最小）。
         {
             QMutexLocker lk(&queueMutex_);
             if (taskQueue_.isEmpty() && !stopRequested_) {
@@ -530,9 +593,11 @@ void SyncWorker::run() {
                 //   (c) ACK channel deadline — pending ACKs must be flushed within ackMaxDelayMs
                 // M-03 fix: also incorporate ackChan_->nextDeadlineMs() so ACK flush is not
                 // delayed by the full broadcastIntervalMs when ACKs are already pending.
+                // (a) 后台广播节奏：默认按 broadcastIntervalMs 周期发一轮。这是等待上限的基准值。
                 qint64 waitMs = config_.broadcastIntervalMs();
                 const qint64 nowForWait = QDateTime::currentMSecsSinceEpoch();
-                // (b) ACK timeout for foreground sync.
+                // (b) 前台 sync() 的 ACK 超时：若正在等 ACK，则不能睡过 ackDeadlineMs_，否则
+                //     E_SYNC_ACK_TIMEOUT 无法准时触发。remaining<=0 说明已到点，置 1ms 立即醒。
                 if (ackWaiting_.load()) {
                     const qint64 remaining = ackDeadlineMs_.load() - nowForWait;
                     if (remaining > 0 && remaining < waitMs)
@@ -540,7 +605,11 @@ void SyncWorker::run() {
                     else if (remaining <= 0)
                         waitMs = 1;  // already expired; wake immediately
                 }
-                // (c) ACK channel flush deadline.
+                // (c) ACK 通道 flush 截止（M-03 修复）：AckChannel 会攒 ACK 到 ackMaxDelayMs
+                // 再批量写出；
+                //     若不把它纳入等待上限，攒着的 ACK 可能被拖到整整一个 broadcastIntervalMs
+                //     才发出， 让对端迟迟收不到确认。max() 表示当前没有待 flush 的
+                //     ACK，无需据此缩短等待。
                 if (ackChan_) {
                     const qint64 ackDeadline = ackChan_->nextDeadlineMs();
                     if (ackDeadline != std::numeric_limits<qint64>::max()) {
@@ -551,15 +620,21 @@ void SyncWorker::run() {
                             waitMs = 1;
                     }
                 }
+                // 带超时地在条件变量上等待：期间 enqueue/requestStop 的 wakeOne/wakeAll
+                // 会提前唤醒； 无人唤醒则最迟 waitMs 后自行醒来去做定时工作。wait 会临时释放
+                // queueMutex_，返回时重持。
                 queueCond_.wait(&queueMutex_, static_cast<ulong>(waitMs > 0 ? waitMs : 1));
             }
+            // 协作式停止：仅当“已请求停止且队列已排空”时才退出——保证收尾前把剩余写任务做完，
+            // 不丢已投递的工作（requestStop 只置标志，真正退出由主循环自己判定）。
             if (stopRequested_ && taskQueue_.isEmpty())
                 break;
         }
 
-        processPendingTasks();
-        scanInbox();
+        processPendingTasks();  // ① 执行本轮排队的全部写任务（导入/捕获写/drain 等）
+        scanInbox();  // ② 收：扫 inbox 应用入站工件、对超时 gap 触发基线回退
 
+        // ③ 发：到达广播周期才广播一轮（节流，避免空转刷小文件）。
         qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
         if (nowMs - lastBroadcastMs >= config_.broadcastIntervalMs()) {
             broadcast();
@@ -577,19 +652,25 @@ void SyncWorker::run() {
         }
     }
 
-    // I-10: watcher_->stop() removed — no QTimer/QFileSystemWatcher to tear down.
+    // --- 阶段④：退出前收尾（跳出主循环后，仍在 worker 线程上执行）---
+    // I-10：不再需要 watcher_->stop()——已改为同步 scan()，没有 QTimer/QFileSystemWatcher 要拆。
+    // 退出前把 AckChannel 里最后攒着的 ACK 强制 flush 出去，避免刚应用完的入站变更没来得及回确认。
     QString ackErr;
     if (!ackChan_->flush(*codec_, &ackErr)) {
         emit errorOccurred({err::E_SYNC_TRANSPORT, Severity::Warning, QStringLiteral("ack"),
                             config_.nodeId(), ackErr});
     }
 
-    // Teardown: clear pointers before closing connection
+    // 销毁次序讲究：先毁掉持有 wconn/h 的对象与暴露指针，最后才关连接、移除连接。
+    //   tpl_/watcher_ 内部握着 wconn 与句柄，必须先 reset；
+    //   wconnPtr_/hPtr_ 置空，让任何“万一残留”的闭包读到空指针即安全跳过（不会用到已关连接）。
     tpl_.reset();
     watcher_.reset();
     wconnPtr_ = nullptr;
     hPtr_ = nullptr;
     wconn.close();
+    // 关键：把局部 wconn 置为空 QSqlDatabase，释放这最后一个引用，使 removeDatabase 时引用计数
+    //   降为 1（仅 Qt 连接表自身持有），从而不触发 "connection still in use" 警告。
     wconn = QSqlDatabase();  // release reference so removeDatabase sees refcount=1, no warning
     QSqlDatabase::removeDatabase(connName);
 }
@@ -973,9 +1054,9 @@ bool SyncWorker::processSelectionPushArtifact(const DecodeResult& dec, const QSt
         }
     }
 
-    // Build mutations from selection push body.
-    // J-05: Fill pkColumns from PRAGMA table_info so UpsertExecutor can build correct
-    // ON CONFLICT(...) clauses. Use cached PRAGMA result per table.
+    // 从选择性推送体构造出待写入的 RowMutation 列表。
+    // J-05：每行要带上主键列(pkColumns)，UpsertExecutor 才能拼出正确的 ON CONFLICT(...) 子句
+    //   （即“按主键 upsert”）。主键列从 PRAGMA table_info 读，并按表缓存，避免每行重复查 PRAGMA。
     QHash<QString, QStringList> pkColsCache;
     auto getPkCols = [&](const QString& table) -> QStringList {
         if (pkColsCache.contains(table))
@@ -997,13 +1078,18 @@ bool SyncWorker::processSelectionPushArtifact(const DecodeResult& dec, const QSt
 
     QList<RowMutation> mutations;
     for (int i = 0; i < body.rows.size(); ++i) {
+        // 第 i 行的数据来自 body.rows[i]，其“属于哪张表 + 是选中行还是依赖行”来自并行的
+        // frozenEntries[i]（冻结清单，发送方按拓扑序冻结，父行在前）。
         const QVariantMap& rowMap = body.rows[i];
         RowMutation m;
         m.table = (i < body.frozenEntries.size()) ? body.frozenEntries[i].table : QString();
         m.columns = rowMap.keys();
         m.values = rowMap.values();
         m.pkColumns = getPkCols(m.table);
-        // recordKind: "selected" → DoUpdate (authoritative), "dependency" → DoNothing
+        // 按记录种类决定 upsert 策略：
+        //   "selected"（用户显式选中，权威数据）→ DoUpdate：命中主键则覆盖更新；
+        //   "dependency"（仅为满足外键闭包而带上的父行）→ DoNothing：已存在就别动它，
+        //     避免依赖行反向覆盖接收端可能更新的数据（只补齐“缺失的父行”即可）。
         if (i < body.frozenEntries.size() &&
             body.frozenEntries[i].recordKind == QLatin1String("dependency"))
             m.mode = UpsertMode::DoNothing;
@@ -1216,6 +1302,9 @@ bool SyncWorker::processBaselineResponseArtifact(const DecodeResult& dec,
     // Fingerprint format mirrors FkClosureBuilder::rowFingerprint(): SHA1 of "col\0val\0..." pairs.
     if (!canonicalSyncTables_.isEmpty()) {
         for (const QString& tbl : canonicalSyncTables_) {
+            // 先探测该表的主键列名。PRAGMA table_info 每行含：cid(0)/name(1)/type(2)/
+            //   notnull(3)/dflt(4)/pk(5)；pk==1 即主键列。表名中的双引号按 SQL
+            //   规则转义(""）以防注入/报错。
             const QString pkColStmt =
                 QStringLiteral("PRAGMA table_info(\"") +
                 QString(tbl).replace(QLatin1Char('"'), QLatin1String("\"\"")) +
@@ -1231,7 +1320,7 @@ bool SyncWorker::processBaselineResponseArtifact(const DecodeResult& dec,
                 }
             }
             if (pkCol.isEmpty())
-                continue;
+                continue;  // 无单列主键的表跳过（一致性缓存以“表+主键”为键，无主键无从盖章）
 
             QSqlQuery rowQ(*wconnPtr_);
             if (!rowQ.exec(QStringLiteral("SELECT * FROM \"") +
@@ -1239,12 +1328,13 @@ bool SyncWorker::processBaselineResponseArtifact(const DecodeResult& dec,
                            QStringLiteral("\"")))
                 continue;
 
+            // 逐行算“行指纹”并盖章进一致性缓存。指纹算法必须与 FkClosureBuilder::rowFingerprint()
+            //   逐字节一致，否则推送端 isConsistent() 比对不上、剪枝失效：
+            //   · 用 QVariantMap（按 key 排序）遍历列，保证列顺序与对端一致（M-01）；
+            //   · 拼接格式为 "列名\0列值\0列名\0列值\0..." 后取 SHA1。
             const QSqlRecord rec = rowQ.record();
             while (rowQ.next()) {
                 const QString pk = rowQ.value(pkCol).toString();
-                // M-01 fix: use QVariantMap (sorted by key) to match
-                // FkClosureBuilder::rowFingerprint() which also iterates a QVariantMap, ensuring
-                // isConsistent() can always find a match.
                 QVariantMap rowMap;
                 for (int ci = 0; ci < rec.count(); ++ci)
                     rowMap.insert(rec.fieldName(ci), rowQ.value(ci));
@@ -1256,6 +1346,7 @@ bool SyncWorker::processBaselineResponseArtifact(const DecodeResult& dec,
                     buf += '\0';
                 }
                 const QByteArray fp = QCryptographicHash::hash(buf, QCryptographicHash::Sha1);
+                // 盖章：记录“(表,主键) 这行现已与权威端一致，指纹=fp”，供后续选择性推送剪枝依赖行。
                 consistencyCache_.stampFromAuthoritative(*wconnPtr_, tbl, pk, fp);
             }
         }

@@ -44,7 +44,8 @@ SUBDIRS = \
     tst_sync_staging_buffer \
     tst_sync_upsert_executor \
     tst_sync_consistency_cache \
-    tst_sync_dead_peer_evictor
+    tst_sync_dead_peer_evictor \
+    tst_udp_reassembly
 
 tst_profile_loader.file          = unit/tst_profile_loader.pro
 tst_schema_introspector.file     = unit/tst_schema_introspector.pro
@@ -84,5 +85,6 @@ tst_sync_staging_buffer.file     = unit/tst_sync_staging_buffer.pro
 tst_sync_upsert_executor.file    = unit/tst_sync_upsert_executor.pro
 tst_sync_consistency_cache.file  = unit/tst_sync_consistency_cache.pro
 tst_sync_dead_peer_evictor.file  = unit/tst_sync_dead_peer_evictor.pro
+tst_udp_reassembly.file          = unit/tst_udp_reassembly.pro
 
 OTHER_FILES += test-common.pri

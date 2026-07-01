@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.16)
 
 set(CMAKE_AUTOMOC ON)
 
-find_package(Qt5 5.12 REQUIRED COMPONENTS Core Sql Test)
+find_package(Qt5 5.12 REQUIRED COMPONENTS Core Sql Test Network)
 
 function(add_dbridge_test name sources)
   add_executable(${name} ${sources})
@@ -56,3 +56,16 @@ add_dbridge_test(tst_sync_staging_buffer unit/tst_sync_staging_buffer.cpp)
 add_dbridge_test(tst_sync_upsert_executor unit/tst_sync_upsert_executor.cpp)
 add_dbridge_test(tst_sync_consistency_cache unit/tst_sync_consistency_cache.cpp)
 add_dbridge_test(tst_sync_dead_peer_evictor unit/tst_sync_dead_peer_evictor.cpp)
+
+# UDP 拆包/组包测试（含覆盖率插桩）
+add_executable(
+  tst_udp_reassembly unit/tst_udp_reassembly.cpp
+                     ${CMAKE_SOURCE_DIR}/examples/sync-demo/udp_transport.cpp)
+target_include_directories(
+  tst_udp_reassembly PRIVATE ${CMAKE_SOURCE_DIR}/examples/sync-demo
+                             ${CMAKE_SOURCE_DIR}/tests)
+target_link_libraries(tst_udp_reassembly PRIVATE Qt5::Test Qt5::Core
+                                                 Qt5::Network)
+target_compile_options(tst_udp_reassembly PRIVATE --coverage -O0)
+target_link_options(tst_udp_reassembly PRIVATE --coverage)
+add_test(NAME tst_udp_reassembly COMMAND tst_udp_reassembly)

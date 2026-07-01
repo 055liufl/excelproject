@@ -111,6 +111,7 @@ class FragmentReassembler {
 
 class UdpFileTransport : public QThread {
     Q_OBJECT
+    friend class TstUdpReassembly;  // 测试白盒访问（非限定名，全局命名空间）
 
    public:
     // 单 peer 构造（edge 节点）。

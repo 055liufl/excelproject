@@ -97,7 +97,7 @@ RxEvent FragmentReassembler::feed(const QString& senderKey, const QByteArray& da
     quint8 fnLen;
     ds >> magic >> type >> msgId >> fragIdx >> fragCount >> totalSize >> fnLen;
     if (ds.status() != QDataStream::Ok)
-        return {};
+        return {};  // LCOV_EXCL_LINE — 前置 size<18 已拦截，流读 18B 不会失败
     if (magic != 0xDB5ACED0u || type != 0x01u)
         return {};
 
@@ -357,6 +357,7 @@ void UdpFileTransport::pollOutbox(QUdpSocket& sock, QHash<quint32, Outbound>& ou
                 f.close();
             }
         }
+        // LCOV_EXCL_START — readAll 读中损坏：无平台无关的确定性触发手法
         if (!readOk) {
             qWarning("UdpFileTransport[port=%u]: cannot read %s", localPort_,
                      qPrintable(artifactSendingPath));
@@ -365,6 +366,7 @@ void UdpFileTransport::pollOutbox(QUdpSocket& sock, QHash<quint32, Outbound>& ou
                                                 QLatin1String(".failed"));
             continue;
         }
+        // LCOV_EXCL_STOP
 
         // 路由决策
         QHostAddress destHost;
@@ -564,7 +566,7 @@ void UdpFileTransport::run() {
         }
         for (quint32 mid : rtoKeys) {
             if (!outbound.contains(mid))
-                continue;
+                continue;  // LCOV_EXCL_LINE — 单线程循环内 outbound 不会在遍历期间被删除
             Outbound& ob = outbound[mid];
             if (ob.retries < kMaxRetries) {
                 // 全量重发（从内存 datagrams，不读盘）

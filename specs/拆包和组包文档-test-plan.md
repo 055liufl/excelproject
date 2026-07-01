@@ -131,27 +131,28 @@ QMAKE_LFLAGS   += --coverage
 
 > **陷阱**：`test-common.pri` 用 `QT = core sql gui testlib`（**赋值**非追加），故 `QT += network` **必须写在 `include(...)` 之后**，否则被覆盖丢失（§11.1）。
 
-### 4.3 生产代码的最小可测性改动（`udp_transport.h`，1 行）
+### 4.3 生产代码的**必需**可测性改动（`udp_transport.h`，1 行）
 
-`extractTargetPeer` 是 `private static`、`maxTransmitBytes_` 是 `private`。为**白盒直测**这两者，在 `UdpFileTransport` 类内加一行友元声明：
+`extractTargetPeer` 是 `private static`、`maxTransmitBytes_` 是 `private`。为**白盒直测**这两者，**必须**在 `UdpFileTransport` 类内加一行友元声明——这是一处**生产头文件改动**（非纯测试接线），须在 DoD 中显式承认：
 
 ```cpp
 class UdpFileTransport : public QThread {
     Q_OBJECT
-    friend class TstUdpReassembly;   // 仅测试可见；生产行为零变化
+    friend class ::TstUdpReassembly;   // 仅测试可见；生产运行时行为零变化
     ...
 };
 ```
 
+- **硬约束**：测试类**必须定义在全局命名空间**且**名称精确为 `TstUdpReassembly`**（与友元声明逐字一致），否则 A24/A25/A26 的白盒断言**无法编译**。声明用 `::TstUdpReassembly` 显式限定全局作用域，避免被误解析到某命名空间内。
 - **取舍**：友元是**最小侵入**（一行、不改任何运行时行为、不放宽对外 API）。换来 `extractTargetPeer` 的 8 类解析分支、`setMaxTransmitBytes` 的夹取分支可**直接白盒断言**，而非绕一大圈端到端间接推断。
-- **备选（零侵入黑盒）**：不加友元，则 `extractTargetPeer` 只能靠 Part B「多 peer 端到端观察工件被投到哪个端口」间接覆盖，`setMaxTransmitBytes` 靠「设 800 后端到端看分片数」间接覆盖——**用例更重、更慢、且分支区分度差**（难判定走了哪条解析分支）。**故推荐加友元**。若团队坚持生产头零改动，则接受这两处降级为间接覆盖（覆盖率仍可达标，但 `extractTargetPeer` 的个别 `size<N` 边界分支可能漏）。
+- **备选（零侵入黑盒，覆盖率降级）**：若团队坚持生产头零改动，则不加友元，A24/A25/A26 降级为：`setMaxTransmitBytes` 只断言返回值（`bool`，public 可直接调，但无法读回 `maxTransmitBytes_` 做白盒校验）+ Part B「设 800 后端到端看分片数」间接印证；`extractTargetPeer` 只能靠 Part B「多 peer 端到端观察工件被投到哪个端口」间接覆盖——**用例更重、更慢、且分支区分度差**（难判定走了哪条解析分支，`size<N` 等边界分支大概率漏，覆盖率随之下降）。**故本计划以「加友元」为达标基线**。
 
 ### 4.4 构建登记
 
 | 构建文件 | 改动 |
 |---|---|
 | `tests/tests.pro` | `SUBDIRS += tst_udp_reassembly` + `tst_udp_reassembly.file = unit/tst_udp_reassembly.pro`（仿 `tst_databridge_schema` 两处登记） |
-| `tests/CMakeLists.txt` | `add_dbridge_test(tst_udp_reassembly "unit/tst_udp_reassembly.cpp;${CMAKE_SOURCE_DIR}/examples/sync-demo/udp_transport.cpp")`；随后 `target_include_directories(tst_udp_reassembly PRIVATE ${CMAKE_SOURCE_DIR}/examples/sync-demo)` + `target_link_libraries(tst_udp_reassembly PRIVATE Qt5::Network)`（宏未链 Network，须补）+ §2.2 覆盖率选项。全局 `AUTOMOC ON` 已能处理 `Q_OBJECT` 头 |
+| `tests/CMakeLists.txt` | **① 先补 `find_package` 组件**：把顶部 `find_package(Qt5 5.12 REQUIRED COMPONENTS Core Sql Test)` 改为 `... COMPONENTS Core Sql Test Network`（否则导入目标 `Qt5::Network` **不存在**，配置期即失败）。**②** `add_dbridge_test(tst_udp_reassembly "unit/tst_udp_reassembly.cpp;${CMAKE_SOURCE_DIR}/examples/sync-demo/udp_transport.cpp")`；随后 `target_include_directories(tst_udp_reassembly PRIVATE ${CMAKE_SOURCE_DIR}/examples/sync-demo)` + `target_link_libraries(tst_udp_reassembly PRIVATE Qt5::Network)`（宏未链 Network，须补）+ §2.2 覆盖率选项。全局 `AUTOMOC ON` 已能处理 `Q_OBJECT` 头 |
 
 ---
 
@@ -174,13 +175,15 @@ class UdpFileTransport : public QThread {
 | **happy path → `.sent`** | 起「发送端 A→B」+「接收端 B→A、inbox 可写」；放工件 → 断言 outbox 出 `.sent`、B 的 inbox 出工件+`.ready` |
 | **多分片端到端** | 同上 + `setMaxTransmitBytes(800)` + 工件 > 752B（如 2KB 随机）；断言 inbox 字节与原文**逐字节一致** |
 | **RTO 重传 + giveUp → `.failed`** | 只起发送端，**对端端口无接收者（黑洞）**或起一个「只收不回 ACK 的哑 `QUdpSocket`」；发送端首发后每 `RTO=500ms` 重发，`maxRetries=5` 后 giveUp → 断言 outbox 出 `.failed`；哑 socket 计 DATA 到达数 == **1+5=6**（实证重传次数） |
-| **durable 落盘失败 → 不 ACK → 持续重传** | 接收端 inbox 路径**指向一个已存在的同名文件**（使写目标/`.ready` 创建失败）或 inbox 目录 `chmod 0500` 只读；发送端发 → 接收端 `feed` 返 Completed 但落盘失败 → **不回 ACK** → 发送端重传直至 giveUp；断言接收端 inbox **无 `.ready` 产出** 且发送端最终 `.failed` |
-| **不可路由 → `.failed`** | 多 peer 发送端；放一个文件名不符合任何命名契约（`extractTargetPeer` 返回空）或 peer 未登记的工件；断言直接 `.failed`（不发送） |
-| **拆包失败 → `.failed`** | 工件**文件名 UTF-8 > 255**（`fragmentMessage` `ok=false`）；断言 `.failed`、无 DATA 发出 |
-| **bind 失败 → 线程即退** | 先用独立 `QUdpSocket` 预占端口 P，再 `start()` 一个 bind 到 P 的 transport；断言其 `wait(1000)` 返回 true（线程因 bind 失败迅速结束）、outbox 工件不被处理 |
-| **坏包丢弃不崩溃** | 向接收端端口手工发：①`<5B` 短包 ②错 magic ③`type=0x03` 未知 ④`type=0x02` 但长度≠9 的坏 ACK；断言接收端存活、inbox 无产出、后续正常工件仍能送达（存活性 + 分派丢弃分支） |
-| **ACK 端点校验（可选）** | 发送端在途某 msgId 时，从**错误端点**手工发一个格式合法的 ACK；断言工件**不**变 `.sent`（端点不匹配被丢弃）。msgId 需经 friend 读 outbound 或以「唯一在途工件」推断 |
-| **NeedAck 端到端（可选）** | 组件层已由 `reasm_dup_after_complete` 覆盖 `NeedAck` 逻辑；`run()` 内 `NeedAck→sendAck` 一行的端到端触发需重放同 msgId 分片，成本高、收益低 → **列为可选**，不达标依赖项 |
+| **durable 落盘失败 → 不 ACK → 持续重传** | 令接收端 `inboxDir_` **本身是一个已存在的普通文件**（非目录）：`mkpath` 失败、目标路径父级非目录 → `QFile::open(WriteOnly)` 失败。**不用**「inbox 目录下预放同名文件」（会被 `WriteOnly` 截断并**成功**）；`chmod 0500` 只读目录仅作备选。断言接收端 inbox 侧**无 `.ready` 产出**、发送端最终 `.failed`（B5） |
+| **不可路由 → `.failed`** | 多 peer 发送端；放一个文件名不符合任何命名契约（`extractTargetPeer` 返回空）或 peer 未登记的工件；断言直接 `.failed`（不发送）（B6） |
+| **拆包失败 → `.failed`** | **可落地手法**：文件名 UTF-8 **正好 255 字节** + `setMaxTransmitBytes(274)`（→`M=1`）+ 数据 **65536B** → `fragCount>65535` → `ok=false`。**不用**「文件名>255」（Linux `NAME_MAX=255`，建不出该工件）。断言 `.failed`、无 DATA 发出（B7） |
+| **bind 失败 → 线程即退** | 先用独立 `QUdpSocket` 预占端口 P（`LocalHost:P`），再 `start()` 一个 bind 到同址的 transport；断言其 `wait(1500)` 返回 true。**平台假设**：Linux/当前 CI 默认 bind 模式（跨平台不保证，见 §11.12）（B8） |
+| **坏包丢弃不崩溃** | 向接收端端口手工发：①`<5B` 短包 ②错 magic ③`type=0x03` 未知 ④`type=0x02` 但长度≠9 的坏 ACK；断言接收端存活、inbox 无产出、后续正常工件仍能送达（B9） |
+| **ACK msgId 不在 outbound** | 向发送端发一个 magic/type 正确、9B、但 `msgId` 不匹配任何在途消息的 ACK；断言被忽略、在途工件不受影响（B10） |
+| **ACK 端点校验（可选）** | **哑 socket 抓发送端首个 DATA 包并解析 `msgId`**，再从**错误端点**发该 `msgId` 的合法 ACK；断言工件**不**变 `.sent`。**不写**「friend 读 outbound」——`outbound` 是 `run()` **局部变量**，friend 亦访问不到（B11） |
+| **pollOutbox 边界（可选）** | ① outbox 目录不存在 → `!dir.exists()` return；② `*.ready` 存在但主文件缺失 → `!QFile::exists` continue（B12） |
+| **NeedAck 端到端（可选）** | 组件层已由 `reasm_dup_after_complete`（A18）覆盖 `NeedAck` 逻辑；`run()` 内 `NeedAck→sendAck` 一行端到端触发需重放同 msgId 分片，成本高收益低 → **可选**（覆盖率差临门一脚再补） |
 
 > **时间成本诚实说明**：`RTO/maxRetries` 是**编译期常量**（设计明确不提供 `setReliabilityParams`），集成层无法调快。故每个 **giveUp 类用例 ≈ 5×500ms + 1×RTO ≈ 3.0–3.5s**。含 giveUp 的用例（giveUp、durable-fail）合计约 **6–8s**；happy/多分片/坏包等亚秒级。全套集成 **≈ 10–12s**，可接受但须在 CI 标注。若未来允许「测试构建经宏 override RTO」，可将其压到毫秒级——**本计划不改生产常量**。
 
@@ -204,7 +207,7 @@ class UdpFileTransport : public QThread {
 | A10 | `reasm_reject_bad_type` | magic 对、type=0x02 | `None` | ②type |
 | A11 | `reasm_reject_out_of_range` | `fragIdx==fragCount`、及 `fragCount==0` | `None`；不污染 pending、不误判 complete | ②越界/fragCount==0 |
 | A12 | `reasm_reject_fnamelen_overflow` | `dg.size() < 18+fnLen` | `None` | ②文件名长度越界 |
-| A13 | `reasm_reject_unsafe_filename` | filename ∈ {空,"a/b","a\\b","/abs",".."} 各一 | 每个均 `None`（间接覆盖 `isFilenameSafe` 全 `return false`） | ②文件名安全全分支 |
+| A13 | `reasm_reject_unsafe_filename` | filename ∈ {空,"a/b","a\\b",".."} 各一 | 每个均 `None`。**注意**：`isFilenameSafe` 校验顺序为「空→含'/'→含'\\'→`isAbsolutePath`→`==".."`」，绝对路径（如 `/abs`）必含 `/`，会**先**被 `contains('/')` 拦截，故 `isAbsolutePath` 的 `return false` 行经 `feed()` **不可达**（§8 豁免） | ②文件名安全（空/'/'/'\\'/".." 四支；isAbsolutePath 见 §8 豁免） |
 | A14 | `reasm_reject_meta_mismatch` | 首片后，次片 fragCount/totalSize/fname_len/fname 各改一处 | 每种不一致均被丢弃；不 complete | ②元数据不一致 |
 | A15 | `reasm_reject_size_mismatch` | 构造「片数凑满但 assemble().size()≠totalSize」 | `None`；判损坏；`pendingCount()==0` | ②总长校验失败 |
 | A16 | `retransmit_recovery` | 先扣留第 k 片→不 complete；再整条重喂 | 补喂后 `Completed`（模拟全量重传恢复） | ②未 complete→补齐 |
@@ -216,8 +219,25 @@ class UdpFileTransport : public QThread {
 | A22 | `collision_two_senders` | 两个不同 `senderKey`、相同 `msgId` 交替喂 | 各自独立 `Completed`；内容不串扰 | ②归并键含端点(碰撞隔离) |
 | A23 | `pending_count_tracking` | feed 若干未 complete → complete/evict | `pendingCount()` 动态正确（0→N→减） | ②pendingCount |
 | A24 | `set_max_transmit_bytes` | 273/274/1000/65507/65508 | 273→false 且 `maxTransmitBytes_` 不变；274/1000/65507→true 且值相符；65508→true 且被夹到 65507（friend 读私有） | ③setMax 全分支 |
-| A25 | `extract_peer_all` | 逐一喂 ack / blreq / baselineresponse / baselinerequest / changeset(`peer-uuid`) / selectionpush(`peer-x-uuid`) / 无法识别 / 各 `size<N` 边界 / `.payload`&`.ack`&`.sending` 后缀 | 每类返回预期 peer 或空串（friend 直调 `extractTargetPeer`） | ③extractTargetPeer 全分支 |
-| A26 | `ctor_and_stop` | 单 peer / 多 peer / 空 peers 构造；`requestStop` 一次/多次 | 构造不抛；`requestStop` 后（friend 读或经 `run` 行为）stop 置位；默认 `maxTransmitBytes_==60000` | ③构造/requestStop |
+| A25 | `extract_peer_all` | friend 直调 `extractTargetPeer`，逐一喂下表精确输入 | 见下方「A25 精确期望表」：每类返回预期 peer 或空串 | ③extractTargetPeer 全分支 + `.sending` 预处理 |
+| A26 | `ctor_and_stop` | 单 peer / 多 peer / 空 peers 构造；`requestStop` 一次/多次 | 构造不抛；默认 `maxTransmitBytes_==60000`（friend 读私有）；`requestStop` 的置位由 B8「bind 失败线程速退」+ B1「happy path 收尾 wait()」端到端间接印证（`stop_` 为 private `QAtomicInt`，friend 亦可直读断言） | ③构造/requestStop |
+
+**A25 精确期望表**（对照代码：先去 `.sending` 再去 `.payload`/`.ack`；`selectionpush` 取 `peer-` 后首段）：
+
+| 输入文件名 | 期望返回 | 覆盖分支 |
+|---|---|---|
+| `ack__from__nodeX__ms__uuid.ack` | `nodeX` | ack（size≥3） |
+| `ack__nodeX`（size<3） | `""` | ack size 不足→继续 |
+| `blreq__from__nodeY__ms.payload` | `nodeY` | blreq（size≥3） |
+| `a__nodeZ__x__y__baselineresponse.payload` | `nodeZ` | baselineresponse（取 parts[1]） |
+| `a__nodeW__x__y__baselinerequest.payload` | `nodeW` | baselinerequest（取 parts[1]） |
+| `origin__ep__changeset__seq__peerA-uuid.payload` | `peerA` | changeset（`lastIndexOf('-')` 左侧） |
+| `origin__ep__changeset__seq__nodash.payload` | `""` | changeset seg 无 `-`→继续 |
+| `origin__ep__selectionpush__id__peer-nodeB-uuid.payload` | `nodeB` | selectionpush（去 `peer-` 后取首段） |
+| `origin__ep__selectionpush__id__nopeerprefix.payload` | `""` | selectionpush seg 不以 `peer-` 开头→继续 |
+| `ack__from__nodeC__ms__uuid.payload.sending` | `nodeC` | `.sending` 预处理→再去 `.payload`（**关键回归**：终态在途文件的 ACK/重传路由） |
+| `ack__from__nodeD__ms__uuid.ack.sending` | `nodeD` | `.sending`→再去 `.ack` |
+| `unknown__format.payload` | `""` | 无匹配→空串 |
 
 ### 6.2 Part B 用例（组件③ socket 部分）
 
@@ -226,15 +246,17 @@ class UdpFileTransport : public QThread {
 | B1 | `e2e_happy_single` | A→B 单片工件端到端 | `QTRY`：outbox 出 `.sent`；B inbox 出工件+`.ready`；无 `.failed` | run(): bind ok / 收 DATA→Completed→写盘 ok→markDelivered→sendAck / 收 ACK→端点匹配→`.sent`；pollOutbox 全 happy；sendAck |
 | B2 | `e2e_happy_multifrag_800` | A→B，`setMaxTransmitBytes(800)`，工件 2KB 随机 | `QTRY`：`.sent`；B inbox 字节 == 原文（多片重组正确） | 同 B1 + fragmentMessage 多片 + 接收端多片 assemble |
 | B3 | `e2e_multipeer_routing` | 多 peer 中心，两个不同目标工件 | 各工件被投到对应端口的接收者 inbox（证 `extractTargetPeer` 端到端路由）；均 `.sent` | pollOutbox 多 peer 路由(7.2) |
-| B4 | `e2e_giveup_no_ack` | 只起发送端；对端为「只收不回 ACK 的哑 socket」 | `QTRY(≈4s)`：outbox 出 `.failed`；哑 socket 累计收到 **6** 个 DATA（首发1+重传5） | run(): RTO 重传(9.2) + giveUp(9.3) |
-| B5 | `e2e_durable_write_fail` | 接收端 inbox 不可写（同名文件占位 / 只读目录） | 接收端**无 `.ready`** 产出；发送端最终 `.failed`（不 ACK→重传→giveUp） | run(): 落盘失败不 ACK(6.3) |
+| B4 | `e2e_giveup_no_ack` | 只起发送端；对端为「只收不回 ACK 的哑 `QUdpSocket`」。**工件必须是单片小文件**（如 100B，默认 60000B 上限下 fragCount=1） | `QTRY(≈4s)`：outbox 出 `.failed`；哑 socket 累计收到 **6** 个 DATA（首发1+重传5）。**注**：断言 `6` 仅对单片成立——多片时每轮重发所有分片，总数=`fragCount×6`，故本用例锁定单片 | run(): RTO 重传(9.2) + giveUp(9.3) |
+| B5 | `e2e_durable_write_fail` | 让接收端 `inboxDir_` **本身是一个已存在的普通文件**（非目录）：则 `mkpath` 失败、`QDir(inboxDir_).filePath(fn)` 的父路径不是目录 → `QFile::open(WriteOnly)` 失败。**不用**「inbox 目录下预放同名文件」（那会被 `WriteOnly` 截断并**成功**，触发不了失败）；`chmod 0500` 只读目录作**备选**（受 root/FS 影响不稳） | 接收端**无 `.ready`** 产出；发送端最终 `.failed`（不 ACK→重传→giveUp） | run(): 落盘 `writeOk=false`→不 ACK(6.3) |
 | B6 | `e2e_unroutable_failed` | 多 peer；工件名不可解析或 peer 未登记 | `QTRY`：直接 `.failed`；对端无任何 DATA 到达 | pollOutbox 不可路由→`.failed`(7.3) |
-| B7 | `e2e_fragment_fail_failed` | 工件文件名 UTF-8 > 255 | `QTRY`：`.failed`；对端无 DATA | pollOutbox 拆包失败→`.failed`(8.2) |
-| B8 | `e2e_bind_fail_thread_exits` | 预占端口 P，再起 bind 到 P 的 transport | 其 `wait(1500)`==true（线程速退）；放入的工件不被发出 | run(): bind 失败→return(1.2) |
+| B7 | `e2e_fragment_fail_failed` | **可落地触发拆包失败**：工件文件名 UTF-8 **正好 255 字节**（`NAME_MAX` 内，磁盘可创建）+ 发送端 `setMaxTransmitBytes(274)`（→ `M=274-18-255=1`）+ 工件数据 **65536B** → `fragCount=65536>65535` → `fragmentMessage` `ok=false`。**不用**「文件名 UTF-8>255」（Linux `NAME_MAX=255` 字节，>255 的工件根本建不出来、`.ready` 也放不进） | `QTRY`：`.failed`；对端无 DATA | pollOutbox 拆包失败→`.failed`(8.2) |
+| B8 | `e2e_bind_fail_thread_exits` | 预占端口 P（独立 `QUdpSocket` bind `LocalHost:P`），再起 bind 到同 `LocalHost:P` 的 transport。**平台假设**：Linux/当前 CI 下默认 bind 模式，同址同端口二次 bind 必失败（跨平台不保证，文档限定本环境） | 其 `wait(1500)`==true（线程速退）；放入的工件不被发出 | run(): bind 失败→return(1.2) |
 | B9 | `e2e_garbage_datagrams` | 向接收端发 4 类坏包（短/错 magic/未知 type/坏长 ACK），随后发 1 个正常工件 | 接收端存活；坏包无 inbox 产出；正常工件仍 `.sent`+inbox（证丢弃分支不影响后续） | run(): dg<5 / magic / 未知 type / ACK 长度≠9 丢弃(4.1/5.1/7.7/7.2) |
-| B10 | `e2e_ack_endpoint_mismatch`（可选） | 在途工件时从错误端点发合法 ACK | 工件不变 `.sent`（端点不匹配丢弃）；正确 ACK 后才 `.sent` | run(): ACK 端点校验(7.6) |
+| B10 | `e2e_ack_msgid_not_in_outbound` | 向**发送端**发一个格式合法但 `msgId` 不在其 outbound 的 ACK（9B，magic/type 正确） | 发送端存活、忽略该 ACK（`!outbound.contains` 分支）；在途工件不受影响 | run(): ACK `msgId` 不在 outbound→continue |
+| B11 | `e2e_ack_endpoint_mismatch`（可选） | **哑 socket 抓发送端首个 DATA 包、解析出 `msgId`**，再从**错误端点**（另一 socket/端口）发一个该 `msgId` 的合法 ACK | 工件**不**变 `.sent`（端点不匹配丢弃）；随后从正确端点发 ACK 才 `.sent`。**不写**「friend 读 outbound」——`outbound` 是 `run()` 局部变量，friend 也访问不到 | run(): ACK 端点校验(7.6) |
+| B12 | `e2e_poll_edge_cases`（可选） | ① outbox 目录不存在的 transport；② outbox 里只放 `*.ready` 但**缺主文件** | ① `pollOutbox` 开头 `!dir.exists()` 直接 return（线程存活、无发送）；② `!QFile::exists(artifactPath)` → `continue`（不认领、不发送、无 `.failed`） | pollOutbox: outbox 不存在 return / 主文件缺失 continue |
 
-> B10 与「NeedAck 端到端」列为**可选**：其对应判定逻辑已被组件层或 B9 覆盖大部；仅为把 `run()` 内该分支的**那一行**也染绿。达 90% 不强依赖它们；若覆盖率报告显示仍差临门一脚再补。
+> **B1–B10 为达标基线**（含 B10「ACK msgId 不在 outbound」——手法简单，应实现）；**B11/B12/NeedAck 为可选补充**：仅为把 `run()`/`pollOutbox` 内个别分支的**那一行**也染绿，达 90% 不强依赖；若覆盖率报告显示仍差临门一脚再补。
 
 ---
 
@@ -245,26 +267,39 @@ class UdpFileTransport : public QThread {
 
 ### 7.2 组件② `FragmentReassembler` + `isFilenameSafe`（≈110 行）
 - `feed` 六校验：A8/A9/A10/A11/A12/A13；短表命中：A17/A18；新建/一致/不一致：A6/A14；重复片不刷进度：A7/A20；未 complete：A16；成功 + assemble：A6/A7；总长失败：A15。
-- `markDelivered`：A17/A18/A21；`evictStale` 两支（pending 淘汰 + 短表过期，含未超时保留）：A19/A20/A21；`pendingCount`：A23；`PendingMsg::complete`（fragCount==0 / 满 / 不满）：A6/A8/A16；`isFilenameSafe` 全 `return false`：A13。→ **全覆盖**。
+- `markDelivered`：A17/A18/A21；`evictStale` 两支（pending 淘汰 + 短表过期，含未超时保留）：A19/A20/A21；`pendingCount`：A23；`PendingMsg::complete`（fragCount==0 / 满 / 不满）：A6/A8/A16；`isFilenameSafe` 的空/'/'/'\\'/".." 四支：A13。→ **除 `isAbsolutePath` 的 `return false` 行外全覆盖**（该行经 `feed()` 不可达：绝对路径必含 `/` 或 `\`，先被前置 `contains` 拦截 → §8 豁免）。
 
 ### 7.3 组件③ 无 socket 部分（≈50 行）
 - `setMaxTransmitBytes` 全分支：A24；`extractTargetPeer` 全解析分支 + 后缀预处理：A25；构造(单/多/空)+`requestStop`：A26。→ **全覆盖**（依赖 §4.3 友元）。
 
 ### 7.4 组件③ socket 部分（≈220 行）
-- `run` bind 成/败：B1/B8；收 DATA→Completed→落盘成功→markDelivered→sendAck：B1/B2；落盘失败→不 ACK：B5；收 ACK→端点匹配→`.sent`：B1；端点不匹配丢弃：B10(可选)；坏包/未知类型/坏 ACK 长度丢弃：B9；RTO 重传：B4；giveUp→`.failed`：B4；`evictStale`（在 run 内周期调用）：B1（每轮都走）。
-- `pollOutbox` 认领→改名→读取→路由→拆包→发送→入 outbound：B1/B2/B3；不可路由→`.failed`：B6；拆包失败→`.failed`：B7。
+- `run` bind 成/败：B1/B8；收 DATA→Completed→落盘成功→markDelivered→sendAck：B1/B2；落盘失败→不 ACK：B5；收 ACK→端点匹配→`.sent`：B1；ACK `msgId` 不在 outbound→continue：B10；端点不匹配丢弃：B11(可选)；坏包/未知类型/坏 ACK 长度丢弃：B9；`NeedAck→sendAck`：可选(见 §5.2)；RTO 重传：B4；giveUp→`.failed`：B4；`evictStale`（在 run 内周期调用）：B1（每轮都走）。
+- `pollOutbox` 认领→改名→读取→路由→拆包→发送→入 outbound：B1/B2/B3；outbox 不存在 return / 主文件缺失 continue：B12；不可路由→`.failed`：B6；拆包失败→`.failed`：B7。
 - `sendAck`：B1（每次交付都发）。
 - **难确定性触发的 FS 竞态**（认领 rename 失败、主文件改名失败、读取 open 成功但 readAll 出错）→ §8 豁免或 chmod 手法尽力覆盖。
 
-### 7.5 测算
+### 7.5 达成测算（先验估计，实测以 lcov 为准）
+
+> **本节是先验定性论证，非 gcov 实测行数**。`udp_transport.cpp` 含注释/空行共约 595 行；**可执行行数（lcov 的 `LF`）须实测确定**。达标判据以 §2.3 的 `lcov --list` 输出为唯一依据，不以本节估算数字为准。
+
+记可执行行为 `LF`，§8 豁免行为 `E`（不进分母），A+B 覆盖行为 `LH`。则：
+
 ```
-可执行行 ≈ 420
-  A 覆盖 ≈ ①40 + ②110 + ③无socket 50 = 200
-  B 覆盖 ≈ ③socket 220 中除「FS 竞态豁免 ≈25」= 195
-  合计 ≈ 395；豁免(不进分母) ≈ 30
-行覆盖率 ≈ 395 / (420 − 30) = 395 / 390 ≈ 101% → 实际取 min，估 ≈ 92–95%
+分母 = LF − E
+分子 = LH ≤ 分母           ← 覆盖行恒 ≤ 分母，不会出现 >100%
+行覆盖率 = LH / (LF − E) = 1 − U/(LF − E)     U = 既未测又未豁免的残留红行
 ```
-> 结论：**A+B 满配可达 ≈ 92–95%**，留有余量吸收估算误差。若实测 < 90%，按 §8 定位红行→补用例或补豁免（优先补用例）。
+
+- **A 覆盖**：组件①（除 UINT32_MAX 注释，无可执行判定）+ ②（除 `isAbsolutePath` 行豁免）+ ③无socket 全部 → 近乎全覆盖其所辖行。
+- **B 覆盖**：③socket 除「§8 的 3 类 FS 竞态豁免行」外全部（含 B10/B12 补的 edge case、B4/B5 的 ARQ 路径）。
+- **残留红行 `U`**：把 §6.2 全部 B 用例（含 B10/B12）写全后，`U` 应趋近 0——非豁免行几乎都有用例命中。
+
+故先验判断 **行覆盖率 ≥ 90%**（分子恒 ≤ 分母，无逻辑矛盾）。
+
+**实测校准流程（达标以此为准）**：
+1. 先只编译+跑 **Part A** → `lcov --list` 记基线（预期 `udp_transport.cpp` 约 **45–50%**，因 socket 部分全红）；
+2. 再加 **Part B** 复测 → 应跃升至 **≥ 90%**；
+3. 若差临门一脚：用 §7.4「难触发 FS 竞态」+ HTML 报告定位具体红行 → **优先补 §6.2 的 B10/B11/B12/NeedAck 小用例**，其次才按 §8 逐条豁免（**不得下调 90% 判据**）。
 
 ---
 
@@ -274,15 +309,16 @@ class UdpFileTransport : public QThread {
 
 | 位置 | 分支 | 豁免理由 | 标注 |
 |------|------|---------|------|
-| `fragmentMessage` | `data.size() > UINT32_MAX` | Qt5 `QByteArray::size()` 为 `int ≤ INT_MAX < UINT32_MAX`，**不可构造** | `// LCOV_EXCL_LINE` 于该判定行（生产已注释「不可达但保留语义」） |
+| `isFilenameSafe` | `QDir::isAbsolutePath(name)` 的 `return false` 行 | 校验顺序为「空→`contains('/')`→`contains('\\')`→`isAbsolutePath`→`==".."`」；任何绝对路径（Unix `/…`、Win `C:\…`）必含 `/` 或 `\`，**先被前置 `contains` 拦截**，故此 `return false` 行经 `feed()` **不可达** | `// LCOV_EXCL_LINE` 于该 `return false` 行（备选：把 `isAbsolutePath` 检查**提前到 `contains` 之前**即可用 `feed("/abs")` 覆盖，但属生产改动，本计划不做） |
 | `pollOutbox` | ① 认领 `rename(.ready→.ready.sending)` 失败 `continue` | 需**并发认领竞态**才失败；单线程确定性测试无法稳定制造，且属 FS 竞态 | `LCOV_EXCL_LINE`（或尽力用 chmod 触发，能覆则不豁免） |
 | `pollOutbox` | ② 主文件 `rename(→.sending)` 失败分支 | 同上，罕见 FS 错误路径 | 同上 |
 | `pollOutbox` | ③ open 成功但 `readAll` `f.error()!=NoError` | 需「打开后文件在读取途中损坏」，无确定性手法 | 同上 |
-| `run` | `waitForReadyRead` 返回 false 的空转 | 每轮循环必然经过，**不豁免**（B 系列自然覆盖） | — |
 
-**不允许**豁免：任何有确定性触发手法（黑洞端口、只读 inbox、预占端口、坏包注入、超长文件名、不可路由名）的分支——必须写用例覆盖。
+> **说明（对照实现）**：`fragmentMessage` 里的 `data.size() > UINT32_MAX` **在实现中已是纯注释、无 `if` 判定行**（见 `udp_transport.cpp` 内「不可达但保留语义」注释），故**本就不产生可执行行、不进分母、无需豁免**——不列入本表。
+>
+> **不豁免**：`run` 的 `waitForReadyRead` 返回 false 空转（每轮必经，B 系列自然覆盖）；以及任何有确定性触发手法（黑洞端口、只读 inbox、预占端口、坏包注入、255 字节文件名+`fragCount>65535`、不可路由名）的分支——**必须写用例覆盖，禁止用豁免凑数**。
 
-> 若最终仅靠豁免仍 < 90%，说明豁免过度或用例不足 → 回到 §6 补 B10/NeedAck 或用 chmod 覆盖 FS 竞态，**不得下调判据**。
+> 若最终仅靠豁免仍 < 90%，说明豁免过度或用例不足 → 回到 §6 补 B10/B11/B12/NeedAck 或用 chmod 覆盖 FS 竞态，**不得下调判据**。
 
 ---
 
@@ -294,7 +330,7 @@ class UdpFileTransport : public QThread {
 ### 9.2 新单测登记
 - `tests/unit/tst_udp_reassembly.pro`：§4.2 内容。
 - `tests/tests.pro`：`SUBDIRS += tst_udp_reassembly` + `.file` 映射（两处）。
-- `tests/CMakeLists.txt`：`add_dbridge_test(tst_udp_reassembly "unit/tst_udp_reassembly.cpp;.../udp_transport.cpp")` + `target_include_directories(... examples/sync-demo)` + `target_link_libraries(... Qt5::Network)` + §2.2 覆盖率选项。
+- `tests/CMakeLists.txt`：**先把顶部 `find_package(Qt5 5.12 REQUIRED COMPONENTS Core Sql Test)` 补为 `... Core Sql Test Network`**（否则 `Qt5::Network` 导入目标不存在、配置期失败）；再 `add_dbridge_test(tst_udp_reassembly "unit/tst_udp_reassembly.cpp;.../udp_transport.cpp")` + `target_include_directories(... examples/sync-demo)` + `target_link_libraries(... Qt5::Network)` + §2.2 覆盖率选项。
 
 ### 9.3 覆盖率工具
 - 本机需 `lcov`/`genhtml`（`gcov` 随 g++）。缺失则 `apt install lcov`（仅度量用，不进生产依赖）。
@@ -308,7 +344,7 @@ class UdpFileTransport : public QThread {
 | 单测编译(qmake) | 见实现计划 §7 的 tests 重生成 + `make -C tests/unit -f Makefile.tst_udp_reassembly` | 编译链接通过（含 network + moc） |
 | 单测运行 | `QT_QPA_PLATFORM=offscreen tests/unit/tst_udp_reassembly` | 全部 slot `PASS`；进程退出码 0 |
 | 组件用例(A) | 同上，`-run frag*,reasm*,peer*,set_max*,ctor*,extract*` | A1–A26 全绿；确定、亚秒级 |
-| 集成用例(B) | 同上，`-run e2e_*` | B1–B9 全绿；含 giveUp 用例(~4s)；无线程泄漏 |
+| 集成用例(B) | 同上，`-run e2e_*` | B1–B10 全绿（B11/B12 可选）；含 giveUp 用例(~4s)；无线程泄漏 |
 | **行覆盖率** | §2.3 lcov 流程 | `udp_transport.cpp` **Lines ≥ 90.0%**、Functions 100% |
 | 双构建(cmake) | `cmake --build build --target tst_udp_reassembly` + `QT_QPA_PLATFORM=offscreen build/tests/tst_udp_reassembly` | 编译+运行通过（AUTOMOC + Qt5::Network） |
 | 无回归 | `sync-suite --selftest`（800B）+ `sync-demo` | 加 friend 后 demo 行为不变、selftest 退出码 0（§11.5） |
@@ -325,18 +361,20 @@ class UdpFileTransport : public QThread {
 6. **端口串扰/TIME_WAIT**：集成用例每个用**独立高位端口**（199xx 段，逐用例 +1），`init()` 起线程、`cleanup()` 停线程 + `QThread::wait()`；避免与 demo 的 150xx/152xx 冲突。
 7. **`QTRY_*` 而非固定 sleep**：终态断言用 `QTRY_VERIFY_WITH_TIMEOUT(cond, ms)` 轮询文件后缀；giveUp 类超时设 ≥ 4500ms（覆盖 5×RTO + 抖动）。
 8. **RTO 不可调**：编译期常量，giveUp 用例天然 ~3s，属**已知不可压缩成本**；勿为提速去改生产常量（会破坏 §4.6 时间约束）。
-9. **`chmod` 只读 inbox 的可移植性**：在 root 或某些 FS 上只读目录仍可写 → durable-fail 用例优先用「同名文件占位使目标路径不是可写文件」的手法，比 `chmod` 稳。
+9. **durable-fail 触发手法**：优先用「`inboxDir_` 本身是普通文件」（`open(WriteOnly)` 必失败）；**不要**用「inbox 目录下预放同名文件」（会被 `WriteOnly` 截断并**成功**）；`chmod 0500` 只读目录在 root/某些 FS 上仍可写，仅作备选。
 10. **clang-format 首提交重排**：提交测试代码时 pre-commit 会重排并中止首次 → 重新 `git add` 再 commit（实现计划 §5.1 同款）。
 11. **`offscreen` 足够**：单测不碰 SQLite/GUI，`QT_QPA_PLATFORM=offscreen` 即可，无需 QSQLITE session 插件。
+12. **B8 bind 失败的平台假设**：Linux/当前 CI 默认 bind 模式下，同 `LocalHost:P` 二次 bind 必失败；跨平台（如设 `ShareAddress`/`ReuseAddressHint`）不保证——文档限定本环境；若移植他处需另证 bind 失败可触发。
+13. **拆包失败用例（B7）不可用超长文件名**：Linux `NAME_MAX=255` 字节，文件名 UTF-8 >255 的工件在磁盘上根本创建不了 → 改用「255 字节文件名 + `setMaxTransmitBytes(274)` + 65536B 数据」使 `fragCount>65535` 触发 `ok=false`。
 
 ---
 
 ## 12. 完成定义（DoD）
 
 - [ ] `tests/unit/tst_udp_reassembly.{cpp,pro}` 新增；`tests.pro`（两处）与 `tests/CMakeLists.txt`（含 Network + include + 覆盖率）登记完成。
-- [ ] `udp_transport.h` 加 `friend class TstUdpReassembly;`（或选零侵入备选并接受降级）。
+- [ ] `udp_transport.h` 加 `friend class ::TstUdpReassembly;`（**必需**生产可测性改动；测试类须在全局命名空间且精确同名。或选 §4.3 零侵入备选并接受 A24/A25/A26 覆盖降级）。
 - [ ] Part A（A1–A26）全绿：组件①②③无 socket 分支全覆盖。
-- [ ] Part B（B1–B9，B10/NeedAck 视覆盖率缺口可选补）全绿：ARQ 重传/giveUp、durable 落盘失败、路由/拆包失败、bind 失败、坏包丢弃均由**确定性手法**触发并断言。
+- [ ] Part B（B1–B10 达标基线；B11/B12/NeedAck 视覆盖率缺口可选补）全绿：ARQ 重传/giveUp、durable 落盘失败、路由/拆包失败、bind 失败、坏包丢弃、ACK msgId 不在 outbound 均由**确定性手法**触发并断言。
 - [ ] `lcov --list` 报告 `udp_transport.cpp` **Lines ≥ 90.0%**、Functions 100%；§8 豁免逐条有理由与 `LCOV_EXCL` 标注。
 - [ ] qmake + cmake 双构建均能编译并运行该单测；`sync-suite --selftest`(800B) 与 `sync-demo` 无回归。
 - [ ] 分阶段提交（组件层 → 集成层 → 覆盖率接线各一 commit，信息含 Co-Authored-By；注意 pre-commit clang-format 首次重排 → 重新 `git add`）。
